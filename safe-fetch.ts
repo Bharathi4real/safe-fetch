@@ -43,13 +43,12 @@ export type ApiResponse<T = unknown> =
 
 // Base URL from environment
 const BASE = process.env.BASE_URL || '';
-console.log(BASE)
+
 // Optional Basic Auth header (if env credentials are set)
 const AUTH =
   process.env.AUTH_USERNAME && process.env.AUTH_PASSWORD
     ? `Basic ${btoa(`${process.env.AUTH_USERNAME}:${process.env.AUTH_PASSWORD}`)}`
     : null;
-console.log(AUTH)
 
 // Status codes eligible for retry
 const RETRY_CODES = new Set([408, 429, 500, 502, 503, 504]);
