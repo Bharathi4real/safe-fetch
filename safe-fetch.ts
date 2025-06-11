@@ -1,3 +1,9 @@
+/**
+ * SafeFetch – Typed fetch utility with retry, timeout & Next.js support
+ * (c) 2025 Bharathi4real – BSD 3-Clause License
+ * https://github.com/Bharathi4real/safe-fetch
+ */
+
 'use server'; // Nextjs
 
 /** Allowed HTTP methods for API calls */
