@@ -6,210 +6,258 @@
 
 'use server'; // Next.js server action
 
-/** Allowed HTTP methods for API calls */
-export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
+/** HTTP methods */
+export type HttpMethod =
+  | 'GET'
+  | 'POST'
+  | 'PUT'
+  | 'DELETE'
+  | 'PATCH'
+  | 'HEAD'
+  | 'OPTIONS';
+
+/** Request body types */
+export type RequestBody =
+  | Record<string, unknown>
+  | FormData
+  | string
+  | ArrayBuffer
+  | Blob
+  | null;
+
+/** Query parameter types */
+export type QueryParams = Record<
+  string,
+  string | number | boolean | null | undefined
+>;
 
 /**
- * Request options for the API client.
- * @template T - Request body type
+ * Request options with comprehensive JSDoc for perfect IntelliSense
+ * @template TBody - Request body type
  */
-export interface RequestOptions<T = unknown> {
-  /** Request body (JSON or FormData) */
-  data?: T;
+export interface RequestOptions<TBody extends RequestBody = RequestBody> {
+  /** Request body - auto-serialized to JSON unless FormData/Blob/ArrayBuffer */
+  data?: TBody;
 
-  /** Query parameters (will be appended to the URL) */
-  params?: Record<string, string | number | boolean>;
+  /** Query parameters appended to URL */
+  params?: QueryParams;
 
-  /** Max retry attempts for safe methods (default: 1) */
+  /** Max retry attempts for idempotent methods (default: 1) */
   retries?: number;
 
-  /** Request timeout in ms (default: 30000) */
+  /** Request timeout in milliseconds (default: 30000) */
   timeout?: number;
 
-  /** Fetch API cache mode (default: 'default') */
+  /** Fetch cache strategy (default: 'default') */
   cache?: RequestCache;
 
-  /** Next.js ISR revalidation time in seconds (false disables ISR) */
+  /** Next.js ISR revalidation time in seconds */
   revalidate?: number | false;
 
-  /** Optional ISR cache tags (Next.js App Router only) */
+  /** Next.js cache tags for on-demand revalidation */
   tags?: string[];
 
-  /** Custom headers (merged with auth/content-type defaults) */
+  /** Custom headers merged with defaults */
   headers?: Record<string, string>;
 
-  /** Logs the inferred TypeScript type of the response (dev-only) */
+  /** Log inferred TypeScript types (dev only) */
   logTypes?: boolean;
+
+  /** Transform response data before returning */
+  transform?<T>(data: T): T;
+
+  /** Custom error handler */
+  onError?: (error: ApiError, attempt: number) => void;
+
+  /** Custom retry condition */
+  shouldRetry?: (error: ApiError, attempt: number) => boolean;
 }
 
-/**
- * API response format returned from apiRequest
- * @template T - Response body type
- */
+/** Structured error information */
+export interface ApiError {
+  readonly name: string;
+  readonly message: string;
+  readonly status: number;
+  readonly attempt?: number;
+}
+
+/** Type-safe API response with success/error discrimination */
 export type ApiResponse<T = unknown> =
-  | { success: true; status: number; data: T }
-  | { success: false; status: number; error: string; data: null };
+  | { success: true; status: number; data: T; headers: Headers }
+  | { success: false; status: number; error: ApiError; data: null };
 
-// Base URL from environment
-const BASE = process.env.BASE_URL || '';
+// Environment configuration
+const BASE_URL = process.env.BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
+const IS_DEV = process.env.NODE_ENV === 'development';
 
-// Optional Basic Auth header (if env credentials are set)
-const AUTH =
-  process.env.AUTH_USERNAME && process.env.AUTH_PASSWORD
-    ? `Basic ${btoa(`${process.env.AUTH_USERNAME}:${process.env.AUTH_PASSWORD}`)}`
-    : null;
+// Authentication setup
+const AUTH_HEADER = (() => {
+  if (process.env.AUTH_USERNAME && process.env.AUTH_PASSWORD) {
+    return `Basic ${btoa(`${process.env.AUTH_USERNAME}:${process.env.AUTH_PASSWORD}`)}`;
+  }
+  if (process.env.AUTH_TOKEN || process.env.API_TOKEN) {
+    return `Bearer ${process.env.AUTH_TOKEN || process.env.API_TOKEN}`;
+  }
+  return null;
+})();
 
-// Status codes eligible for retry
+// Retry configuration
 const RETRY_CODES = new Set([408, 429, 500, 502, 503, 504]);
+const IDEMPOTENT_METHODS = new Set<HttpMethod>([
+  'GET',
+  'PUT',
+  'DELETE',
+  'HEAD',
+  'OPTIONS',
+]);
 
-/**
- * Builds full request URL with optional query parameters.
- */
-const buildUrl = (
-  endpoint: string,
-  params?: Record<string, string | number | boolean>,
-): string => {
-  const url = new URL(endpoint, BASE);
+/** Build request URL with query parameters */
+const buildUrl = (endpoint: string, params?: QueryParams): string => {
+  const url = new URL(
+    endpoint.startsWith('/') ? endpoint : `/${endpoint}`,
+    BASE_URL,
+  );
   if (params) {
-    for (const [key, value] of Object.entries(params)) {
-      url.searchParams.append(key, String(value));
-    }
+    Object.entries(params).forEach(([key, value]) => {
+      if (value != null) url.searchParams.append(key, String(value));
+    });
   }
   return url.toString();
 };
 
-/**
- * Constructs final headers for the request.
- */
+/** Build request headers with content-type detection */
 const buildHeaders = (
-  data?: unknown,
-  headers?: Record<string, string>,
+  data?: RequestBody,
+  custom?: Record<string, string>,
 ): HeadersInit => {
-  const result: HeadersInit = { ...headers };
-  if (AUTH) result.Authorization = AUTH;
-  if (data && !(data instanceof FormData)) {
-    result['Content-Type'] = 'application/json';
+  const headers: Record<string, string> = { ...custom };
+
+  if (AUTH_HEADER) headers.Authorization = AUTH_HEADER;
+  if (
+    data &&
+    !(data instanceof FormData) &&
+    !(data instanceof Blob) &&
+    !(data instanceof ArrayBuffer)
+  ) {
+    headers['Content-Type'] = 'application/json';
   }
-  return result;
+  if (!headers.Accept) headers.Accept = 'application/json, text/plain, */*';
+
+  return headers;
 };
 
-/**
- * Parses the response body into JSON or plain text fallback.
- */
-const parse = async <T>(res: Response): Promise<T> => {
-  const contentType = res.headers.get('content-type');
-  if (contentType?.includes('application/json')) {
-    try {
-      return await res.json();
-    } catch {
-      return (await res.text()) as T;
-    }
+/** Parse response with intelligent content-type handling */
+const parseResponse = async <T>(response: Response): Promise<T> => {
+  const contentType = response.headers.get('content-type') || '';
+
+  if (contentType.includes('application/json')) {
+    return await response.json();
   }
-  return (await res.text()) as T;
+
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text as T;
+  }
 };
 
-/**
- * Returns an AbortController and a cleanup function for timeout handling.
- */
-const createController = (timeout: number) => {
+/** Create timeout controller with cleanup */
+const createTimeout = (ms: number) => {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
-  return { c: controller, clean: () => clearTimeout(timeoutId) };
+  const id = setTimeout(() => controller.abort(), ms);
+  return { controller, cleanup: () => clearTimeout(id) };
 };
 
-/**
- * Determines whether the request should be retried.
- */
-const retryable = (
-  err: { name: string; status?: number; message: string },
+/** Check if request should be retried */
+const shouldRetry = (
+  error: ApiError,
   attempt: number,
   maxRetries: number,
   method: HttpMethod,
+  customRetry?: (error: ApiError, attempt: number) => boolean,
 ): boolean => {
+  if (customRetry) return attempt < maxRetries && customRetry(error, attempt);
+
   return (
     attempt < maxRetries &&
-    ['GET', 'PUT'].includes(method) &&
-    (err.name === 'AbortError' ||
-      (typeof err.status === 'number' && RETRY_CODES.has(err.status)) ||
-      /fetch|network|ECONNRESET/i.test(err.message))
+    IDEMPOTENT_METHODS.has(method) &&
+    (error.name === 'AbortError' ||
+      RETRY_CODES.has(error.status) ||
+      /network|fetch|connection/i.test(error.message))
+  );
+};
+
+/** Exponential backoff with jitter */
+const delay = (attempt: number) => {
+  const ms = Math.min(1000 * Math.pow(2, attempt), 10000);
+  const jitter = ms * 0.25 * (Math.random() - 0.5);
+  return new Promise((resolve) => setTimeout(resolve, ms + jitter));
+};
+
+/** Log inferred TypeScript types (dev only) */
+const logTypes = (endpoint: string, data: unknown): void => {
+  if (!IS_DEV) return;
+
+  const inferType = (val: unknown): string => {
+    if (val === null) return 'null';
+    if (Array.isArray(val))
+      return val.length ? `${inferType(val[0])}[]` : 'unknown[]';
+    if (typeof val === 'object') {
+      const obj = val as Record<string, unknown>;
+      const props = Object.entries(obj)
+        .map(([k, v]) => `  ${k}: ${inferType(v)};`)
+        .join('\n');
+      return `{\n${props}\n}`;
+    }
+    return typeof val;
+  };
+
+  const typeName =
+    endpoint
+      .split(/[\/\-]/)
+      .filter(Boolean)
+      .map((s) => s.charAt(0).toUpperCase() + s.slice(1))
+      .join('') + 'Response';
+
+  console.log(
+    `\n// Generated type for "${endpoint}":\nexport type ${typeName} = ${inferType(data)};\n`,
   );
 };
 
 /**
- * Delays execution using exponential backoff strategy.
- */
-const delay = (attempt: number) =>
-  new Promise((res) => setTimeout(res, Math.min(1000 * 2 ** attempt, 10000)));
-
-/**
- * Logs a best-effort inferred TypeScript type from the response object.
- * Fully typed – no usage of `any`.
- * @param name Identifier like endpoint name
- * @param value The raw JSON value from response
- */
-const logGeneratedType = (name: string, value: unknown): void => {
-  const indentStr = (level: number) => ' '.repeat(level);
-
-  const inferType = (val: unknown, indent = 2): string => {
-    const ind = indentStr(indent);
-
-    if (val === null) return 'null';
-    if (typeof val === 'boolean') return 'boolean';
-    if (typeof val === 'number') return 'number';
-    if (typeof val === 'string') return 'string';
-    if (Array.isArray(val)) {
-      if (val.length === 0) return 'unknown[]';
-      const elementType = inferType(val[0], indent + 2);
-      return `${elementType}[]`;
-    }
-    if (typeof val === 'object') {
-      const obj = val as Record<string, unknown>;
-      const props = Object.entries(obj)
-        .map(([key, v]) => `${ind}${key}: ${inferType(v, indent + 2)};`)
-        .join('\n');
-      return `{\n${props}\n${indentStr(indent - 2)}}`;
-    }
-
-    return 'unknown'; // fallback
-  };
-
-  const formatName = (raw: string) =>
-    raw
-      .split(/[\/\-]/)
-      .filter(Boolean)
-      .map((s) => s.charAt(0).toUpperCase() + s.slice(1))
-      .join('');
-
-  const typeName = formatName(name);
-  const typeDef = inferType(value);
-
-  console.log(`\n// Inferred type for "${name}":\nexport type ${typeName} = ${typeDef};\n`);
-};
-
-
-/**
- * Makes a typed API request with retry, timeout, and ISR support.
+ * Enhanced API request function with comprehensive TypeScript support
  *
- * @template T - Expected response type (inferred if omitted)
- * @template D - Request body type
- * @param method - HTTP method ('GET', 'POST', etc.)
- * @param endpoint - API route relative to BASE_URL
- * @param opts - Optional settings: headers, retries, params, timeout, etc.
- *
- * @returns Promise resolving to an ApiResponse<T>
+ * @template TResponse - Expected response data type
+ * @template TBody - Request body type
+ * @param method - HTTP method
+ * @param endpoint - API endpoint path
+ * @param options - Request configuration
+ * @returns Promise resolving to typed ApiResponse
  *
  * @example
- * // With explicit type
- * const res = await apiRequest<User[]>('GET', '/users');
+ * ```typescript
+ * // Simple GET
+ * const users = await apiRequest<User[]>('GET', '/users');
  *
- * // With inferred type (logs to console)
- * const res = await apiRequest('GET', '/services', { logTypes: true });
+ * // POST with full configuration
+ * const result = await apiRequest<CreateResponse, CreateUserData>('POST', '/users', {
+ *   data: { name: 'John', email: 'john@example.com' },
+ *   retries: 3,
+ *   shouldRetry: (error, attempt) => error.status === 503 && attempt < 2,
+ *   onError: (error, attempt) => console.warn(`Retry ${attempt}:`, error),
+ *   transform: (data) => ({ ...data, timestamp: Date.now() })
+ * });
+ * ```
  */
-export default async function apiRequest<T = unknown, D = unknown>(
+export default async function apiRequest<
+  TResponse = unknown,
+  TBody extends RequestBody = RequestBody,
+>(
   method: HttpMethod,
   endpoint: string,
-  opts: RequestOptions<D> = {},
-): Promise<ApiResponse<T>> {
+  options: RequestOptions<TBody> = {},
+): Promise<ApiResponse<TResponse>> {
   const {
     data,
     params,
@@ -218,105 +266,136 @@ export default async function apiRequest<T = unknown, D = unknown>(
     cache = 'default',
     revalidate,
     tags = [],
-    headers,
-    logTypes = false,
-  } = opts;
+    headers: customHeaders,
+    logTypes: shouldLogTypes = false,
+    transform,
+    onError,
+    shouldRetry: customShouldRetry,
+  } = options;
 
   const url = buildUrl(endpoint, params);
-  const requestHeaders = buildHeaders(data, headers);
+  const headers = buildHeaders(data, customHeaders);
 
-  let fallbackError: { name: string; message: string; status: number } = {
+  let lastError: ApiError = {
     name: 'UnknownError',
-    message: 'An unexpected error occurred',
+    message: 'Request failed',
     status: 500,
   };
 
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const { c: controller, clean } = createController(timeout);
+    const { controller, cleanup } = createTimeout(timeout);
+
     try {
-      const init: RequestInit = {
-        method,
-        headers: requestHeaders,
-        cache,
-        signal: controller.signal,
-        ...(data && {
-          body: data instanceof FormData ? data : JSON.stringify(data),
-        }),
-        ...(revalidate !== undefined || tags.length
+      // Prepare request body
+      let body: BodyInit | undefined;
+      if (data) {
+        body =
+          data instanceof FormData ||
+          data instanceof Blob ||
+          data instanceof ArrayBuffer ||
+          typeof data === 'string'
+            ? data
+            : JSON.stringify(data);
+      }
+
+      // Next.js options
+      const nextOptions =
+        revalidate !== undefined || tags.length
           ? {
               next: {
                 ...(revalidate !== undefined && { revalidate }),
                 ...(tags.length && { tags }),
               },
             }
-          : {}),
-      };
+          : {};
 
-      const res = await fetch(url, init);
-      clean();
+      const response = await fetch(url, {
+        method,
+        headers,
+        body,
+        cache,
+        signal: controller.signal,
+        ...nextOptions,
+      });
 
-      const responseData = await parse<T>(res);
+      cleanup();
 
-      if (res.ok) {
-        if (logTypes && typeof responseData === 'object') {
-          logGeneratedType(endpoint, responseData);
-        }
+      const responseData = await parseResponse<TResponse>(response);
+
+      if (response.ok) {
+        const finalData = transform ? transform(responseData) : responseData;
+
+        if (shouldLogTypes) logTypes(endpoint, finalData);
 
         return {
           success: true,
-          status: res.status,
-          data: responseData,
+          status: response.status,
+          data: finalData,
+          headers: response.headers,
         };
       }
 
-      const err = {
+      const error: ApiError = {
         name: 'HttpError',
-        message: `HTTP ${res.status}: ${res.statusText}`,
-        status: res.status,
+        message: `HTTP ${response.status}: ${response.statusText}`,
+        status: response.status,
+        attempt,
       };
 
-      if (retryable(err, attempt, retries, method)) {
+      lastError = error;
+      if (onError) onError(error, attempt);
+
+      if (shouldRetry(error, attempt, retries, method, customShouldRetry)) {
         await delay(attempt);
         continue;
       }
 
-      return {
-        success: false,
-        status: err.status,
-        error: err.message,
-        data: null,
-      };
-    } catch (error: unknown) {
-      clean();
+      return { success: false, status: response.status, error, data: null };
+    } catch (err) {
+      cleanup();
 
-      const err =
-        error instanceof Error
+      const error: ApiError =
+        err instanceof Error
           ? {
-              name: error.name,
+              name: err.name === 'AbortError' ? 'TimeoutError' : 'NetworkError',
               message:
-                error.name === 'AbortError'
-                  ? 'Request timeout'
-                  : error.message || 'Unknown error',
-              status: error.name === 'AbortError' ? 408 : 500,
+                err.name === 'AbortError'
+                  ? `Timeout after ${timeout}ms`
+                  : err.message,
+              status: err.name === 'AbortError' ? 408 : 500,
+              attempt,
             }
           : {
               name: 'UnknownError',
-              message: 'An unexpected error occurred',
+              message: 'Unexpected error',
               status: 500,
+              attempt,
             };
 
-      fallbackError = err;
+      lastError = error;
+      if (onError) onError(error, attempt);
 
-      if (retryable(err, attempt, retries, method)) {
+      if (shouldRetry(error, attempt, retries, method, customShouldRetry)) {
         await delay(attempt);
+        continue;
       }
     }
   }
 
   return {
     success: false,
-    status: fallbackError.status,
-    error: fallbackError.message,
+    status: lastError.status,
+    error: lastError,
     data: null,
   };
 }
+
+/** Type guard for successful responses */
+export const isSuccess = <T>(
+  response: ApiResponse<T>,
+): response is Extract<ApiResponse<T>, { success: true }> => response.success;
+
+/** Type guard for error responses */
+export const isError = <T>(
+  response: ApiResponse<T>,
+): response is Extract<ApiResponse<T>, { success: false }> => !response.success;
