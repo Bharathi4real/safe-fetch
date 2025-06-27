@@ -246,7 +246,8 @@ const logTypes = (endpoint: string, data: unknown): void => {
  *   retries: 3,
  *   shouldRetry: (error, attempt) => error.status === 503 && attempt < 2,
  *   onError: (error, attempt) => console.warn(`Retry ${attempt}:`, error),
- *   transform: (data) => ({ ...data, timestamp: Date.now() })
+ *   transform: (data) => ({ ...data, timestamp: Date.now() }),
+ *   logTypes: true
  * });
  * ```
  */
@@ -390,12 +391,35 @@ export default async function apiRequest<
   };
 }
 
-/** Type guard for successful responses */
-export const isSuccess = <T>(
+
+/**
+ * Type guard for successful responses
+ *
+ * Check if the API response was successful.
+ *
+ * @example
+ * const res = await apiRequest('GET', '/users');
+ * if (apiRequest.isSuccess(res)) {
+ *   // Safe access to res.data
+ * } else {
+ *   console.error(res.error);
+ * }
+ */
+apiRequest.isSuccess = <T>(
   response: ApiResponse<T>,
 ): response is Extract<ApiResponse<T>, { success: true }> => response.success;
 
-/** Type guard for error responses */
-export const isError = <T>(
+/**
+ * Type guard for error responses
+ * 
+ * Check if the API response failed.
+ *
+ * @example
+ * const res = await apiRequest('GET', '/users');
+ * if (apiRequest.isError(res)) {
+ *   console.error(res.error);
+ * }
+ */
+apiRequest.isError = <T>(
   response: ApiResponse<T>,
 ): response is Extract<ApiResponse<T>, { success: false }> => !response.success;
