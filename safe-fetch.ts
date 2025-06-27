@@ -113,16 +113,34 @@ const IDEMPOTENT_METHODS = new Set<HttpMethod>([
 
 /** Build request URL with query parameters */
 const buildUrl = (endpoint: string, params?: QueryParams): string => {
-  const url = new URL(
-    endpoint.startsWith('/') ? endpoint : `/${endpoint}`,
-    BASE_URL,
-  );
+  let finalUrl: URL;
+
+  // Handle different endpoint formats
+  if (endpoint.startsWith('http://') || endpoint.startsWith('https://')) {
+    // Absolute URL - use as-is
+    finalUrl = new URL(endpoint);
+  } else if (endpoint.startsWith('/')) {
+    // Absolute path - join with base URL
+    finalUrl = new URL(endpoint, BASE_URL);
+  } else {
+    // Relative path - smart joining
+    if (BASE_URL.endsWith('/')) {
+      finalUrl = new URL(endpoint, BASE_URL);
+    } else {
+      finalUrl = new URL(`/${endpoint}`, BASE_URL);
+    }
+  }
+
+  // Add query parameters
   if (params) {
     Object.entries(params).forEach(([key, value]) => {
-      if (value != null) url.searchParams.append(key, String(value));
+      if (value != null) {
+        finalUrl.searchParams.append(key, String(value));
+      }
     });
   }
-  return url.toString();
+
+  return finalUrl.toString();
 };
 
 /** Build request headers with content-type detection */
@@ -391,7 +409,6 @@ export default async function apiRequest<
   };
 }
 
-
 /**
  * Type guard for successful responses
  *
@@ -411,7 +428,7 @@ apiRequest.isSuccess = <T>(
 
 /**
  * Type guard for error responses
- * 
+ *
  * Check if the API response failed.
  *
  * @example
