@@ -378,7 +378,7 @@ const logTypes = (endpoint: string, data: unknown): void => {
   if (!IS_DEV) return;
 
   const inferType = (val: unknown, depth = 0): string => {
-    if (depth > 10) return 'DeepNested';
+    if (depth > 10) return 'any /* depth exceeded */';
     if (val === null) return 'null';
     if (val === undefined) return 'undefined';
 
@@ -386,40 +386,37 @@ const logTypes = (endpoint: string, data: unknown): void => {
       if (val.length === 0) return 'unknown[]';
       const firstType = inferType(val[0], depth + 1);
       const allSame = val.every((item) => typeof item === typeof val[0]);
-      return allSame ? `${firstType}[]` : 'mixed[]';
+      return allSame ? `${firstType}[]` : 'Array<unknown>';
     }
 
     if (typeof val === 'object' && val !== null) {
       const obj = val as Record<string, unknown>;
-      const entries = Object.entries(obj).slice(0, 10);
-      const props = entries
+      const props = Object.entries(obj)
         .map(([k, v]) => {
           const valueType = /password|token|secret|key|auth/i.test(k)
-            ? 'string'
+            ? 'string /* redacted */'
             : inferType(v, depth + 1);
-          return `  ${k}: ${valueType};`;
+          return `  ${JSON.stringify(k)}: ${valueType};`;
         })
         .join('\n');
-      const hasMore = Object.keys(obj).length > 10;
-      return `{\n${props}${hasMore ? '\n  // ... more properties' : ''}\n}`;
+      return `{\n${props}\n}`;
     }
 
     return typeof val;
   };
 
   try {
-    const typeName =
-      endpoint
-        .replace(/[^\w\/-]/g, '')
-        .split(/[\/\-]/)
-        .filter(Boolean)
-        .map((s) => s.charAt(0).toUpperCase() + s.slice(1))
-        .join('') + 'Response';
-    console.log(
-      `\n// Generated type for "${endpoint}":\nexport type ${typeName} = ${inferType(data)};\n`,
-    );
-  } catch (error) {
-    console.warn('SafeFetch: Type logging failed:', error);
+    const typeName = endpoint
+      .replace(/[^a-zA-Z0-9]/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .replace(/_{2,}/g, '_')
+      .replace(/^(\d)/, '_$1');
+
+    const inferred = inferType(data);
+    console.log(`🔍 Inferred Type for "${endpoint}"`);
+    console.log(`type ${typeName}Type = ${inferred}`);
+  } catch (err) {
+    console.warn('[logTypes] Failed to infer types:', err);
   }
 };
 
