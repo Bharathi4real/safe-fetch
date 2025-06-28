@@ -147,6 +147,19 @@ const AUTH_HEADER = (() => {
   }
 })();
 
+// Helper for creating ApiError to reduce repetition and streamline error handling
+const createApiError = (
+  name: string,
+  message: string,
+  status: number,
+  attempt?: number,
+): ApiError => ({
+  name,
+  message,
+  status,
+  attempt,
+});
+
 /** Validate URL for SSRF protection */
 const isUrlSafe = (url: string, allowedHosts?: string[]): boolean => {
   try {
@@ -302,8 +315,7 @@ const parseResponse = async <T>(
     // Parse JSON if content-type indicates or text looks like JSON
     if (
       contentType.includes('application/json') ||
-      text.trim().startsWith('{') ||
-      text.trim().startsWith('[')
+      /^[{\[]/.test(text.trim()) // Simplified check for JSON start
     ) {
       try {
         return JSON.parse(text);
@@ -396,7 +408,7 @@ const logTypes = (endpoint: string, data: unknown): void => {
           const valueType = /password|token|secret|key|auth/i.test(k)
             ? 'string /* redacted */'
             : inferType(v, depth + 1);
-          return `  ${JSON.stringify(k)}: ${valueType};`;
+          return `   ${JSON.stringify(k)}: ${valueType};`;
         })
         .join('\n');
       return `{\n${props}\n}`;
@@ -421,7 +433,7 @@ const logTypes = (endpoint: string, data: unknown): void => {
 };
 
 /**
- * Enhanced API request function with comprehensive TypeScript support
+ * API request function with comprehensive TypeScript support
  *
  * @template TResponse - Expected response data type
  * @template TBody - Request body type
@@ -437,16 +449,20 @@ const logTypes = (endpoint: string, data: unknown): void => {
  *
  * // POST with full configuration
  * const result = await apiRequest<CreateResponse, CreateUserData>('POST', '/users', {
- *   data: { name: 'John', email: 'john@example.com' },
- *   retries: 3,
- *   cache: "force-cache",
- *   tags:["id", "users"],
- *   shouldRetry: (error, attempt) => error.status === 503 && attempt < 2,
- *   onError: (error, attempt) => console.warn(`Retry ${attempt}:`, error),
- *   transform: (data) => ({ ...data, timestamp: Date.now() }),
- *   logTypes: true,
- *   allowedHosts: ['api.example.com'], // Additional hosts (merged with env)
- *   maxResponseSize: 5 * 1024 * 1024 // 5MB
+ * data: { name: 'John', email: 'john@example.com' },
+ * params: { userId: 123, status: 'active' }, // Added: Query parameters
+ * retries: 3,
+ * timeout: 5000, // Added: Request timeout
+ * cache: "force-cache",
+ * revalidate: 60, // Added: Next.js ISR revalidation time
+ * tags:["id", "users"],
+ * headers: { 'X-Custom-Header': 'foobar' }, // Added: Custom headers
+ * shouldRetry: (error, attempt) => error.status === 503 && attempt < 2,
+ * onError: (error, attempt) => console.warn(`Retry ${attempt}:`, error),
+ * transform: (data) => ({ ...data, timestamp: Date.now() }),
+ * logTypes: true,
+ * allowedHosts: ['api.example.com'], // Additional hosts (merged with env)
+ * maxResponseSize: 5 * 1024 * 1024 // 5MB
  * });
  *
  * // Environment configuration:
@@ -493,39 +509,40 @@ export default async function apiRequest<
     url = buildUrl(endpoint, params, allowedHosts);
     headers = buildHeaders(data, customHeaders);
   } catch (error) {
-    const apiError: ApiError = {
-      name: 'ValidationError',
-      message:
-        error instanceof Error ? error.message : 'Request validation failed',
-      status: 400,
-    };
+    const apiError = createApiError(
+      'ValidationError',
+      error instanceof Error ? error.message : 'Request validation failed',
+      400,
+    );
     return { success: false, status: 400, error: apiError, data: null };
   }
 
-  let lastError: ApiError = {
-    name: 'UnknownError',
-    message: 'Request failed',
-    status: 500,
-  };
+  let lastError: ApiError = createApiError(
+    'UnknownError',
+    'Request failed',
+    500,
+  );
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     const { controller, cleanup } = createTimeout(timeout);
+    let currentResponseStatus = 500; // Default status for network/unknown errors
 
     try {
       // Prepare request body
       let body: BodyInit | undefined;
-      if (data) {
-        if (typeof data === 'string') {
-          if (data.length > maxResponseSize)
-            throw new Error('Request body too large');
-          body = data;
-        } else if (
+      if (data != null) {
+        if (
           data instanceof FormData ||
           data instanceof Blob ||
           data instanceof ArrayBuffer
         ) {
           body = data;
+        } else if (typeof data === 'string') {
+          if (data.length > maxResponseSize)
+            throw new Error('Request body too large');
+          body = data;
         } else {
+          // Assume it's Record<string, unknown>
           const jsonString = JSON.stringify(data);
           if (jsonString.length > maxResponseSize)
             throw new Error('Request body too large');
@@ -533,25 +550,24 @@ export default async function apiRequest<
         }
       }
 
-      // Next.js options
-      const nextOptions = (() => {
-        if (revalidate !== undefined || tags.length) {
-          const validTags = tags.filter(
-            (tag) =>
-              typeof tag === 'string' &&
-              tag.length > 0 &&
-              tag.length <= 100 &&
-              /^[a-zA-Z0-9\-_]+$/.test(tag),
-          );
-          return {
-            next: {
-              ...(revalidate !== undefined && { revalidate }),
-              ...(validTags.length && { tags: validTags }),
-            },
-          };
-        }
-        return {};
-      })();
+      // Next.js options (inlined)
+      const nextOptions =
+        revalidate !== undefined || tags.length
+          ? {
+              next: {
+                ...(revalidate !== undefined && { revalidate }),
+                ...(tags.length && {
+                  tags: tags.filter(
+                    (tag) =>
+                      typeof tag === 'string' &&
+                      tag.length > 0 &&
+                      tag.length <= 100 &&
+                      /^[a-zA-Z0-9\-_]+$/.test(tag),
+                  ),
+                }),
+              },
+            }
+          : {};
 
       const response = await fetch(url, {
         method,
@@ -562,6 +578,7 @@ export default async function apiRequest<
         ...nextOptions,
       });
       cleanup();
+      currentResponseStatus = response.status; // Update status for potential error reporting
 
       const responseData = await parseResponse<TResponse>(
         response,
@@ -572,15 +589,20 @@ export default async function apiRequest<
         let finalData: TResponse;
         try {
           finalData = transform ? transform(responseData) : responseData;
-        } catch {
-          const error: ApiError = {
-            name: 'TransformError',
-            message: 'Response transformation failed',
-            status: response.status,
+        } catch (transformError) {
+          lastError = createApiError(
+            'TransformError',
+            'Response transformation failed',
+            response.status,
             attempt,
+          );
+          onError?.(lastError, attempt);
+          return {
+            success: false,
+            status: response.status,
+            error: lastError,
+            data: null,
           };
-          onError?.(error, attempt);
-          return { success: false, status: response.status, error, data: null };
         }
 
         if (shouldLogTypes) logTypes(endpoint, finalData);
@@ -592,87 +614,107 @@ export default async function apiRequest<
         };
       }
 
-      // Handle HTTP errors
-      const error: ApiError = {
-        name: 'HttpError',
-        message:
-          response.status >= 500
-            ? `Server error (${response.status})`
-            : `HTTP ${response.status}: ${response.statusText}`,
-        status: response.status,
-        attempt,
-      };
+      // Handle HTTP errors (response not ok) - try to get error from body
+      let errorMessage =
+        response.status >= 500
+          ? `Server error (${response.status})`
+          : `HTTP ${response.status}: ${response.statusText}`;
+      let errorName = 'HttpError';
 
-      lastError = error;
-      onError?.(error, attempt);
-
-      if (
-        shouldRetryRequest(error, attempt, retries, method, customShouldRetry)
-      ) {
-        await delay(attempt);
-        continue;
+      // Attempt to extract more detailed error from responseData if it's an object
+      if (typeof responseData === 'object' && responseData !== null) {
+        const dataAsRecord = responseData as Record<string, unknown>;
+        if (
+          typeof dataAsRecord.message === 'string' &&
+          dataAsRecord.message.length > 0
+        ) {
+          errorMessage = dataAsRecord.message;
+        } else if (
+          typeof dataAsRecord.error === 'string' &&
+          dataAsRecord.error.length > 0
+        ) {
+          errorMessage = dataAsRecord.error;
+        }
+        if (
+          typeof dataAsRecord.code === 'string' &&
+          dataAsRecord.code.length > 0
+        ) {
+          errorName = dataAsRecord.code;
+        } else if (
+          typeof dataAsRecord.name === 'string' &&
+          dataAsRecord.name.length > 0
+        ) {
+          errorName = dataAsRecord.name;
+        }
       }
 
-      return { success: false, status: response.status, error, data: null };
+      lastError = createApiError(
+        errorName,
+        errorMessage,
+        response.status,
+        attempt,
+      );
     } catch (err) {
       cleanup();
 
-      const error: ApiError = (() => {
-        if (err instanceof Error) {
-          if (err.name === 'AbortError' || err.message.includes('timeout')) {
-            return {
-              name: 'TimeoutError',
-              message: `Request timeout after ${timeout}ms`,
-              status: 408,
-              attempt,
-            };
-          }
-          if (err.message.includes('too large')) {
-            return {
-              name: 'PayloadTooLargeError',
-              message: 'Response or request too large',
-              status: 413,
-              attempt,
-            };
-          }
-          if (
-            err.message.includes('not allowed') ||
-            err.message.includes('SSRF')
-          ) {
-            return {
-              name: 'SecurityError',
-              message: 'Request blocked for security reasons',
-              status: 403,
-              attempt,
-            };
-          }
-          return {
-            name: 'NetworkError',
-            message: 'Network request failed',
-            status: 500,
+      // Determine the specific error type
+      if (err instanceof Error) {
+        if (err.name === 'AbortError' || err.message.includes('timeout')) {
+          lastError = createApiError(
+            'TimeoutError',
+            `Request timeout after ${timeout}ms`,
+            408,
             attempt,
-          };
+          );
+        } else if (err.message.includes('too large')) {
+          lastError = createApiError(
+            'PayloadTooLargeError',
+            'Response or request too large',
+            413,
+            attempt,
+          );
+        } else if (
+          err.message.includes('not allowed') ||
+          err.message.includes('SSRF')
+        ) {
+          lastError = createApiError(
+            'SecurityError',
+            'Request blocked for security reasons',
+            403,
+            attempt,
+          );
+        } else {
+          lastError = createApiError(
+            'NetworkError',
+            'Network request failed',
+            500,
+            attempt,
+          );
         }
-        return {
-          name: 'UnknownError',
-          message: 'Unexpected error occurred',
-          status: 500,
+      } else {
+        lastError = createApiError(
+          'UnknownError',
+          'Unexpected error occurred',
+          currentResponseStatus,
           attempt,
-        };
-      })();
-
-      lastError = error;
-      onError?.(error, attempt);
-
-      if (
-        shouldRetryRequest(error, attempt, retries, method, customShouldRetry)
-      ) {
-        await delay(attempt);
-        continue;
+        );
       }
+    }
+
+    onError?.(lastError, attempt); // Call custom onError handler for any error
+
+    // Decide whether to retry or break the loop
+    if (
+      shouldRetryRequest(lastError, attempt, retries, method, customShouldRetry)
+    ) {
+      await delay(attempt);
+      continue; // Proceed to the next retry attempt
+    } else {
+      break; // Stop retrying if not allowed or retries exhausted
     }
   }
 
+  // Return the final error response if all retries failed or no more retries allowed
   return {
     success: false,
     status: lastError.status,
@@ -687,9 +729,9 @@ export default async function apiRequest<
  * @example
  * const res = await apiRequest('GET', '/users');
  * if (apiRequest.isSuccess(res)) {
- *   // Safe access to res.data
+ * // Safe access to res.data
  * } else {
- *   console.error(res.error);
+ * console.error(res.error);
  * }
  */
 apiRequest.isSuccess = <T>(
@@ -702,7 +744,7 @@ apiRequest.isSuccess = <T>(
  * @example
  * const res = await apiRequest('GET', '/users');
  * if (apiRequest.isError(res)) {
- *   console.error(res.error);
+ * console.error(res.error);
  * }
  */
 apiRequest.isError = <T>(
