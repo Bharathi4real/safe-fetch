@@ -442,6 +442,8 @@ const logTypes = (endpoint: string, data: unknown): void => {
  * const result = await apiRequest<CreateResponse, CreateUserData>('POST', '/users', {
  *   data: { name: 'John', email: 'john@example.com' },
  *   retries: 3,
+ *   cache: "force-cache"
+ *   tags:["id", "users"]
  *   shouldRetry: (error, attempt) => error.status === 503 && attempt < 2,
  *   onError: (error, attempt) => console.warn(`Retry ${attempt}:`, error),
  *   transform: (data) => ({ ...data, timestamp: Date.now() }),
