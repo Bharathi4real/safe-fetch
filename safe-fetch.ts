@@ -321,7 +321,7 @@ const parseResponse = async <T>(
         return JSON.parse(text);
       } catch (error) {
         if (contentType.includes('application/json'))
-          throw new Error('Invalid JSON response');
+          throw new Error(`Invalid JSON response: ${error}`);
       }
     }
 
@@ -600,7 +600,7 @@ export default async function apiRequest<
           return {
             success: false,
             status: response.status,
-            error: lastError,
+            error: lastError ?? error,
             data: null,
           };
         }
