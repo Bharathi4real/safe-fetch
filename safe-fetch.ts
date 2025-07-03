@@ -319,7 +319,7 @@ const parseResponse = async <T>(
     ) {
       try {
         return JSON.parse(text);
-      } catch (parseError) {
+      } catch (error) {
         if (contentType.includes('application/json'))
           throw new Error('Invalid JSON response');
       }
@@ -589,7 +589,7 @@ export default async function apiRequest<
         let finalData: TResponse;
         try {
           finalData = transform ? transform(responseData) : responseData;
-        } catch (transformError) {
+        } catch (error) {
           lastError = createApiError(
             'TransformError',
             'Response transformation failed',
