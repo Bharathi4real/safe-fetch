@@ -72,6 +72,7 @@ export interface ApiError {
   readonly message: string;
   readonly status: number;
   readonly attempt?: number;
+  readonly data?: unknown;
 }
 
 /** Type-safe API response with success/error discrimination */
@@ -153,11 +154,13 @@ const createApiError = (
   message: string,
   status: number,
   attempt?: number,
+  data?: unknown,
 ): ApiError => ({
   name,
   message,
   status,
   attempt,
+  data,
 });
 
 /** Validate URL for SSRF protection */
@@ -315,7 +318,7 @@ const parseResponse = async <T>(
     // Parse JSON if content-type indicates or text looks like JSON
     if (
       contentType.includes('application/json') ||
-      /^[{\[]/.test(text.trim()) // Simplified check for JSON start
+      /^[{\[]/.test(text.trim()) 
     ) {
       try {
         return JSON.parse(text);
@@ -578,7 +581,7 @@ export default async function apiRequest<
         ...nextOptions,
       });
       cleanup();
-      currentResponseStatus = response.status; // Update status for potential error reporting
+      currentResponseStatus = response.status;
 
       const responseData = await parseResponse<TResponse>(
         response,
@@ -600,7 +603,7 @@ export default async function apiRequest<
           return {
             success: false,
             status: response.status,
-            error: lastError ?? error,
+            error: lastError,
             data: null,
           };
         }
@@ -614,45 +617,13 @@ export default async function apiRequest<
         };
       }
 
-      // Handle HTTP errors (response not ok) - try to get error from body
-      let errorMessage =
-        response.status >= 500
-          ? `Server error (${response.status})`
-          : `HTTP ${response.status}: ${response.statusText}`;
-      let errorName = 'HttpError';
-
-      // Attempt to extract more detailed error from responseData if it's an object
-      if (typeof responseData === 'object' && responseData !== null) {
-        const dataAsRecord = responseData as Record<string, unknown>;
-        if (
-          typeof dataAsRecord.message === 'string' &&
-          dataAsRecord.message.length > 0
-        ) {
-          errorMessage = dataAsRecord.message;
-        } else if (
-          typeof dataAsRecord.error === 'string' &&
-          dataAsRecord.error.length > 0
-        ) {
-          errorMessage = dataAsRecord.error;
-        }
-        if (
-          typeof dataAsRecord.code === 'string' &&
-          dataAsRecord.code.length > 0
-        ) {
-          errorName = dataAsRecord.code;
-        } else if (
-          typeof dataAsRecord.name === 'string' &&
-          dataAsRecord.name.length > 0
-        ) {
-          errorName = dataAsRecord.name;
-        }
-      }
-
+      // Handle HTTP errors - return the actual API error response
       lastError = createApiError(
-        errorName,
-        errorMessage,
+        'HttpError',
+        `HTTP ${response.status}`,
         response.status,
         attempt,
+        responseData,
       );
     } catch (err) {
       cleanup();
