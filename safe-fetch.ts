@@ -603,7 +603,7 @@ export default async function apiRequest<
           return {
             success: false,
             status: response.status,
-            error: lastError,
+            error: lastError ?? error,
             data: null,
           };
         }
