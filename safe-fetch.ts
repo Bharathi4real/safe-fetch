@@ -7,29 +7,13 @@
 'use server'; // Next.js server action
 
 /** HTTP methods */
-export type HttpMethod =
-  | 'GET'
-  | 'POST'
-  | 'PUT'
-  | 'DELETE'
-  | 'PATCH'
-  | 'HEAD'
-  | 'OPTIONS';
+export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'HEAD' | 'OPTIONS';
 
 /** Request body types */
-export type RequestBody =
-  | Record<string, unknown>
-  | FormData
-  | string
-  | ArrayBuffer
-  | Blob
-  | null;
+export type RequestBody = Record<string, unknown> | FormData | string | ArrayBuffer | Blob | null;
 
 /** Query parameter types */
-export type QueryParams = Record<
-  string,
-  string | number | boolean | null | undefined
->;
+export type QueryParams = Record<string, string | number | boolean | null | undefined>;
 
 /** Next.js specific options */
 export interface NextOptions {
@@ -112,8 +96,7 @@ const MAX_REQUEST_BODY_SIZE_DEFAULT = 10 * 1024 * 1024; // 10MB
 
 // Parse allowed hosts from environment (comma-separated)
 const ENV_ALLOWED_HOSTS = (() => {
-  const hostsEnv =
-    process.env.ALLOWED_HOSTS || process.env.SAFEFETCH_ALLOWED_HOSTS;
+  const hostsEnv = process.env.ALLOWED_HOSTS || process.env.SAFEFETCH_ALLOWED_HOSTS;
   return (
     hostsEnv
       ?.split(',')
@@ -149,13 +132,7 @@ const CONFIG = {
   },
   retry: {
     codes: new Set([408, 429, 500, 502, 503, 504]),
-    idempotentMethods: new Set<HttpMethod>([
-      'GET',
-      'PUT',
-      'DELETE',
-      'HEAD',
-      'OPTIONS',
-    ]),
+    idempotentMethods: new Set<HttpMethod>(['GET', 'PUT', 'DELETE', 'HEAD', 'OPTIONS']),
   },
 } as const;
 
@@ -167,9 +144,7 @@ const AUTH_HEADER = (() => {
       return `Basic ${Buffer.from(`${AUTH_USERNAME}:${AUTH_PASSWORD}`, 'utf8').toString('base64')}`;
     }
     const token = AUTH_TOKEN || API_TOKEN;
-    return token && /^[A-Za-z0-9\-._~+/]+=*$/.test(token)
-      ? `Bearer ${token}`
-      : null;
+    return token && /^[A-Za-z0-9\-._~+/]+=*$/.test(token) ? `Bearer ${token}` : null;
   } catch (e) {
     if (IS_DEV) {
       console.warn('Failed to set AUTH_HEADER:', e);
@@ -228,7 +203,10 @@ const isUrlSafe = (url: string, allowedHosts?: string[]): boolean => {
     // Node.js URL parser normalizes IP addresses.
     // Example: new URL('http://0x7f000001').hostname === '127.0.0.1'
     // Example: new URL('http://[::1]').hostname === '::1'
-    const isIpAddress = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^\[(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\]$|^[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}$/.test(hostname) || hostname.includes(':'); // Simple check for IPv4/IPv6 format
+    const isIpAddress =
+      /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^\[(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\]$|^[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}$/.test(
+        hostname,
+      ) || hostname.includes(':'); // Simple check for IPv4/IPv6 format
 
     if (isIpAddress && CONFIG.security.blockedIpRanges.some((range) => range.test(hostname))) {
       if (IS_DEV) console.warn(`Blocked IP range: ${hostname}`);
@@ -236,10 +214,7 @@ const isUrlSafe = (url: string, allowedHosts?: string[]): boolean => {
     }
 
     // Allowed hosts check
-    const allAllowed = [
-      ...ENV_ALLOWED_HOSTS,
-      ...(allowedHosts?.map((h) => h.toLowerCase()) || []),
-    ];
+    const allAllowed = [...ENV_ALLOWED_HOSTS, ...(allowedHosts?.map((h) => h.toLowerCase()) || [])];
 
     // If allowedHosts are specified, ensure the hostname matches one of them
     if (
@@ -277,16 +252,11 @@ const isUrlSafe = (url: string, allowedHosts?: string[]): boolean => {
  * @returns The fully constructed and validated URL string.
  * @throws Error if the URL is unsafe or BASE_URL is missing for relative paths.
  */
-const buildUrl = (
-  endpoint: string,
-  params?: QueryParams,
-  allowedHosts?: string[],
-): string => {
+const buildUrl = (endpoint: string, params?: QueryParams, allowedHosts?: string[]): string => {
   let finalUrl: URL;
 
   if (endpoint.startsWith('http://') || endpoint.startsWith('https://')) {
-    if (!isUrlSafe(endpoint, allowedHosts))
-      throw new Error('URL not allowed: potential SSRF risk');
+    if (!isUrlSafe(endpoint, allowedHosts)) throw new Error('URL not allowed: potential SSRF risk');
     finalUrl = new URL(endpoint);
   } else {
     if (!BASE_URL) throw new Error('BASE_URL required for relative paths');
@@ -295,11 +265,8 @@ const buildUrl = (
       ? new URL(endpoint, BASE_URL).toString()
       : new URL(endpoint, basePath).toString();
 
-    if (!isUrlSafe(fullUrl, allowedHosts))
-      throw new Error('URL not allowed: potential SSRF risk');
-    finalUrl = endpoint.startsWith('/')
-      ? new URL(endpoint, BASE_URL)
-      : new URL(endpoint, basePath);
+    if (!isUrlSafe(fullUrl, allowedHosts)) throw new Error('URL not allowed: potential SSRF risk');
+    finalUrl = endpoint.startsWith('/') ? new URL(endpoint, BASE_URL) : new URL(endpoint, basePath);
   }
 
   // Add sanitized query parameters using URLSearchParams
@@ -331,10 +298,7 @@ const buildUrl = (
  * @param custom Custom headers provided by the user.
  * @returns HeadersInit object ready for fetch.
  */
-const buildHeaders = (
-  data?: RequestBody,
-  custom?: Record<string, string>,
-): HeadersInit => {
+const buildHeaders = (data?: RequestBody, custom?: Record<string, string>): HeadersInit => {
   const headers: Record<string, string> = {};
 
   // Sanitize custom headers
@@ -377,18 +341,14 @@ const buildHeaders = (
  * @returns A Promise resolving to the parsed response data.
  * @throws Error if response is too large, or JSON parsing fails.
  */
-const parseResponse = async <T>(
-  response: Response,
-  maxSize: number,
-): Promise<T> => {
+const parseResponse = async <T>(response: Response, maxSize: number): Promise<T> => {
   const contentType = response.headers.get('content-type') || '';
   const contentLength = response.headers.get('content-length');
 
   if (contentLength && parseInt(contentLength, 10) > maxSize) {
-    throw new Error(
-      `Response too large: ${contentLength} bytes (max: ${maxSize})`,
-      { cause: 'PayloadTooLarge' }
-    );
+    throw new Error(`Response too large: ${contentLength} bytes (max: ${maxSize})`, {
+      cause: 'PayloadTooLarge',
+    });
   }
 
   const reader = response.body?.getReader();
@@ -404,7 +364,9 @@ const parseResponse = async <T>(
 
       totalSize += value.length;
       if (totalSize > maxSize)
-        throw new Error(`Response too large: exceeded ${maxSize} bytes`, { cause: 'PayloadTooLarge' });
+        throw new Error(`Response too large: exceeded ${maxSize} bytes`, {
+          cause: 'PayloadTooLarge',
+        });
       chunks.push(value);
     }
 
@@ -428,7 +390,10 @@ const parseResponse = async <T>(
       } catch (error) {
         // Only throw "Invalid JSON" if content-type was explicitly JSON
         if (contentType.includes('application/json')) {
-          throw new Error(`Invalid JSON response: ${error instanceof Error ? error.message : String(error)}`, { cause: 'InvalidJson' });
+          throw new Error(
+            `Invalid JSON response: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: 'InvalidJson' },
+          );
         }
         // Otherwise, return as plain text if it wasn't strictly JSON
       }
@@ -436,7 +401,10 @@ const parseResponse = async <T>(
 
     return text as T;
   } catch (error) {
-    if (error instanceof Error && (error.message.includes('too large') || error.cause === 'PayloadTooLarge')) {
+    if (
+      error instanceof Error &&
+      (error.message.includes('too large') || error.cause === 'PayloadTooLarge')
+    ) {
       throw error; // Re-throw specific size error
     }
     if (error instanceof Error && error.cause === 'InvalidJson') {
@@ -535,7 +503,9 @@ const logTypes = (endpoint: string, data: unknown): void => {
       // Infer type based on the first element, assuming homogeneous array
       const firstType = inferType(val[0], depth + 1);
       // Check if all elements are of the same basic type to avoid overly complex unions
-      const allSameBasicType = val.every((item) => typeof item === typeof val[0] || (item === null && val[0] === null));
+      const allSameBasicType = val.every(
+        (item) => typeof item === typeof val[0] || (item === null && val[0] === null),
+      );
       return allSameBasicType ? `${firstType}[]` : `Array<${firstType} | unknown>`; // More specific if not all same
     }
 
@@ -584,18 +554,15 @@ const prepareRequestBody = (
 ): BodyInit | undefined => {
   if (data == null) return undefined;
 
-  if (
-    data instanceof FormData ||
-    data instanceof Blob ||
-    data instanceof ArrayBuffer
-  ) {
+  if (data instanceof FormData || data instanceof Blob || data instanceof ArrayBuffer) {
     // For these types, size check is harder without reading the entire stream.
     // Rely on network layer or server to handle extreme sizes.
     return data;
   }
 
   if (typeof data === 'string') {
-    if (new TextEncoder().encode(data).length > maxSize) { // Check byte length for strings
+    if (new TextEncoder().encode(data).length > maxSize) {
+      // Check byte length for strings
       throw new Error('Request body too large (string)', { cause: 'PayloadTooLarge' });
     }
     return data;
@@ -603,7 +570,8 @@ const prepareRequestBody = (
 
   // Assume it's Record<string, unknown> and stringify
   const jsonString = JSON.stringify(data);
-  if (new TextEncoder().encode(jsonString).length > maxSize) { // Check byte length for JSON
+  if (new TextEncoder().encode(jsonString).length > maxSize) {
+    // Check byte length for JSON
     throw new Error('Request body too large (JSON)', { cause: 'PayloadTooLarge' });
   }
   return jsonString;
@@ -615,10 +583,7 @@ const prepareRequestBody = (
  * @param tags Cache tags for on-demand revalidation.
  * @returns An object containing Next.js fetch options.
  */
-const buildNextOptions = (
-  revalidate?: number | false,
-  tags?: string[],
-): { next?: NextOptions } => {
+const buildNextOptions = (revalidate?: number | false, tags?: string[]): { next?: NextOptions } => {
   if (revalidate === undefined && (!tags || tags.length === 0)) {
     return {};
   }
@@ -700,7 +665,9 @@ const executeFetch = async <TResponse>(
         const resolvedRedirectUrl = new URL(redirectUrl, currentUrl).toString(); // Resolve relative redirects
 
         if (!isUrlSafe(resolvedRedirectUrl)) {
-          throw new Error('Redirect URL not allowed: potential SSRF risk', { cause: 'SecurityError' });
+          throw new Error('Redirect URL not allowed: potential SSRF risk', {
+            cause: 'SecurityError',
+          });
         }
 
         currentUrl = resolvedRedirectUrl;
@@ -716,10 +683,7 @@ const executeFetch = async <TResponse>(
     }
 
     // Process final response
-    const responseData = await parseResponse<TResponse>(
-      response,
-      maxResponseSize,
-    );
+    const responseData = await parseResponse<TResponse>(response, maxResponseSize);
 
     if (response.ok) {
       return {
@@ -739,7 +703,7 @@ const executeFetch = async <TResponse>(
         response.status,
         attempt,
         responseData,
-        `HTTP ${response.status} error for URL: ${currentUrl}`
+        `HTTP ${response.status} error for URL: ${currentUrl}`,
       ),
     };
   } catch (err) {
@@ -756,7 +720,7 @@ const executeFetch = async <TResponse>(
             408,
             attempt,
             null,
-            `Request to ${currentUrl} timed out after ${timeout}ms`
+            `Request to ${currentUrl} timed out after ${timeout}ms`,
           ),
         };
       }
@@ -769,11 +733,15 @@ const executeFetch = async <TResponse>(
             413,
             attempt,
             null,
-            `Payload too large for URL: ${currentUrl}`
+            `Payload too large for URL: ${currentUrl}`,
           ),
         };
       }
-      if (err.message.includes('not allowed') || err.message.includes('SSRF') || err.cause === 'SecurityError') {
+      if (
+        err.message.includes('not allowed') ||
+        err.message.includes('SSRF') ||
+        err.cause === 'SecurityError'
+      ) {
         return {
           success: false,
           error: createApiError(
@@ -782,7 +750,7 @@ const executeFetch = async <TResponse>(
             403,
             attempt,
             null,
-            `Security error for URL: ${currentUrl} - ${err.message}`
+            `Security error for URL: ${currentUrl} - ${err.message}`,
           ),
         };
       }
@@ -795,7 +763,7 @@ const executeFetch = async <TResponse>(
             400, // Or 500, depending on how you classify this
             attempt,
             null,
-            `Exceeded max redirects (${CONFIG.security.maxRedirects}) for URL: ${currentUrl}`
+            `Exceeded max redirects (${CONFIG.security.maxRedirects}) for URL: ${currentUrl}`,
           ),
         };
       }
@@ -808,7 +776,7 @@ const executeFetch = async <TResponse>(
             currentResponseStatus,
             attempt,
             null,
-            `Failed to parse JSON response from ${currentUrl}: ${err.message}`
+            `Failed to parse JSON response from ${currentUrl}: ${err.message}`,
           ),
         };
       }
@@ -817,7 +785,7 @@ const executeFetch = async <TResponse>(
         err.message.includes('network') ||
         err.message.includes('fetch') ||
         err.message.includes('connection') ||
-        (err as NodeJS.ErrnoException).code // For Node.js specific network errors like ECONNREFUSED, ENOTFOUND
+        (err as NodeJS.ErrnoException).code
       ) {
         return {
           success: false,
@@ -827,7 +795,7 @@ const executeFetch = async <TResponse>(
             500,
             attempt,
             null,
-            `Network error for URL: ${currentUrl} - ${err.message} (Code: ${(err as NodeJS.ErrnoException).code || 'N/A'})`
+            `Network error for URL: ${currentUrl} - ${err.message} (Code: ${(err as NodeJS.ErrnoException).code || 'N/A'})`,
           ),
         };
       }
@@ -840,7 +808,7 @@ const executeFetch = async <TResponse>(
           currentResponseStatus,
           attempt,
           null,
-          `An unknown error occurred for URL: ${currentUrl} - ${err.message}`
+          `An unknown error occurred for URL: ${currentUrl} - ${err.message}`,
         ),
       };
     }
@@ -854,7 +822,7 @@ const executeFetch = async <TResponse>(
         currentResponseStatus,
         attempt,
         null,
-        `An unknown non-Error type was thrown for URL: ${currentUrl}`
+        `An unknown non-Error type was thrown for URL: ${currentUrl}`,
       ),
     };
   }
@@ -893,7 +861,7 @@ const executeFetch = async <TResponse>(
  * headers: { 'X-Custom-Header': 'foobar' },
  * shouldRetry: (error, attempt) => error.status === 503 && attempt < 2,
  * onError: (error, attempt) => console.warn(`Retry ${attempt}:`, error),
- * transform: (data) => ({ userId: data.id, timestamp: Date.now() }), // Transforms CreateApiResponse to TransformedCreateResponse
+ * transform: (data) => ({ userId: data.id, timestamp: Date.now() }),
  * logTypes: true,
  * allowedHosts: ['api.example.com'],
  * maxResponseSize: 5 * 1024 * 1024,
@@ -938,19 +906,47 @@ export default async function apiRequest<
 
   // Input validation
   if (retries < 0 || retries > 10) {
-    const error = createApiError('ValidationError', 'Retries must be between 0 and 10', 400, undefined, null, 'Invalid retries option');
+    const error = createApiError(
+      'ValidationError',
+      'Retries must be between 0 and 10',
+      400,
+      undefined,
+      null,
+      'Invalid retries option',
+    );
     return { success: false, status: 400, error, data: null };
   }
   if (timeout < 1000 || timeout > 300000) {
-    const error = createApiError('ValidationError', 'Timeout must be between 1s and 5 minutes', 400, undefined, null, 'Invalid timeout option');
+    const error = createApiError(
+      'ValidationError',
+      'Timeout must be between 1s and 5 minutes',
+      400,
+      undefined,
+      null,
+      'Invalid timeout option',
+    );
     return { success: false, status: 400, error, data: null };
   }
   if (maxResponseSize < 1024 || maxResponseSize > 100 * 1024 * 1024) {
-    const error = createApiError('ValidationError', 'Max response size must be between 1KB and 100MB', 400, undefined, null, 'Invalid maxResponseSize option');
+    const error = createApiError(
+      'ValidationError',
+      'Max response size must be between 1KB and 100MB',
+      400,
+      undefined,
+      null,
+      'Invalid maxResponseSize option',
+    );
     return { success: false, status: 400, error, data: null };
   }
   if (maxRequestBodySize < 1024 || maxRequestBodySize > 100 * 1024 * 1024) {
-    const error = createApiError('ValidationError', 'Max request body size must be between 1KB and 100MB', 400, undefined, null, 'Invalid maxRequestBodySize option');
+    const error = createApiError(
+      'ValidationError',
+      'Max request body size must be between 1KB and 100MB',
+      400,
+      undefined,
+      null,
+      'Invalid maxRequestBodySize option',
+    );
     return { success: false, status: 400, error, data: null };
   }
 
@@ -967,7 +963,9 @@ export default async function apiRequest<
       400,
       undefined,
       null,
-      error instanceof Error ? `Request validation failed: ${error.message}` : 'Request validation failed with unknown error'
+      error instanceof Error
+        ? `Request validation failed: ${error.message}`
+        : 'Request validation failed with unknown error',
     );
     return { success: false, status: 400, error: apiError, data: null };
   }
@@ -981,12 +979,13 @@ export default async function apiRequest<
     500,
     undefined,
     null,
-    'Initial unknown error before fetch attempt'
+    'Initial unknown error before fetch attempt',
   );
 
   // Retry loop
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const result = await executeFetch<TResponse>( // TResponse is the type *before* transformation
+    const result = await executeFetch<TResponse>(
+      // TResponse is the type *before* transformation
       url,
       method,
       headers,
@@ -1002,7 +1001,9 @@ export default async function apiRequest<
       let finalData: TTransformedResponse; // Use TTransformedResponse here
       try {
         // Apply transformation if provided, otherwise cast to TTransformedResponse (which defaults to TResponse)
-        finalData = transform ? transform(result.data) : (result.data as unknown as TTransformedResponse);
+        finalData = transform
+          ? transform(result.data)
+          : (result.data as unknown as TTransformedResponse);
       } catch (error) {
         lastError = createApiError(
           'TransformError',
@@ -1010,7 +1011,7 @@ export default async function apiRequest<
           result.status,
           attempt,
           null,
-          `Response transformation failed for URL: ${url}. Error: ${error instanceof Error ? error.message : String(error)}`
+          `Response transformation failed for URL: ${url}. Error: ${error instanceof Error ? error.message : String(error)}`,
         );
         onError?.(lastError, attempt);
         return {
@@ -1033,16 +1034,7 @@ export default async function apiRequest<
     lastError = result.error;
     onError?.(lastError, attempt);
 
-    if (
-      !shouldRetryRequest(
-        lastError,
-        attempt,
-        retries,
-        method,
-        customShouldRetry,
-      )
-    )
-      break;
+    if (!shouldRetryRequest(lastError, attempt, retries, method, customShouldRetry)) break;
     await delay(attempt);
   }
 
