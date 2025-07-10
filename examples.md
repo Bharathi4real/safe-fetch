@@ -1,51 +1,43 @@
-# 🛡️ SafeFetch Usage Guide
+# SafeFetch Usage Guide
 
-A typed fetch utility with retry, timeout & Next.js support. Simply copy and paste the code into your project.
+A comprehensive guide for using SafeFetch - a typed fetch utility with retry, timeout, and Next.js support.
 
-## 🚀 Available Features
+## Table of Contents
 
-- ✅ **TypeScript Support** - Full type safety with inference helpers
-- ✅ **Automatic Retries** - Smart retry logic for failed requests
-- ✅ **Timeout Control** - Configurable request timeouts
-- ✅ **Next.js Integration** - ISR, cache tags, and server actions
-- ✅ **Query Parameters** - Easy URL parameter handling
-- ✅ **File Uploads** - FormData support with proper headers
-- ✅ **Authentication** - Built-in Basic Auth from environment
-- ✅ **Error Handling** - Consistent response format with detailed API errors
-- ✅ **Cache Control** - Full fetch cache API support
-- ✅ **Development Tools** - Type inference logging
-- ✅ **SSRF Protection** - Configurable allowed hosts and blocked IP ranges
-- ✅ **Response Transformation** - Custom function to transform successful response data
-- ✅ **Custom Error Handling/Retry Conditions** - Optional callbacks for fine-grained control
-- ✅ **Max Response Size** - Prevents large/malicious responses
+1. [Installation & Setup](#installation--setup)
+2. [Basic Usage](#basic-usage)
+3. [Configuration Options](#configuration-options)
+4. [Request Types](#request-types)
+5. [Response Handling](#response-handling)
+6. [Error Handling](#error-handling)
+7. [Advanced Features](#advanced-features)
+8. [Next.js Integration](#nextjs-integration)
+9. [Security Features](#security-features)
+10. [Environment Configuration](#environment-configuration)
+11. [Best Practices](#best-practices)
+12. [Troubleshooting](#troubleshooting)
+13. [Browser Compatibility](#browser-compatibility)
 
-## 📋 Quick Navigation
-
-- [Setup](#setup) - Environment and installation
-- [Basic Usage](#basic-usage) - Simple GET/POST examples
-- [TypeScript Support](#typescript-support) - Type safety and inference
-- [Query Parameters](#query-parameters) - URL parameter handling
-- [Advanced Features](#advanced-features) - Retries, headers, uploads, transformations, error callbacks
-- [Next.js Specific Features](#nextjs-specific-features) - ISR, cache tags, SSR
-- [Error Handling](#error-handling) - Comprehensive error management
-- [Complete Examples](#complete-examples) - Real-world usage patterns
-- [Environment Variables](#environment-variables) - Configuration options
-- [Response Format](#response-format) - Consistent success and error response structure
-- [Tips & Best Practices](#tips--best-practices) - Development recommendations
-- [Browser Compatibility](#browser-compatibility) - Supported environments
-
-## Setup
+## Installation & Setup
 
 Copy the SafeFetch code into your project (e.g., `lib/api.ts` or `utils/safe-fetch.ts`).
 
 Set optional environment variables:
 
 ```bash
+# API Configuration
 BASE_URL=https://api.your-domain.com
-AUTH_USERNAME=your_username
-AUTH_PASSWORD=your_password
-ALLOWED_HOSTS=api.your-domain.com,another.allowed.host.com
-SAFEFETCH_ALLOWED_HOSTS=additional-security-hosts.com
+
+# Authentication (Choose one)
+AUTH_USERNAME=your_username    # Basic Auth
+AUTH_PASSWORD=your_password    # Basic Auth
+# OR
+AUTH_TOKEN=your_bearer_token   # Bearer Token
+# OR
+API_TOKEN=your_api_token       # Alternative Bearer Token
+
+# Security (Optional)
+ALLOWED_HOSTS=api.example.com,cdn.example.com
 ```
 
 ## Basic Usage
@@ -53,93 +45,326 @@ SAFEFETCH_ALLOWED_HOSTS=additional-security-hosts.com
 ### Simple GET Request
 
 ```typescript
-import apiRequest from './lib/api';
-
 // Basic GET request
 const response = await apiRequest('GET', '/users');
 
-if (response.success) {
-  console.log('Users:', response.data);
+if (apiRequest.isSuccess(response)) {
+  console.log(response.data); // Response data
+  console.log(response.status); // HTTP status code
+  console.log(response.headers); // Response headers
 } else {
-  console.error('Error:', response.error); // response.error is an ApiError object
+  console.error(response.error); // Error details
 }
 ```
 
 ### POST Request with Data
 
 ```typescript
-import apiRequest from './lib/api';
-
-// Create a new user
-const newUser = { name: 'John Doe', email: 'john@example.com' };
-
-const response = await apiRequest('POST', '/users', {
-  data: newUser
-});
-
-if (response.success) {
-  console.log('Created user:', response.data);
-} else {
-  console.error('Error creating user:', response.error);
-}
-```
-
-## TypeScript Support
-
-### Explicit Types
-
-```typescript
-import apiRequest from './lib/api';
-
-interface User {
-  id: number;
+interface CreateUserData {
   name: string;
   email: string;
 }
 
-// Specify response type
-const response = await apiRequest<User[]>('GET', '/users');
+const userData: CreateUserData = {
+  name: 'John Doe',
+  email: 'john@example.com'
+};
 
-if (response.success) {
-  // response.data is now typed as User[]
-  response.data.forEach(user => {
-    console.log(user.name); // TypeScript knows this is a string
-  });
+const response = await apiRequest<any, CreateUserData>('POST', '/users', {
+  data: userData
+});
+
+if (apiRequest.isSuccess(response)) {
+  console.log('User created:', response.data);
 }
 ```
 
-### Type Inference Helper
+## Configuration Options
+
+### Complete Configuration Example
 
 ```typescript
-import apiRequest from './lib/api';
+interface User {
+  id: string;
+  name: string;
+  email: string;
+}
 
-// Log inferred types to console (development only)
-// Note: This logs the *inferred* type of the *response data*
-const response = await apiRequest('GET', '/users', {
-  logTypes: true
-});
+interface CreateUserResponse {
+  success: boolean;
+  user: User;
+  message: string;
+}
 
-// This will log a TypeScript interface to the console (example):
-// 🔍 Inferred Type for "/users"
-// type usersType = {
-//    id: number;
-//    name: string;
-//    email: string;
-// }[];
+interface TransformedResponse {
+  userId: string;
+  userName: string;
+  timestamp: number;
+}
+
+const response = await apiRequest<CreateUserResponse, CreateUserData, TransformedResponse>(
+  'POST',
+  '/users',
+  {
+    // Request body
+    data: { name: 'John', email: 'john@example.com' },
+
+    // Query parameters
+    params: {
+      source: 'web',
+      version: 'v1',
+      debug: true
+    },
+
+    // Retry configuration
+    retries: 3,
+    timeout: 10000, // 10 seconds
+
+    // Caching
+    cache: 'force-cache',
+    revalidate: 3600, // 1 hour
+    tags: ['users', 'create'],
+
+    // Custom headers
+    headers: {
+      'X-Custom-Header': 'my-value',
+      'X-Request-ID': '12345'
+    },
+
+    // Security limits
+    maxResponseSize: 5 * 1024 * 1024, // 5MB
+    maxRequestBodySize: 2 * 1024 * 1024, // 2MB
+    allowedHosts: ['api.example.com', 'cdn.example.com'],
+
+    // Response transformation
+    transform: (data) => ({
+      userId: data.user.id,
+      userName: data.user.name,
+      timestamp: Date.now()
+    }),
+
+    // Error handling
+    onError: (error, attempt) => {
+      console.warn(`Attempt ${attempt + 1} failed:`, error.message);
+    },
+
+    // Custom retry logic
+    shouldRetry: (error, attempt) => {
+      return error.status === 503 && attempt < 2;
+    },
+
+    // Development helpers
+    logTypes: true // Logs inferred TypeScript types
+  }
+);
 ```
 
-## Query Parameters
+## Request Types
+
+### GET Requests
 
 ```typescript
-import apiRequest from './lib/api';
+// Simple GET
+const users = await apiRequest<User[]>('GET', '/users');
 
-// GET /users?page=1&limit=10&active=true
-const response = await apiRequest('GET', '/users', {
+// GET with query parameters
+const filteredUsers = await apiRequest<User[]>('GET', '/users', {
   params: {
     page: 1,
     limit: 10,
     active: true,
     status: null // Null/undefined values are ignored
+  }
+});
+
+// GET with custom headers
+const userDetails = await apiRequest<User>('GET', '/users/123', {
+  headers: {
+    'Accept': 'application/json',
+    'X-API-Version': '2.0'
+  }
+});
+```
+
+### POST Requests
+
+```typescript
+// JSON POST
+const newUser = await apiRequest<User, CreateUserData>('POST', '/users', {
+  data: {
+    name: 'Jane Doe',
+    email: 'jane@example.com'
+  }
+});
+
+// Form data POST
+const formData = new FormData();
+formData.append('name', 'John');
+formData.append('avatar', fileInput.files[0]);
+
+const uploadResponse = await apiRequest<UploadResponse>('POST', '/upload', {
+  data: formData
+});
+
+// Raw string POST
+const textResponse = await apiRequest<string>('POST', '/webhook', {
+  data: JSON.stringify({ event: 'user.created' }),
+  headers: {
+    'Content-Type': 'application/json'
+  }
+});
+```
+
+### PUT/PATCH Requests
+
+```typescript
+// Update user
+const updatedUser = await apiRequest<User, Partial<User>>('PUT', '/users/123', {
+  data: {
+    name: 'Updated Name',
+    email: 'updated@example.com'
+  }
+});
+
+// Partial update
+const patchedUser = await apiRequest<User, Partial<User>>('PATCH', '/users/123', {
+  data: {
+    name: 'New Name Only'
+  }
+});
+```
+
+### DELETE Requests
+
+```typescript
+// Delete user
+const deleteResponse = await apiRequest<{ success: boolean }>('DELETE', '/users/123');
+
+// Delete with confirmation
+const deleteWithConfirm = await apiRequest<DeleteResponse>('DELETE', '/users/123', {
+  params: {
+    confirm: true
+  }
+});
+```
+
+## Response Handling
+
+### Type Guards
+
+```typescript
+const response = await apiRequest<User[]>('GET', '/users');
+
+// Success check
+if (apiRequest.isSuccess(response)) {
+  // TypeScript knows response.data is User[]
+  response.data.forEach(user => console.log(user.name));
+  console.log(`Status: ${response.status}`);
+  console.log(`Headers:`, response.headers);
+}
+
+// Error check
+if (apiRequest.isError(response)) {
+  // TypeScript knows response.error is ApiError
+  console.error(`Error: ${response.error.message}`);
+  console.error(`Status: ${response.error.status}`);
+  console.error(`Attempt: ${response.error.attempt}`);
+}
+```
+
+### Response Transformation
+
+```typescript
+interface ApiResponse {
+  data: User[];
+  meta: {
+    total: number;
+    page: number;
+  };
+}
+
+interface TransformedResponse {
+  users: User[];
+  totalCount: number;
+  currentPage: number;
+}
+
+const response = await apiRequest<ApiResponse, any, TransformedResponse>('GET', '/users', {
+  transform: (data) => ({
+    users: data.data,
+    totalCount: data.meta.total,
+    currentPage: data.meta.page
+  })
+});
+
+if (apiRequest.isSuccess(response)) {
+  // response.data is now TransformedResponse
+  console.log(`Found ${response.data.totalCount} users`);
+}
+```
+
+## Error Handling
+
+### Built-in Error Types
+
+```typescript
+const response = await apiRequest('GET', '/users');
+
+if (apiRequest.isError(response)) {
+  switch (response.error.name) {
+    case 'TimeoutError':
+      console.error('Request timed out');
+      break;
+    case 'NetworkError':
+      console.error('Network connection failed');
+      break;
+    case 'HttpError':
+      console.error(`HTTP ${response.error.status}: ${response.error.message}`);
+      break;
+    case 'ParseError':
+      console.error('Failed to parse response');
+      break;
+    case 'SecurityError':
+      console.error('Request blocked for security reasons');
+      break;
+    case 'ValidationError':
+      console.error('Request validation failed');
+      break;
+    default:
+      console.error('Unknown error:', response.error.message);
+  }
+}
+```
+
+### Custom Error Handling
+
+```typescript
+const response = await apiRequest('GET', '/users', {
+  onError: (error, attempt) => {
+    console.warn(`Attempt ${attempt + 1} failed:`, error.message);
+
+    // Log to external service
+    if (error.status >= 500) {
+      logToErrorService(error);
+    }
+
+    // Show user-friendly message
+    if (error.name === 'NetworkError') {
+      showNotification('Please check your internet connection');
+    }
+  },
+
+  shouldRetry: (error, attempt) => {
+    // Retry on server errors, but not client errors
+    if (error.status >= 500) return attempt < 2;
+
+    // Retry on specific timeout errors
+    if (error.name === 'TimeoutError') return attempt < 1;
+
+    // Don't retry on authentication errors
+    if (error.status === 401) return false;
+
+    return false;
   }
 });
 ```
@@ -149,199 +374,124 @@ const response = await apiRequest('GET', '/users', {
 ### Retry Configuration
 
 ```typescript
-import apiRequest from './lib/api';
-
-// Retry failed requests (only for GET and PUT by default, configurable)
-const response = await apiRequest('GET', '/unstable-endpoint', {
-  retries: 3,   // Will retry up to 3 times
-  timeout: 5000 // 5 second timeout for each attempt
-});
-
-if (!response.success) {
-  console.error(`Request failed after ${response.error.attempt} attempts:`, response.error);
-}
-```
-
-### Custom Headers
-
-```typescript
-import apiRequest from './lib/api';
-
-const response = await apiRequest('POST', '/protected', {
-  data: { message: 'Hello' },
-  headers: {
-    'X-Custom-Header': 'my-value',
-    'Authorization': 'Bearer your-custom-token' // Overrides environment AUTH_HEADER if set
-  }
-});
-```
-
-### File Upload with FormData
-
-```typescript
-import apiRequest from './lib/api';
-
-// Assuming fileInput is an HTMLInputElement like <input type="file" id="fileInput">
-const fileInput = document.getElementById('fileInput') as HTMLInputElement;
-const selectedFile = fileInput?.files?.[0];
-
-if (selectedFile) {
-  const formData = new FormData();
-  formData.append('file', selectedFile);
-  formData.append('description', 'User profile picture');
-
-  const response = await apiRequest<{ url: string }>('POST', '/upload', {
-    data: formData, // Automatically sets 'Content-Type': 'multipart/form-data'
-    timeout: 60000  // Longer timeout for uploads
-  });
-
-  if (response.success) {
-    console.log('File uploaded:', response.data.url);
-  } else {
-    console.error('File upload failed:', response.error);
-  }
-}
-```
-
-### Response Transformation
-
-```typescript
-import apiRequest from './lib/api';
-
-interface RawItem {
-  id: number;
-  name: string;
-  created_at: string; // ISO string
-}
-
-interface TransformedItem {
-  itemId: number;
-  itemName: string;
-  createdAtDate: Date;
-}
-
-const response = await apiRequest<RawItem[], RawItem[]>('GET', '/items', {
-  transform: (data) => {
-    // Transform data after successful fetch, before returning
-    return data.map(item => ({
-      itemId: item.id,
-      itemName: item.name,
-      createdAtDate: new Date(item.created_at)
-    }));
-  }
-});
-
-if (response.success) {
-  response.data.forEach(item => {
-    console.log(item.createdAtDate.getFullYear()); // Transformed type
-  });
-}
-```
-
-### Custom Error Handler (onError)
-
-```typescript
-import apiRequest from './lib/api';
-
-const response = await apiRequest('GET', '/sensitive-data', {
-  onError: (error, attempt) => {
-    console.error(`Attempt ${attempt} failed for /sensitive-data:`, error.message);
-    // You could send this to an external error monitoring service
-    // if (error.status === 401) logoutUser();
-  }
-});
-```
-
-### Custom Retry Condition (shouldRetry)
-
-```typescript
-import apiRequest from './lib/api';
-
-const response = await apiRequest('POST', '/process-task', {
-  data: { taskId: 'abc-123' },
-  retries: 5,
+// Custom retry logic
+const response = await apiRequest('GET', '/api/data', {
+  retries: 3,
+  timeout: 5000,
   shouldRetry: (error, attempt) => {
-    // Only retry for 503 Service Unavailable, and only up to 3 times
-    return error.status === 503 && attempt < 3;
+    // Retry on 5xx errors or network issues
+    if (error.status >= 500) return true;
+    if (error.name === 'NetworkError') return true;
+    if (error.name === 'TimeoutError') return attempt < 2;
+    return false;
   },
-  onError: (error, attempt) => console.warn(`Retry attempt ${attempt} for /process-task:`, error.message)
+  onError: (error, attempt) => {
+    console.log(`Retry ${attempt + 1}: ${error.message}`);
+  }
 });
-
-if (!response.success) {
-  console.error('Task processing failed after all retries:', response.error);
-}
 ```
 
-### Maximum Response Size
+### Type Inference and Debugging
 
 ```typescript
-import apiRequest from './lib/api';
-
-// Limit response size to 2MB
-const response = await apiRequest('GET', '/large-report', {
-  maxResponseSize: 2 * 1024 * 1024 // 2MB
+const response = await apiRequest('GET', '/users', {
+  logTypes: true // Only works in development
 });
 
-if (!response.success && response.error.name === 'PayloadTooLargeError') {
-  console.error('Response exceeded maximum allowed size.');
-}
+// Console output:
+// 🔍 Inferred Type for "/users"
+// type _usersType = {
+//   "id": string;
+//   "name": string;
+//   "email": string;
+// }[];
 ```
 
-## Next.js Specific Features
-
-SafeFetch is designed to seamlessly integrate with the Next.js App Router's extended fetch options.
-
-### ISR (Incremental Static Regeneration)
+### Full URL Support
 
 ```typescript
-// pages/api/products.ts or app/products/page.tsx
-import apiRequest from '../../lib/api'; // Adjust path as needed
+// Use full URLs (with SSRF protection)
+const externalData = await apiRequest('GET', 'https://api.example.com/data', {
+  allowedHosts: ['api.example.com']
+});
 
-// Revalidate cache every 60 seconds
-export default async function ProductsPage() {
-  const response = await apiRequest('GET', '/products', {
-    revalidate: 60 // Revalidate data every 60 seconds
+// Mix of base URL and endpoints
+const response = await apiRequest('GET', '/users'); // Uses BASE_URL
+const external = await apiRequest('GET', 'https://external.com/api'); // Full URL
+```
+
+## Next.js Integration
+
+### Server Actions
+
+```typescript
+'use server';
+
+import apiRequest from '@/lib/safe-fetch';
+
+export async function createUser(formData: FormData) {
+  const response = await apiRequest<User, CreateUserData>('POST', '/users', {
+    data: {
+      name: formData.get('name') as string,
+      email: formData.get('email') as string
+    },
+    // Next.js specific options
+    revalidate: 60, // Revalidate every minute
+    tags: ['users'], // Cache tag for on-demand revalidation
   });
 
-  if (response.success) {
-    return (
-      <div>
-        <h1>Products</h1>
-        {/* Render products */}
-      </div>
-    );
+  if (apiRequest.isSuccess(response)) {
+    return { success: true, user: response.data };
   } else {
-    return <div>Error loading products: {response.error.message}</div>;
+    return { success: false, error: response.error.message };
   }
 }
+```
 
-// You can also disable ISR (dynamic rendering)
-async function fetchDynamicData() {
-  const response = await apiRequest('GET', '/dynamic-data', {
-    revalidate: false // Opt-out of caching for this fetch
+### Static Generation with ISR
+
+```typescript
+// app/users/page.tsx
+import apiRequest from '@/lib/safe-fetch';
+
+export default async function UsersPage() {
+  const response = await apiRequest<User[]>('GET', '/users', {
+    revalidate: 3600, // Revalidate every hour
+    tags: ['users'],
+    cache: 'force-cache'
   });
-  // ...
+
+  if (apiRequest.isError(response)) {
+    return <div>Error loading users</div>;
+  }
+
+  return (
+    <div>
+      {response.data.map(user => (
+        <div key={user.id}>{user.name}</div>
+      ))}
+    </div>
+  );
 }
 ```
 
-### Cache Tags
+### Cache Revalidation
 
 ```typescript
-// app/actions/productActions.ts (Server Action)
 'use server';
-import apiRequest from '../../lib/api'; // Adjust path as needed
-import { revalidateTag } from 'next/cache'; // Import from Next.js
+
+import apiRequest from '@/lib/safe-fetch';
+import { revalidateTag } from 'next/cache';
 
 export async function createProduct(formData: FormData) {
   const newProductData = Object.fromEntries(formData);
   const response = await apiRequest('POST', '/products', {
     data: newProductData,
-    // Tag this fetch for selective revalidation if needed elsewhere
     tags: ['products-list', 'new-arrivals']
   });
 
-  if (response.success) {
-    // After creating a product, revalidate the 'products-list' tag to get fresh data
+  if (apiRequest.isSuccess(response)) {
+    // After creating a product, revalidate the cache
     revalidateTag('products-list');
     console.log('Product created and cache revalidated!');
   } else {
@@ -352,339 +502,326 @@ export async function createProduct(formData: FormData) {
 }
 ```
 
-### Fetch Cache Control
+## Security Features
+
+### SSRF Protection
 
 ```typescript
-import apiRequest from './lib/api';
-
-// Control fetch caching behavior
-const responseNoStore = await apiRequest('GET', '/realtime-data', {
-  cache: 'no-store' // Always fetch fresh data, never cache
+// Allowed hosts configuration
+const response = await apiRequest('GET', 'https://api.example.com/data', {
+  allowedHosts: [
+    'api.example.com',
+    'cdn.example.com',
+    '*.trusted-domain.com' // Wildcards supported
+  ]
 });
 
-// Other common options:
-const responseForceCache = await apiRequest('GET', '/static-content', {
-  cache: 'force-cache' // Always use cache, even if stale (unless revalidated)
+// Blocked URLs (automatically protected):
+// - localhost, 127.0.0.1, private IPs
+// - Metadata endpoints (169.254.169.254)
+// - Non-standard ports
+// - URLs with credentials
+```
+
+### Size Limits
+
+```typescript
+const response = await apiRequest('POST', '/upload', {
+  data: largeFile,
+  maxRequestBodySize: 50 * 1024 * 1024, // 50MB request limit
+  maxResponseSize: 10 * 1024 * 1024, // 10MB response limit
 });
+```
 
-const responseDefaultCache = await apiRequest('GET', '/default-data', {
-  cache: 'default' // Standard browser cache behavior (default for SafeFetch)
+### Header Sanitization
+
+```typescript
+// Headers are automatically sanitized
+const response = await apiRequest('GET', '/api', {
+  headers: {
+    'X-Custom': 'safe-value',
+    'Invalid\r\nHeader': 'blocked', // Automatically filtered
+    'X-Large-Header': 'x'.repeat(10000) // Truncated to maxHeaderLength
+  }
 });
 ```
 
-## Error Handling
+## Environment Configuration
 
-SafeFetch provides a consistent ApiResponse structure, allowing you to easily handle both successful responses and detailed errors.
-
-### Comprehensive Error Handling
-
-```typescript
-import apiRequest from './lib/api';
-
-const response = await apiRequest('GET', '/non-existent-resource');
-
-if (!response.success) {
-  console.error('API Request Failed!');
-  console.error('Status:', response.status);
-  console.error('Error Name:', response.error.name);
-  console.error('Error Message:', response.error.message);
-  console.error('Attempt:', response.error.attempt); // Only present if retries were attempted
-
-  // Handle specific error types or statuses
-  switch (response.error.name) {
-    case 'HttpError':
-      if (response.status === 404) {
-        console.log('Resource not found!');
-      } else if (response.status === 401) {
-        console.log('Authentication required!');
-        // Redirect to login page or refresh token
-      }
-      break;
-    case 'TimeoutError':
-      console.log('The request took too long to respond.');
-      break;
-    case 'NetworkError':
-      console.log('A network issue prevented the request (e.g., no internet).');
-      break;
-    case 'PayloadTooLargeError':
-      console.log('The response or request body was too large.');
-      break;
-    case 'SecurityError':
-      console.log('The request was blocked due to SSRF protection.');
-      break;
-    case 'TransformError':
-      console.log('Failed to transform the response data.');
-      break;
-    default:
-      console.log('An unexpected error occurred.');
-  }
-}
-```
-
-### Automatic Retry Conditions
-
-The utility automatically retries requests when:
-
-- Request times out (TimeoutError or AbortError).
-- Server returns 408 (Request Timeout), 429 (Too Many Requests), 500 (Internal Server Error), 502 (Bad Gateway), 503 (Service Unavailable), or 504 (Gateway Timeout) status codes.
-- Underlying network errors occur (e.g., NetworkError related messages).
-
-**Important:** Retries only apply to idempotent HTTP methods: GET, PUT, DELETE, HEAD, and OPTIONS. POST and PATCH are not retried by default as they may not be idempotent. You can override this using the `shouldRetry` option.
-
-## Complete Examples
-
-### CRUD Operations
-
-```typescript
-import apiRequest from './lib/api';
-
-interface Todo {
-  id: number;
-  title: string;
-  completed: boolean;
-}
-
-class TodoService {
-  // Get all todos
-  static async getAll() {
-    return apiRequest<Todo[]>('GET', '/todos');
-  }
-
-  // Get single todo
-  static async getById(id: number) {
-    return apiRequest<Todo>('GET', `/todos/${id}`);
-  }
-
-  // Create todo
-  static async create(todo: Omit<Todo, 'id'>) {
-    return apiRequest<Todo>('POST', '/todos', { data: todo });
-  }
-
-  // Update todo
-  static async update(id: number, todo: Partial<Todo>) {
-    return apiRequest<Todo>('PUT', `/todos/${id}`, { data: todo });
-  }
-
-  // Delete todo
-  static async delete(id: number) {
-    return apiRequest('DELETE', `/todos/${id}`);
-  }
-}
-
-// Example Usage:
-async function runTodoExamples() {
-  console.log('Fetching all todos...');
-  const allTodos = await TodoService.getAll();
-  if (allTodos.success) {
-    console.log('Todos:', allTodos.data);
-  } else {
-    console.error('Failed to fetch todos:', allTodos.error);
-  }
-
-  console.log('\nCreating a new todo...');
-  const newTodo = await TodoService.create({ title: 'Learn SafeFetch', completed: false });
-  if (newTodo.success) {
-    console.log('New Todo created:', newTodo.data);
-    const todoId = newTodo.data.id;
-
-    console.log(`\nUpdating todo ${todoId}...`);
-    const updatedTodo = await TodoService.update(todoId, { completed: true });
-    if (updatedTodo.success) {
-      console.log('Updated Todo:', updatedTodo.data);
-    } else {
-      console.error('Failed to update todo:', updatedTodo.error);
-    }
-
-    console.log(`\nDeleting todo ${todoId}...`);
-    const deleteResult = await TodoService.delete(todoId);
-    if (deleteResult.success) {
-      console.log(`Todo ${todoId} deleted successfully!`);
-    } else {
-      console.error('Failed to delete todo:', deleteResult.error);
-    }
-
-  } else {
-    console.error('Failed to create todo:', newTodo.error);
-  }
-}
-
-// Uncomment to run:
-// runTodoExamples();
-```
-
-### Search with Pagination
-
-```typescript
-import apiRequest from './lib/api';
-
-interface SearchParams {
-  query: string;
-  page?: number; // Optional, defaults to 1
-  limit?: number; // Optional, defaults to 10
-}
-
-interface SearchResultItem {
-  id: string;
-  title: string;
-  description: string;
-  url: string;
-}
-
-interface SearchResponse {
-  results: SearchResultItem[];
-  total: number;
-  page: number;
-  limit: number;
-}
-
-async function search(params: SearchParams) {
-  return apiRequest<SearchResponse>('GET', '/search', {
-    params,
-    timeout: 10000, // 10 second timeout for search
-    retries: 2,     // Retry search up to 2 times
-    // Example of a custom transform:
-    transform: (data) => ({
-      ...data,
-      results: data.results.map(item => ({
-        ...item,
-        title: item.title.toUpperCase() // Convert titles to uppercase
-      }))
-    })
-  });
-}
-
-// Usage
-async function runSearchExample() {
-  console.log('Searching for "javascript" on page 1...');
-  const results = await search({
-    query: 'javascript',
-    page: 1,
-    limit: 5
-  });
-
-  if (results.success) {
-    console.log('Search Results (transformed titles):', results.data.results);
-    console.log(`Total results: ${results.data.total}`);
-    console.log(`Current page: ${results.data.page}`);
-  } else {
-    console.error('Search failed:', results.error);
-  }
-
-  console.log('\nSearching for "python" on page 2...');
-  const resultsPage2 = await search({
-    query: 'python',
-    page: 2,
-    limit: 3
-  });
-
-  if (resultsPage2.success) {
-    console.log('Search Results (page 2):', resultsPage2.data.results);
-  } else {
-    console.error('Search failed on page 2:', resultsPage2.error);
-  }
-}
-
-// Uncomment to run:
-// runSearchExample();
-```
-
-## Environment Variables
-
-These environment variables can be set in your `.env.local` file (for Next.js) or as system environment variables in other Node.js projects.
+### Environment Variables
 
 ```bash
-# Optional base URL for API requests.
-# If not set, you must use absolute URLs (e.g., 'https://api.example.com/data').
-# If set, relative URLs (e.g., '/users') will be appended to this BASE_URL.
+# .env.local
 BASE_URL=https://api.example.com
+NEXT_PUBLIC_API_URL=https://api.example.com
 
-# Optional Basic Authentication credentials.
-# If both are provided, SafeFetch will include a 'Basic' Authorization header.
-AUTH_USERNAME=your_username
-AUTH_PASSWORD=your_password
+# Authentication
+AUTH_TOKEN=your-bearer-token
+# or
+AUTH_USERNAME=username
+AUTH_PASSWORD=password
+# or
+API_TOKEN=your-api-token
 
-# Optional Bearer Token Authentication.
-# If AUTH_USERNAME and AUTH_PASSWORD are not set, SafeFetch will check for these.
-# It will include a 'Bearer' Authorization header if a valid token is found.
-AUTH_TOKEN=your_bearer_token_here
-API_TOKEN=your_api_key_or_token_here
-
-# Optional: Comma-separated list of allowed hostnames for SSRF protection.
-# Requests to hosts not in this list (or not BASE_URL) will be blocked.
-# Merged with 'SAFEFETCH_ALLOWED_HOSTS'.
+# Security
 ALLOWED_HOSTS=api.example.com,cdn.example.com
+SAFEFETCH_ALLOWED_HOSTS=secure-api.com,trusted.com
 
-# Additional environment variable for allowed hosts (merged with ALLOWED_HOSTS).
-# Useful for adding more hosts without modifying the primary ALLOWED_HOSTS var.
-SAFEFETCH_ALLOWED_HOSTS=secure-api.com,analytics.domain.org
+# Node.js environment
+NODE_ENV=production
 ```
 
-## Response Format
+### Configuration Priority
 
-All `apiRequest` calls return a consistent `Promise<ApiResponse<T>>`. This type provides clear discrimination between success and error states using a `success` boolean.
+1. Options passed to `apiRequest()`
+2. Environment variables
+3. Default values
 
-### Success Response (ApiResponse<T> where success is true)
+## Best Practices
+
+### 1. Type Safety First
 
 ```typescript
-{
-  success: true,
-  status: 200,   // HTTP status code (e.g., 200, 201)
-  data: T,       // Your typed response data (e.g., User[], Product)
-  headers: Headers // The full Headers object from the successful response
+// Define interfaces for better type safety
+interface User {
+  id: string;
+  name: string;
+  email: string;
+  createdAt: string;
 }
+
+interface CreateUserRequest {
+  name: string;
+  email: string;
+}
+
+interface CreateUserResponse {
+  user: User;
+  message: string;
+}
+
+// Use generic types
+const response = await apiRequest<CreateUserResponse, CreateUserRequest>(
+  'POST',
+  '/users',
+  { data: { name: 'John', email: 'john@example.com' } }
+);
 ```
 
-### Error Response (ApiResponse<T> where success is false)
+### 2. Comprehensive Error Handling
 
 ```typescript
-{
-  success: false,
-  status: 400, // HTTP status code (e.g., 400, 404, 500)
-  error: {
-    name: string;    // Category of the error (e.g., "HttpError", "NetworkError", "TimeoutError", "ValidationError", "PayloadTooLargeError", "SecurityError", "TransformError", "UnknownError")
-    message: string; // Detailed error message (from API or internal)
-    status: number;  // The HTTP status code (same as the top-level 'status')
-    attempt?: number;// The retry attempt number at which the error occurred (if retries were used)
-  },
-  data: null // Data is always null on error
+// Always handle errors
+const response = await apiRequest<User[]>('GET', '/users');
+
+if (apiRequest.isError(response)) {
+  // Handle different error types
+  switch (response.error.name) {
+    case 'NetworkError':
+      showOfflineMessage();
+      break;
+    case 'TimeoutError':
+      showRetryButton();
+      break;
+    default:
+      showGenericError(response.error.message);
+  }
+  return;
 }
+
+// Safe to use response.data
+processUsers(response.data);
 ```
 
-## Tips & Best Practices
+### 3. Smart Retry Strategy
 
-1. **Always Check `response.success`**: Before attempting to access `response.data`, always check the `response.success` property. This ensures type safety and prevents runtime errors.
+```typescript
+// Configure retries based on operation type
+const response = await apiRequest('GET', '/users', {
+  retries: 3, // Safe for GET requests
+  shouldRetry: (error, attempt) => {
+    // Retry server errors and network issues
+    return error.status >= 500 || error.name === 'NetworkError';
+  }
+});
 
-2. **Explicitly Type Responses**: While SafeFetch offers some inference, explicitly defining `TResponse` (e.g., `apiRequest<User[]>`) provides the best type safety and IntelliSense.
+// Be cautious with non-idempotent operations
+const createResponse = await apiRequest('POST', '/users', {
+  data: userData,
+  retries: 0 // Don't retry POST by default
+});
+```
 
-3. **Use `logTypes: true` in Dev**: For complex API responses, `logTypes: true` can be incredibly helpful for automatically generating a TypeScript interface or type that matches your API's response structure.
+### 4. Performance Optimization
 
-4. **Understand Retry Behavior**: Remember that retries are enabled by default for GET, PUT, DELETE, HEAD, and OPTIONS methods. For POST or PATCH (which are generally not idempotent), set `retries: 0` or provide a custom `shouldRetry` function if you need to retry them.
+```typescript
+// Use appropriate cache strategies
+const staticData = await apiRequest('GET', '/config', {
+  cache: 'force-cache',
+  revalidate: 86400 // 24 hours
+});
 
-5. **Adjust `timeout` Appropriately**: The default 30-second timeout is a general starting point. Adjust it based on your API's expected response times, especially for long-running operations or large file uploads.
+const dynamicData = await apiRequest('GET', '/user/notifications', {
+  cache: 'no-cache'
+});
+```
 
-6. **Leverage Next.js Features**: If you're in a Next.js App Router environment, make full use of `revalidate` and `tags` for efficient caching and on-demand revalidation.
+### 5. Security Best Practices
 
-7. **Implement `onError` for Analytics**: Use the `onError` callback to log errors to your monitoring systems, trigger alerts, or handle specific error scenarios (e.g., force logout on a 401 Unauthorized).
+```typescript
+// Always specify allowed hosts for external APIs
+const externalData = await apiRequest('GET', 'https://api.third-party.com/data', {
+  allowedHosts: ['api.third-party.com'],
+  maxResponseSize: 1024 * 1024 // Limit response size
+});
+```
 
-8. **SSRF Protection**: Configure `ALLOWED_HOSTS` environment variables to prevent Server-Side Request Forgery vulnerabilities, especially when making requests to dynamic URLs.
+### 6. Development Tips
+
+- **Always Check Response Success**: Use `apiRequest.isSuccess()` before accessing `response.data`
+- **Explicitly Type Responses**: Define `TResponse` types for better IntelliSense
+- **Use `logTypes: true` in Development**: Automatically generate TypeScript interfaces
+- **Understand Retry Behavior**: Retries are enabled by default for idempotent methods
+- **Adjust Timeouts Appropriately**: Default 30 seconds may need adjustment for your use case
+- **Leverage Next.js Features**: Use `revalidate` and `tags` for efficient caching
+- **Implement Error Analytics**: Use `onError` callback for monitoring and alerts
+
+## Troubleshooting
+
+### Common Issues and Solutions
+
+#### SSRF Protection Blocking Valid Requests
+
+```typescript
+// Problem: Request blocked by SSRF protection
+const response = await apiRequest('GET', 'https://api.example.com/data');
+// Error: "URL not allowed: potential SSRF risk"
+
+// Solution: Add to allowed hosts
+const response = await apiRequest('GET', 'https://api.example.com/data', {
+  allowedHosts: ['api.example.com']
+});
+
+// Or use environment variable
+// ALLOWED_HOSTS=api.example.com,cdn.example.com
+```
+
+#### Request Body Too Large
+
+```typescript
+// Problem: Large request body rejected
+const response = await apiRequest('POST', '/upload', {
+  data: largeFile
+});
+// Error: "Request body too large"
+
+// Solution: Increase size limit
+const response = await apiRequest('POST', '/upload', {
+  data: largeFile,
+  maxRequestBodySize: 50 * 1024 * 1024 // 50MB
+});
+```
+
+#### Timeout Issues
+
+```typescript
+// Problem: Requests timing out
+const response = await apiRequest('GET', '/slow-endpoint');
+// Error: "Request timeout after 30000ms"
+
+// Solution: Increase timeout
+const response = await apiRequest('GET', '/slow-endpoint', {
+  timeout: 60000 // 60 seconds
+});
+```
+
+#### TypeScript Errors
+
+```typescript
+// Problem: Type mismatches
+interface User { id: string; name: string; }
+const response = await apiRequest<User[]>('GET', '/users');
+// Error: Property 'email' does not exist on type 'User'
+
+// Solution: Update interface or use transformation
+interface ApiUser { id: string; name: string; email: string; }
+const response = await apiRequest<ApiUser[]>('GET', '/users');
+```
+
+#### Authentication Issues
+
+```typescript
+// Problem: 401 Unauthorized
+const response = await apiRequest('GET', '/protected');
+// Error: HTTP 401 Error
+
+// Solution: Check environment variables
+// AUTH_TOKEN=your-token
+// or
+// AUTH_USERNAME=user
+// AUTH_PASSWORD=pass
+
+// Or pass custom headers
+const response = await apiRequest('GET', '/protected', {
+  headers: {
+    'Authorization': 'Bearer your-token'
+  }
+});
+```
+
+### Debug Mode
+
+```typescript
+// Enable detailed logging in development
+const response = await apiRequest('GET', '/users', {
+  logTypes: true, // Log inferred types
+  onError: (error, attempt) => {
+    console.log('Debug info:', {
+      error: error.devMessage || error.message,
+      attempt,
+      status: error.status,
+      data: error.data
+    });
+  }
+});
+```
 
 ## Browser Compatibility
 
 SafeFetch is designed to be highly compatible with modern JavaScript environments.
 
-**Works in all modern environments that support:**
+### Requirements
+
+SafeFetch requires support for:
 - Fetch API
 - AbortController
 - Promises
 - URL constructor
 - TextDecoder (for response parsing)
-- Buffer (Node.js for auth header, typically polyfilled in modern bundlers for browser environments if needed)
+- Buffer (Node.js for auth header, typically polyfilled in modern bundlers)
 
-**Compatible with:**
+### Compatible Environments
+
 - ✅ Next.js 13+ (App Router)
 - ✅ React 18+
 - ✅ Node.js 18+
-- ✅ All evergreen modern browsers (Chrome, Firefox, Safari, Edge)
+- ✅ All modern browsers (Chrome, Firefox, Safari, Edge)
+
+## Summary
+
+SafeFetch provides a robust, type-safe HTTP client with comprehensive error handling, retry logic, and security features. It's designed to work seamlessly with Next.js while providing excellent developer experience through TypeScript support and detailed error information.
+
+### Key Benefits
+
+- **Full TypeScript Support**: Generic types and automatic inference
+- **Automatic Retry Logic**: Exponential backoff with customizable strategies
+- **SSRF Protection**: Built-in security features and request validation
+- **Next.js Integration**: ISR, caching, and revalidation support
+- **Comprehensive Error Handling**: Detailed error types and custom handlers
+- **Response Transformation**: Transform API responses to match your needs
+- **Development Tools**: Type debugging and detailed logging
+
+For more advanced use cases or custom configurations, refer to the source code and adapt the examples to your specific needs.
 
 ---
 
