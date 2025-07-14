@@ -15,6 +15,21 @@ export type RequestBody = Record<string, unknown> | FormData | string | ArrayBuf
 /** Query parameter types */
 export type QueryParams = Record<string, string | number | boolean | null | undefined>;
 
+export type ErrorData =
+  | string
+  | number
+  | boolean
+  | null
+  | undefined
+  | Record<string, unknown>
+  | Array<unknown>
+  | Blob
+  | ArrayBuffer
+  | FormData
+  | ReadableStream
+  | BigInt
+  | symbol;
+
 /** Next.js specific options */
 export interface NextOptions {
   revalidate?: number | false;
@@ -68,8 +83,12 @@ export interface ApiError {
   readonly message: string;
   readonly status: number;
   readonly attempt?: number;
-  readonly data?: unknown;
-  readonly devMessage?: string; // For more verbose error details in dev
+  readonly data?: ErrorData;
+  readonly devMessage?: string;
+  readonly originalError?: Error;
+  readonly contentType?: string;
+  readonly dataType?: string;
+  readonly dataSizeBytes?: number;
 }
 
 /** Type-safe API response with success/error discrimination */
@@ -160,15 +179,44 @@ const createApiError = (
   status: number,
   attempt?: number,
   data?: unknown,
-  devMessage?: string, // More verbose message for development
-): ApiError => ({
-  name,
-  message: IS_DEV && devMessage ? devMessage : message,
-  status,
-  attempt,
-  data,
-  ...(IS_DEV && devMessage && { devMessage }),
-});
+  devMessage?: string,
+  originalError?: Error,
+  contentType?: string,
+): ApiError => {
+  // Safely determine data type and size
+  const getDataInfo = (data: unknown): { dataType: string; dataSizeBytes?: number } => {
+    if (data === null) return { dataType: 'null' };
+    if (data === undefined) return { dataType: 'undefined' };
+    if (typeof data === 'string') return { dataType: 'string', dataSizeBytes: new TextEncoder().encode(data).length };
+    if (typeof data === 'number') return { dataType: 'number' };
+    if (typeof data === 'boolean') return { dataType: 'boolean' };
+    if (typeof data === 'bigint') return { dataType: 'bigint' };
+    if (typeof data === 'symbol') return { dataType: 'symbol' };
+    if (data instanceof Blob) return { dataType: 'Blob', dataSizeBytes: data.size };
+    if (data instanceof ArrayBuffer) return { dataType: 'ArrayBuffer', dataSizeBytes: data.byteLength };
+    if (data instanceof FormData) return { dataType: 'FormData' };
+    if (data instanceof ReadableStream) return { dataType: 'ReadableStream' };
+    if (Array.isArray(data)) return { dataType: 'Array', dataSizeBytes: JSON.stringify(data).length };
+    if (typeof data === 'object') return { dataType: 'Object', dataSizeBytes: JSON.stringify(data).length };
+    return { dataType: 'unknown' };
+  };
+
+  const { dataType, dataSizeBytes } = getDataInfo(data);
+
+  return {
+    name,
+    message: IS_DEV && devMessage ? devMessage : message,
+    status,
+    attempt,
+    data: data as ErrorData,
+    ...(IS_DEV && devMessage && { devMessage }),
+    ...(originalError && { originalError }),
+    ...(contentType && { contentType }),
+    dataType,
+    ...(dataSizeBytes && { dataSizeBytes }),
+  };
+};
+
 
 /**
  * Validates a URL for SSRF protection by checking protocols, blocked hosts/IPs,
@@ -351,8 +399,39 @@ const parseResponse = async <T>(response: Response, maxSize: number): Promise<T>
     });
   }
 
+  // Handle different content types appropriately
+  if (contentType.includes('application/json')) {
+    const text = await response.text();
+    if (text.length > maxSize) {
+      throw new Error(`Response too large: ${text.length} bytes (max: ${maxSize})`, {
+        cause: 'PayloadTooLarge',
+      });
+    }
+    try {
+      return JSON.parse(text) as T;
+    } catch (error) {
+      throw new Error(
+        `Invalid JSON response: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: 'InvalidJson' },
+      );
+    }
+  }
+
+  if (contentType.includes('application/octet-stream') || contentType.includes('application/pdf')) {
+    return response.arrayBuffer() as Promise<T>;
+  }
+
+  if (contentType.includes('multipart/form-data')) {
+    return response.formData() as Promise<T>;
+  }
+
+  if (contentType.includes('image/') || contentType.includes('video/') || contentType.includes('audio/')) {
+    return response.blob() as Promise<T>;
+  }
+
+  // Default to text for other content types
   const reader = response.body?.getReader();
-  if (!reader) return '' as T; // Return empty string for no body
+  if (!reader) return '' as T;
 
   const chunks: Uint8Array[] = [];
   let totalSize = 0;
@@ -377,25 +456,15 @@ const parseResponse = async <T>(response: Response, maxSize: number): Promise<T>
       offset += chunk.length;
     }
 
-    // Use TextDecoder with 'fatal: false' for robustness against malformed UTF-8
     const text = new TextDecoder('utf-8', { fatal: false }).decode(combined);
 
-    // Parse JSON if content-type indicates or text heuristically looks like JSON
-    if (
-      contentType.includes('application/json') ||
-      /^\s*[{[]/.test(text.trim()) // Check for starting with { or [ after trimming whitespace
-    ) {
+    // Try to parse as JSON if it looks like JSON
+    if (/^\s*[{[]/.test(text.trim())) {
       try {
         return JSON.parse(text) as T;
-      } catch (error) {
-        // Only throw "Invalid JSON" if content-type was explicitly JSON
-        if (contentType.includes('application/json')) {
-          throw new Error(
-            `Invalid JSON response: ${error instanceof Error ? error.message : String(error)}`,
-            { cause: 'InvalidJson' },
-          );
-        }
-        // Otherwise, return as plain text if it wasn't strictly JSON
+      } catch {
+        // If JSON parsing fails, return as text
+        return text as T;
       }
     }
 
@@ -405,14 +474,15 @@ const parseResponse = async <T>(response: Response, maxSize: number): Promise<T>
       error instanceof Error &&
       (error.message.includes('too large') || error.cause === 'PayloadTooLarge')
     ) {
-      throw error; // Re-throw specific size error
+      throw error;
     }
     if (error instanceof Error && error.cause === 'InvalidJson') {
-      throw error; // Re-throw specific JSON error
+      throw error;
     }
     throw new Error('Failed to read or parse response body', { cause: error });
   }
 };
+
 
 /**
  * Creates an AbortController with a timeout and a cleanup function.
@@ -490,34 +560,33 @@ const shouldRetryRequest = (
  * @param endpoint The API endpoint.
  * @param data The data from which to infer types.
  */
-const logTypes = (endpoint: string, data: unknown): void => {
+const logTypes = (endpoint: string, data: unknown, prefix = ''): void => {
   if (!IS_DEV) return;
 
-  const inferType = (val: unknown, depth = 0): string => {
+  const inferType = (val: unknown, depth = 0, path = ''): string => {
     if (depth > 10) return 'unknown /* depth exceeded */';
     if (val === null) return 'null';
     if (val === undefined) return 'undefined';
 
     if (Array.isArray(val)) {
       if (val.length === 0) return 'unknown[]';
-      // Infer type based on the first element, assuming homogeneous array
-      const firstType = inferType(val[0], depth + 1);
-      // Check if all elements are of the same basic type to avoid overly complex unions
+      const firstType = inferType(val[0], depth + 1, `${path}[0]`);
       const allSameBasicType = val.every(
         (item) => typeof item === typeof val[0] || (item === null && val[0] === null),
       );
-      return allSameBasicType ? `${firstType}[]` : `Array<${firstType} | unknown>`; // More specific if not all same
+      return allSameBasicType ? `${firstType}[]` : `Array<${firstType} | unknown>`;
     }
 
     if (typeof val === 'object' && val !== null) {
       const obj = val as Record<string, unknown>;
       const props = Object.entries(obj)
-        .slice(0, 50) // Limit number of properties to infer for very large objects
+        .slice(0, 50)
         .map(([k, v]) => {
+          const keyPath = path ? `${path}.${k}` : k;
           const valueType = /password|token|secret|key|auth/i.test(k)
             ? 'string /* redacted */'
-            : inferType(v, depth + 1);
-          return `    ${JSON.stringify(k)}: ${valueType};`;
+            : inferType(v, depth + 1, keyPath);
+          return `    ${JSON.stringify(k)}: ${valueType}; // ${keyPath}`;
         })
         .join('\n');
       const ellipsis = Object.keys(obj).length > 50 ? '\n    // ... more properties' : '';
@@ -528,14 +597,31 @@ const logTypes = (endpoint: string, data: unknown): void => {
   };
 
   try {
-    const typeName = endpoint
+    const typeName = (prefix + endpoint)
       .replace(/[^a-zA-Z0-9]/g, '_')
       .replace(/^_+|_+$/g, '')
       .replace(/_{2,}/g, '_')
       .replace(/^(\d)/, '_$1');
     const inferred = inferType(data);
-    console.log(`🔍 Inferred Type for "${endpoint}"`);
+    console.log(`🔍 ${prefix}Inferred Type for "${endpoint}"`);
     console.log(`type ${typeName}Type = ${inferred};`);
+
+    // Log common error properties if they exist
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      const obj = data as Record<string, unknown>;
+      if ('error' in obj) {
+        console.log(`// Error message type: ${typeof obj.error}`);
+        if (typeof obj.error === 'string') {
+          console.log(`// Error: "${obj.error}"`);
+        }
+      }
+      if ('message' in obj) {
+        console.log(`// Message type: ${typeof obj.message}`);
+        if (typeof obj.message === 'string') {
+          console.log(`// Message: "${obj.message}"`);
+        }
+      }
+    }
   } catch (err) {
     console.warn('[logTypes] Failed to infer types:', err);
   }
@@ -637,6 +723,7 @@ const executeFetch = async <TResponse>(
   let response: Response;
   let currentResponseStatus = 500;
   let timeoutController: TimeoutController | null = null;
+  let responseContentType: string | null = null;
 
   try {
     while (true) {
@@ -658,6 +745,7 @@ const executeFetch = async <TResponse>(
       timeoutController = null; // Clear reference
 
       currentResponseStatus = response.status;
+      responseContentType = response.headers.get('content-type');
 
       // Handle redirects (3xx status codes)
       if (response.status >= 300 && response.status < 400 && response.headers.has('Location')) {
@@ -694,7 +782,14 @@ const executeFetch = async <TResponse>(
       };
     }
 
-    // HTTP error response
+    // HTTP error response - now with enhanced error data and automatic type logging
+    const errorData = responseData;
+
+    // Always log types for error responses in development
+    if (IS_DEV) {
+      logTypes(currentUrl, errorData, 'Error_');
+    }
+
     return {
       success: false,
       error: createApiError(
@@ -702,14 +797,18 @@ const executeFetch = async <TResponse>(
         `HTTP ${response.status} Error`,
         response.status,
         attempt,
-        responseData,
+        errorData, // This can now be any type
         `HTTP ${response.status} error for URL: ${currentUrl}`,
+        undefined,
+        responseContentType || undefined,
       ),
     };
   } catch (err) {
     timeoutController?.cleanup(); // Ensure cleanup if error occurs before response is received
 
-    // Determine specific error type
+    const originalError = err instanceof Error ? err : new Error(String(err));
+
+    // Determine specific error type with enhanced error data
     if (err instanceof Error) {
       if (err.name === 'AbortError' || err.message.includes('timeout')) {
         return {
@@ -721,6 +820,8 @@ const executeFetch = async <TResponse>(
             attempt,
             null,
             `Request to ${currentUrl} timed out after ${timeout}ms`,
+            originalError,
+            responseContentType || undefined,
           ),
         };
       }
@@ -734,6 +835,8 @@ const executeFetch = async <TResponse>(
             attempt,
             null,
             `Payload too large for URL: ${currentUrl}`,
+            originalError,
+            responseContentType || undefined,
           ),
         };
       }
@@ -751,6 +854,8 @@ const executeFetch = async <TResponse>(
             attempt,
             null,
             `Security error for URL: ${currentUrl} - ${err.message}`,
+            originalError,
+            responseContentType || undefined,
           ),
         };
       }
@@ -764,6 +869,8 @@ const executeFetch = async <TResponse>(
             attempt,
             null,
             `Exceeded max redirects (${CONFIG.security.maxRedirects}) for URL: ${currentUrl}`,
+            originalError,
+            responseContentType || undefined,
           ),
         };
       }
@@ -777,6 +884,8 @@ const executeFetch = async <TResponse>(
             attempt,
             null,
             `Failed to parse JSON response from ${currentUrl}: ${err.message}`,
+            originalError,
+            responseContentType || undefined,
           ),
         };
       }
@@ -796,6 +905,8 @@ const executeFetch = async <TResponse>(
             attempt,
             null,
             `Network error for URL: ${currentUrl} - ${err.message} (Code: ${(err as NodeJS.ErrnoException).code || 'N/A'})`,
+            originalError,
+            responseContentType || undefined,
           ),
         };
       }
@@ -809,6 +920,8 @@ const executeFetch = async <TResponse>(
           attempt,
           null,
           `An unknown error occurred for URL: ${currentUrl} - ${err.message}`,
+          originalError,
+          responseContentType || undefined,
         ),
       };
     }
@@ -823,6 +936,8 @@ const executeFetch = async <TResponse>(
         attempt,
         null,
         `An unknown non-Error type was thrown for URL: ${currentUrl}`,
+        originalError,
+        responseContentType || undefined,
       ),
     };
   }
