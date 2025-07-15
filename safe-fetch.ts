@@ -27,7 +27,7 @@ export type ErrorData =
   | ArrayBuffer
   | FormData
   | ReadableStream
-  | BigInt
+  | bigint
   | symbol;
 
 /** Next.js specific options */
@@ -187,17 +187,21 @@ const createApiError = (
   const getDataInfo = (data: unknown): { dataType: string; dataSizeBytes?: number } => {
     if (data === null) return { dataType: 'null' };
     if (data === undefined) return { dataType: 'undefined' };
-    if (typeof data === 'string') return { dataType: 'string', dataSizeBytes: new TextEncoder().encode(data).length };
+    if (typeof data === 'string')
+      return { dataType: 'string', dataSizeBytes: new TextEncoder().encode(data).length };
     if (typeof data === 'number') return { dataType: 'number' };
     if (typeof data === 'boolean') return { dataType: 'boolean' };
     if (typeof data === 'bigint') return { dataType: 'bigint' };
     if (typeof data === 'symbol') return { dataType: 'symbol' };
     if (data instanceof Blob) return { dataType: 'Blob', dataSizeBytes: data.size };
-    if (data instanceof ArrayBuffer) return { dataType: 'ArrayBuffer', dataSizeBytes: data.byteLength };
+    if (data instanceof ArrayBuffer)
+      return { dataType: 'ArrayBuffer', dataSizeBytes: data.byteLength };
     if (data instanceof FormData) return { dataType: 'FormData' };
     if (data instanceof ReadableStream) return { dataType: 'ReadableStream' };
-    if (Array.isArray(data)) return { dataType: 'Array', dataSizeBytes: JSON.stringify(data).length };
-    if (typeof data === 'object') return { dataType: 'Object', dataSizeBytes: JSON.stringify(data).length };
+    if (Array.isArray(data))
+      return { dataType: 'Array', dataSizeBytes: JSON.stringify(data).length };
+    if (typeof data === 'object')
+      return { dataType: 'Object', dataSizeBytes: JSON.stringify(data).length };
     return { dataType: 'unknown' };
   };
 
@@ -216,7 +220,6 @@ const createApiError = (
     ...(dataSizeBytes && { dataSizeBytes }),
   };
 };
-
 
 /**
  * Validates a URL for SSRF protection by checking protocols, blocked hosts/IPs,
@@ -325,6 +328,7 @@ const buildUrl = (endpoint: string, params?: QueryParams, allowedHosts?: string[
         const sanitizedKey = key.replace(/[^\w\-_.]/g, '').substring(0, 100);
         const sanitizedValue = String(value)
           .substring(0, 1000)
+          // biome-ignore lint/suspicious/noControlCharactersInRegex: <needed>
           .replace(/[\x00-\x1f\x7f-\x9f]/g, ''); // Remove control characters
 
         if (sanitizedKey && sanitizedValue) {
@@ -355,7 +359,9 @@ const buildHeaders = (data?: RequestBody, custom?: Record<string, string>): Head
       // Validate header key against RFC 7230 (field-name)
       if (/^[!#$%&'*+\-.0-9A-Z^_`a-z|~]+$/.test(key)) {
         // Sanitize header value: remove control characters including CR/LF
+
         const sanitizedValue = value
+          // biome-ignore lint/suspicious/noControlCharactersInRegex: <needed>
           .replace(/[\x00-\x1f\x7f-\xff\r\n]/g, '') // Explicitly remove CR/LF
           .substring(0, CONFIG.security.maxHeaderLength);
         if (sanitizedValue) headers[key] = sanitizedValue;
@@ -425,7 +431,11 @@ const parseResponse = async <T>(response: Response, maxSize: number): Promise<T>
     return response.formData() as Promise<T>;
   }
 
-  if (contentType.includes('image/') || contentType.includes('video/') || contentType.includes('audio/')) {
+  if (
+    contentType.includes('image/') ||
+    contentType.includes('video/') ||
+    contentType.includes('audio/')
+  ) {
     return response.blob() as Promise<T>;
   }
 
@@ -483,7 +493,6 @@ const parseResponse = async <T>(response: Response, maxSize: number): Promise<T>
   }
 };
 
-
 /**
  * Creates an AbortController with a timeout and a cleanup function.
  * @param ms The timeout duration in milliseconds.
@@ -513,7 +522,7 @@ const createTimeout = (ms: number): TimeoutController => {
  */
 const delay = (attempt: number): Promise<void> => {
   // Max delay of 10 seconds
-  const baseMs = Math.min(1000 * Math.pow(2, attempt), 10000);
+  const baseMs = Math.min(1000 * 2 ** attempt, 10000);
   const jitter = baseMs * 0.25 * (Math.random() - 0.5); // +/- 12.5% jitter
   const finalMs = Math.max(100, Math.min(baseMs + jitter, 10000)); // Min 100ms, Max 10s
   return new Promise((resolve) => setTimeout(resolve, finalMs));
@@ -760,10 +769,6 @@ const executeFetch = async <TResponse>(
 
         currentUrl = resolvedRedirectUrl;
         redirectCount++;
-        // For 301, 302, 303, GET is usually used for the redirect. For 307, 308, original method is preserved.
-        // Node.js fetch generally follows this, but for manual, we'll keep the method for simplicity.
-        // If strict adherence to RFCs for method changes on redirect is needed, this logic would expand.
-        continue; // Continue loop to fetch the redirected URL
       } else {
         // Not a redirect, or no Location header, so break and process response
         break;
