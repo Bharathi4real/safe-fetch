@@ -787,11 +787,10 @@ const executeFetch = async <TResponse>(
       };
     }
 
-    // HTTP error response - now with enhanced error data and automatic type logging
+    // HTTP error response - now with enhanced error data and type logging
     const errorData = responseData;
 
-    // Always log types for error responses in development
-    if (IS_DEV) {
+    if (IS_DEV && logTypes) {
       logTypes(currentUrl, errorData, 'Error_');
     }
 
