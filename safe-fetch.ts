@@ -1241,7 +1241,7 @@ const executeFetch = async <TResponse>(
  * // SAFEFETCH_ALLOWED_HOSTS=secure-api.com
  * ```
  */
-export default async function apiRequest<
+async function apiRequest<
   TResponse = unknown, // Original response type from API
   TBody extends RequestBody = RequestBody,
   TTransformedResponse = TResponse, // Transformed response type
@@ -1493,3 +1493,6 @@ apiRequest.isSuccess = <T>(
 apiRequest.isError = <T>(
   response: ApiResponse<T>,
 ): response is Extract<ApiResponse<T>, { success: false }> => !response.success;
+
+
+export default apiRequest;
