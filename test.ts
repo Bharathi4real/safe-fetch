@@ -3,6 +3,7 @@
  * (c) 2025 Bharathi4real – BSD 3-Clause License
  * https://github.com/Bharathi4real/safe-fetch
  */
+'use server';
 
 import { revalidatePath, revalidateTag } from 'next/cache';
 
@@ -44,13 +45,13 @@ const MAX = {
 /**
  * HTTP methods with perfect autocomplete
  */
-export const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
+const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
 export type HttpMethod = (typeof HTTP_METHODS)[number];
 
 /**
  * HTTP status codes
  */
-export const STATUS = {
+const STATUS = {
   OK: 200,
   CREATED: 201,
   NO_CONTENT: 204,
@@ -238,8 +239,9 @@ export interface RequestOptions<TData = unknown> {
   retryDelay?: number;
 
   /**
-   * CSRF token. Required for any mutation (POST, PUT, etc).
-   * Must be at least 32 chars and contain only safe characters.
+   * CSRF token. Optional for mutation requests (POST, PUT, etc).
+   * When provided, must be at least 32 chars and contain only safe characters.
+   * If not provided, no CSRF validation will be performed.
    */
   csrfToken?: string;
 
@@ -260,10 +262,10 @@ export interface RequestOptions<TData = unknown> {
  * Method-specific options with proper typing
  */
 export type GetOptions = Omit<RequestOptions<never>, 'data' | 'csrfToken'>;
-export type PostOptions<T> = RequestOptions<T> & { csrfToken: string };
-export type PutOptions<T> = RequestOptions<T> & { csrfToken: string };
-export type PatchOptions<T> = RequestOptions<T> & { csrfToken: string };
-export type DeleteOptions = RequestOptions<never> & { csrfToken: string };
+export type PostOptions<T> = RequestOptions<T>;
+export type PutOptions<T> = RequestOptions<T>;
+export type PatchOptions<T> = RequestOptions<T>;
+export type DeleteOptions = RequestOptions<never>;
 
 /**
  * API response with success/error states
@@ -349,22 +351,22 @@ export async function apiRequest<T>(
 export async function apiRequest<T>(
   method: 'POST',
   url: string,
-  options: PostOptions<T>,
+  options?: PostOptions<T>,
 ): Promise<ApiResponse<T>>;
 export async function apiRequest<T>(
   method: 'PUT',
   url: string,
-  options: PutOptions<T>,
+  options?: PutOptions<T>,
 ): Promise<ApiResponse<T>>;
 export async function apiRequest<T>(
   method: 'PATCH',
   url: string,
-  options: PatchOptions<T>,
+  options?: PatchOptions<T>,
 ): Promise<ApiResponse<T>>;
 export async function apiRequest<T>(
   method: 'DELETE',
   url: string,
-  options: DeleteOptions,
+  options?: DeleteOptions,
 ): Promise<ApiResponse<T>>;
 
 /**
@@ -372,7 +374,7 @@ export async function apiRequest<T>(
  *
  * This function:
  * - Automatically attaches credentials (JWT or Basic Auth)
- * - Protects mutations with CSRF checks
+ * - Optionally validates mutations with CSRF checks
  * - Handles common HTTP errors and maps them to helpful messages
  * - Automatically retries on failures (with backoff)
  * - Validates inputs like URLs, methods, payload size
@@ -394,11 +396,19 @@ export async function apiRequest<T>(
  * }
  * ```
  *
- * POST request with CSRF and cache revalidation:
+ * POST request with optional CSRF and cache revalidation:
  * ```ts
  * const res = await apiRequest<User>('POST', '/api/users', {
  *   data: { name: 'Jane' },
- *   csrfToken: csrf,
+ *   csrfToken: csrf, // Optional - provide if your API requires it
+ *   revalidateTags: ['users']
+ * });
+ * ```
+ *
+ * POST request without CSRF (for APIs that don't require it):
+ * ```ts
+ * const res = await apiRequest<User>('POST', '/api/users', {
+ *   data: { name: 'Jane' },
  *   revalidateTags: ['users']
  * });
  * ```
@@ -407,7 +417,7 @@ export async function apiRequest<T>(
  * ```ts
  * const res = await apiRequest<User>('PUT', '/api/users/123', {
  *   data: { name: 'John' },
- *   csrfToken: csrf,
+ *   csrfToken: csrf, // Optional
  *   timeout: 15000,
  *   retryAttempts: 2,
  *   revalidatePaths: ['/users']
@@ -510,19 +520,8 @@ export async function apiRequest<T>(
     };
   }
 
-  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
-    if (!csrfToken) {
-      return {
-        success: false,
-        error: createError(
-          STATUS.FORBIDDEN,
-          'AUTH_ERROR',
-          'CSRF token is required for mutations (POST/PUT/PATCH/DELETE)',
-          requestId,
-        ),
-        data: null,
-      };
-    }
+  // Optional CSRF validation - only check if token is provided
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && csrfToken !== undefined) {
     if (!/^[a-zA-Z0-9-_]{32,}$/.test(csrfToken)) {
       return {
         success: false,
