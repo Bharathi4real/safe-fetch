@@ -19,11 +19,11 @@ if (!env.BASE_URL?.startsWith('https://')) {
   throw new Error('BASE_URL must start with https://');
 }
 
-const PROD_ALLOWED_DOMAINS = ['api.example.com', 'another.example.com'] as const;
+const PROD_ALLOWED_DOMAINS = ['api.example.com', 'another.example.com'] satisfies string[];
 
 if (
   process.env.NODE_ENV === 'production' &&
-  !PROD_ALLOWED_DOMAINS.includes(new URL(env.BASE_URL).hostname as any)
+  !PROD_ALLOWED_DOMAINS.includes(new URL(env.BASE_URL).hostname)
 ) {
   throw new Error('BASE_URL must be one of the allowed production domains');
 }
@@ -586,7 +586,14 @@ export async function apiRequest<T>(
         }
       }
 
-      const fetchOptions: RequestInit = {
+      interface NextFetchOptions extends RequestInit {
+        next?: {
+          revalidate?: number | false;
+          tags?: string[];
+        };
+      }
+
+      const fetchOptions: NextFetchOptions = {
         method,
         headers,
         cache,
@@ -595,7 +602,14 @@ export async function apiRequest<T>(
       };
 
       if (revalidate !== undefined || revalidateTags.length) {
-        (fetchOptions as any).next = {
+        fetchOptions.next = {
+          revalidate,
+          tags: sanitizeTags(revalidateTags),
+        };
+      }
+
+      if (revalidate !== undefined || revalidateTags.length) {
+        fetchOptions.next = {
           revalidate,
           tags: sanitizeTags(revalidateTags),
         };
@@ -637,7 +651,8 @@ export async function apiRequest<T>(
         } else {
           throw new Error(`Unsupported content type: ${contentType}`);
         }
-      } catch (err) {
+      } catch (error: unknown) {
+        console.error('Failed to parse response:', error);
         return {
           success: false,
           error: createError(
