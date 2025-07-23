@@ -1,10 +1,11 @@
 import { revalidatePath, revalidateTag } from 'next/cache';
 
+// Environment configuration
 const env = {
   AUTH_USERNAME: process.env.AUTH_USERNAME?.trim(),
   AUTH_PASSWORD: process.env.AUTH_PASSWORD?.trim(),
   AUTH_TOKEN: process.env.AUTH_TOKEN?.trim(),
-  BASE_URL: process.env.BASE_URL?.trim(),
+  BASE_URL: process.env.BASE_URL?.trim() || '',
   ALLOW_BASIC_AUTH_IN_PROD: process.env.ALLOW_BASIC_AUTH_IN_PROD === 'true',
 };
 
@@ -12,11 +13,11 @@ if (!env.BASE_URL?.startsWith('https://')) {
   throw new Error('BASE_URL must start with https://');
 }
 
-const PROD_ALLOWED_DOMAINS = ['api.example.com', 'another.example.com'];
+const PROD_ALLOWED_DOMAINS = ['api.example.com', 'another.example.com'] as const;
 
 if (
   process.env.NODE_ENV === 'production' &&
-  !PROD_ALLOWED_DOMAINS.includes(new URL(env.BASE_URL).hostname)
+  !PROD_ALLOWED_DOMAINS.includes(new URL(env.BASE_URL).hostname as any)
 ) {
   throw new Error('BASE_URL must be one of the allowed production domains');
 }
@@ -32,11 +33,76 @@ const MAX = {
   RATE_MAX: 500,
   CIRCUIT_TTL: 30_000,
   CIRCUIT_MAX: 100,
-};
+} as const;
 
-const ALLOWED_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
-type HttpMethod = (typeof ALLOWED_METHODS)[number];
+/**
+ * HTTP methods with perfect autocomplete
+ */
+export const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
+export type HttpMethod = typeof HTTP_METHODS[number];
 
+/**
+ * HTTP status codes
+ */
+export const STATUS = {
+  OK: 200,
+  CREATED: 201,
+  NO_CONTENT: 204,
+  BAD_REQUEST: 400,
+  UNAUTHORIZED: 401,
+  FORBIDDEN: 403,
+  NOT_FOUND: 404,
+  METHOD_NOT_ALLOWED: 405,
+  REQUEST_TIMEOUT: 408,
+  PAYLOAD_TOO_LARGE: 413,
+  RATE_LIMITED: 429,
+  INTERNAL_ERROR: 500,
+  SERVICE_UNAVAILABLE: 503,
+} as const;
+
+export type StatusCode = typeof STATUS[keyof typeof STATUS];
+
+/**
+ * Error categories for better error handling
+ */
+export type ErrorType = 
+  | 'VALIDATION_ERROR'
+  | 'AUTH_ERROR'
+  | 'RATE_LIMIT_ERROR'
+  | 'NETWORK_ERROR'
+  | 'TIMEOUT_ERROR'
+  | 'SERVER_ERROR';
+
+/**
+ * Structured error information
+ */
+export interface ApiError {
+  status: StatusCode;
+  type: ErrorType;
+  message: string;
+  timestamp: string;
+  requestId: string;
+  details?: Record<string, unknown>;
+}
+
+/**
+ * Cache options with clear descriptions
+ */
+export type CacheOption = 
+  | 'no-store'         // Never cache (default)
+  | 'force-cache'      // Always use cache
+  | 'default'          // Browser default
+  | 'no-cache'         // Revalidate before use
+  | 'reload'           // Always fetch fresh
+  | 'only-if-cached';  // Use cache only
+
+/**
+ * Query parameter types
+ */
+export type QueryValue = string | number | boolean | null | undefined;
+export type QueryParams = Record<string, QueryValue>;
+
+// Rate limiting and circuit breaker
 const rateTimestamps: number[] = [];
 const circuitMap = new Map<string, number>();
 
@@ -54,7 +120,7 @@ const getAuthHeader = (): string | undefined => {
   if (env.AUTH_TOKEN) {
     const isValidJwt = /^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/.test(env.AUTH_TOKEN);
     if (!isValidJwt || env.AUTH_TOKEN.length > 512) {
-      throw new Error('Invalid AUTH_TOKEN');
+      throw new Error('Invalid AUTH_TOKEN format');
     }
     return `Bearer ${env.AUTH_TOKEN}`;
   }
@@ -73,7 +139,7 @@ const getAuthHeader = (): string | undefined => {
 const sanitizeTags = (tags: string[]): string[] =>
   tags
     .filter((tag) => /^[\w:-]+$/.test(tag))
-    .map((tag) => (tag.startsWith('api:') ? tag : `api:${tag}`))
+    .map((tag) => tag.startsWith('api:') ? tag : `api:${tag}`)
     .slice(0, MAX.TAGS)
     .map((t) => t.slice(0, MAX.TAG_LEN));
 
@@ -99,44 +165,229 @@ const invalidateCache = async (
   }
 };
 
-export interface ApiRequestOptions {
-  data?: unknown;
-  query?: Record<string, string | number | boolean | null | undefined>;
-  cache?: RequestCache;
+/**
+ * Configuration options for API requests
+ */
+export interface ApiRequestOptions<TData = unknown> {
+  /** 
+   * Request data (POST/PUT/PATCH only)
+   * @example { name: "John", email: "john@example.com" }
+   */
+  data?: TData;
+  
+  /** 
+   * URL query parameters
+   * @example { page: 1, limit: 10, search: "john" }
+   */
+  query?: QueryParams;
+  
+  /** 
+   * Cache strategy
+   * @default 'no-store'
+   */
+  cache?: CacheOption;
+  
+  /** 
+   * Cache revalidation time in seconds
+   * @example 3600 // 1 hour
+   */
   revalidate?: number | false;
+  
+  /** 
+   * Cache tags to invalidate on success
+   * @example ['users', 'posts']
+   */
   revalidateTags?: string[];
+  
+  /** 
+   * Paths to revalidate on success  
+   * @example ['/users', '/dashboard']
+   */
   revalidatePaths?: string[];
+  
+  /** 
+   * Revalidation type
+   */
   revalidateType?: 'page' | 'layout';
+  
+  /** 
+   * Request timeout in milliseconds
+   * @default 30000
+   */
   timeout?: number;
-  retryAttempts?: number;
+  
+  /** 
+   * Number of retry attempts (0-5)
+   * @default 3
+   */
+  retryAttempts?: 0 | 1 | 2 | 3 | 4 | 5;
+  
+  /** 
+   * Base retry delay in milliseconds
+   * @default 1000
+   */
   retryDelay?: number;
+  
+  /** 
+   * CSRF token (required for POST/PUT/PATCH/DELETE)
+   * Must be 32+ characters of alphanumeric, hyphens, underscores
+   */
   csrfToken?: string;
+  
+  /** 
+   * Log inferred TypeScript types in development
+   * @default false
+   */
   logTypes?: boolean;
+
+  /**
+   * Additional request headers
+   * @example { 'X-Client-Version': '1.0.0' }
+   */
+  customHeaders?: Record<string, string>;
 }
 
-export type ApiResponse<T> =
-  | { success: true; data: T }
-  | { success: false; status: number; error: string; data: null };
+/**
+ * Method-specific options with proper typing
+ */
+export type GetOptions = Omit<ApiRequestOptions<never>, 'data' | 'csrfToken'>;
+export type PostOptions<T> = ApiRequestOptions<T> & { csrfToken: string };
+export type PutOptions<T> = ApiRequestOptions<T> & { csrfToken: string };
+export type PatchOptions<T> = ApiRequestOptions<T> & { csrfToken: string };
+export type DeleteOptions = ApiRequestOptions<never> & { csrfToken: string };
 
+/**
+ * API response with success/error states
+ */
+export type ApiResponse<T> =
+  | { 
+      success: true; 
+      data: T;
+      status: StatusCode;
+      headers: Record<string, string>;
+      requestId: string;
+    }
+  | { 
+      success: false; 
+      error: ApiError;
+      data: null;
+    };
+
+/**
+ * Type inference helper for development
+ */
 function inferType(val: unknown, depth = 0): string {
-  const pad = (level: number): string => '  '.repeat(level);
+  const indent = '  '.repeat(depth);
   if (val === null) return 'null';
-  if (Array.isArray(val)) return `Array<${inferType(val[0], depth) || 'unknown'}>`;
-  if (typeof val === 'object') {
-    const entries = Object.entries(val as Record<string, unknown>)
-      .slice(0, 10)
-      .map(([k, v]) => `${pad(depth + 1)}${k}: ${inferType(v, depth + 1)};`)
+  if (val === undefined) return 'undefined';
+  if (Array.isArray(val)) {
+    const itemType = val.length > 0 ? inferType(val[0], depth) : 'unknown';
+    return `${itemType}[]`;
+  }
+  if (typeof val === 'object' && val !== null) {
+    if (depth > 2) return 'object';
+    const entries = Object.entries(val)
+      .slice(0, 8)
+      .map(([k, v]) => `${indent}  ${k}: ${inferType(v, depth + 1)};`)
       .join('\n');
-    return `{\n${entries}\n${pad(depth)}}`;
+    return `{\n${entries}\n${indent}}`;
   }
   return typeof val;
 }
 
+/**
+ * Create structured error
+ */
+function createError(
+  status: StatusCode,
+  type: ErrorType,
+  message: string,
+  requestId: string,
+  details?: Record<string, unknown>
+): ApiError {
+  return {
+    status,
+    type,
+    message,
+    timestamp: new Date().toISOString(),
+    requestId,
+    details,
+  };
+}
+
+/**
+ * Map status codes to error types
+ */
+function getErrorType(status: number): ErrorType {
+  if (status === 400 || status === 422) return 'VALIDATION_ERROR';
+  if (status === 401 || status === 403) return 'AUTH_ERROR';
+  if (status === 408) return 'TIMEOUT_ERROR';
+  if (status === 429) return 'RATE_LIMIT_ERROR';
+  if (status >= 500) return 'SERVER_ERROR';
+  return 'NETWORK_ERROR';
+}
+
+// Overloaded function signatures for perfect IntelliSense
+export async function apiRequest<T>(method: 'GET', url: string, options?: GetOptions): Promise<ApiResponse<T>>;
+export async function apiRequest<T>(method: 'POST', url: string, options: PostOptions<T>): Promise<ApiResponse<T>>;
+export async function apiRequest<T>(method: 'PUT', url: string, options: PutOptions<T>): Promise<ApiResponse<T>>;
+export async function apiRequest<T>(method: 'PATCH', url: string, options: PatchOptions<T>): Promise<ApiResponse<T>>;
+export async function apiRequest<T>(method: 'DELETE', url: string, options: DeleteOptions): Promise<ApiResponse<T>>;
+
+/**
+ * Production-ready HTTP client with type safety, security, and reliability.
+ * 
+ * Features:
+ * - Full TypeScript support with method-specific options
+ * - Automatic authentication (JWT/Basic Auth)
+ * - Rate limiting and circuit breaker
+ * - Retry logic with exponential backoff
+ * - CSRF protection for mutations
+ * - Next.js cache integration
+ * - Request/response size limits
+ * - Comprehensive error handling
+ * 
+ * @example GET request
+ * ```typescript
+ * const users = await apiRequest<User[]>('GET', '/api/users', {
+ *   query: { page: 1, limit: 10 }
+ * });
+ * 
+ * if (users.success) {
+ *   console.log(users.data); // User[] with full IntelliSense
+ * } else {
+ *   console.error(users.error.message);
+ * }
+ * ```
+ * 
+ * @example POST request  
+ * ```typescript
+ * const newUser = await apiRequest<User>('POST', '/api/users', {
+ *   data: { name: 'John', email: 'john@example.com' },
+ *   csrfToken: 'your-csrf-token', // Required for mutations
+ *   revalidateTags: ['users']
+ * });
+ * ```
+ * 
+ * @example Advanced usage
+ * ```typescript
+ * const response = await apiRequest<User>('PUT', '/api/users/123', {
+ *   data: { name: 'Jane' },
+ *   csrfToken: 'token',
+ *   cache: 'force-cache',
+ *   revalidate: 3600,
+ *   revalidatePaths: ['/users'],
+ *   timeout: 15000,
+ *   retryAttempts: 2
+ * });
+ * ```
+ */
 export async function apiRequest<T>(
   method: HttpMethod,
   url: string,
-  options: ApiRequestOptions = {},
+  options: ApiRequestOptions = {}
 ): Promise<ApiResponse<T>> {
+  const requestId = `req_${crypto.randomUUID()}`;
   const {
     data,
     query,
@@ -149,152 +400,278 @@ export async function apiRequest<T>(
     retryAttempts = 3,
     retryDelay = 1000,
     csrfToken,
-    logTypes,
+    logTypes = false,
+    customHeaders = {},
   } = options;
 
-  const upperMethod = method.toUpperCase() as HttpMethod;
-  if (!ALLOWED_METHODS.includes(upperMethod)) {
-    return { success: false, status: 405, error: 'Invalid HTTP method', data: null };
+  // Validate method
+  if (!HTTP_METHODS.includes(method)) {
+    return { 
+      success: false, 
+      error: createError(
+        STATUS.METHOD_NOT_ALLOWED, 
+        'VALIDATION_ERROR',
+        `Invalid method: ${method}`,
+        requestId
+      ), 
+      data: null 
+    };
   }
 
-  const fullUrl = new URL(url, env.BASE_URL);
-  if (fullUrl.protocol !== 'https:') {
-    return { success: false, status: 400, error: 'Only HTTPS requests are allowed', data: null };
-  }
-
-  if (isRateLimited()) {
-    return { success: false, status: 429, error: 'Rate limit exceeded', data: null };
-  }
-
-  const circuitKey = fullUrl.origin + fullUrl.pathname;
-  const now = Date.now();
-  if ((circuitMap.get(circuitKey) ?? 0) > now) {
-    return { success: false, status: 503, error: 'Circuit breaker active', data: null };
-  }
-
-  Object.entries(query || {}).forEach(([key, val]) => {
-    if (val != null) fullUrl.searchParams.append(key, encodeURIComponent(String(val)));
-  });
-
-  const isForm = typeof FormData !== 'undefined' && data instanceof FormData;
-
-  if (['GET', 'HEAD'].includes(upperMethod) && data) {
+  // Build and validate URL
+  let fullUrl: URL;
+  try {
+    fullUrl = new URL(url, env.BASE_URL);
+  } catch {
     return {
       success: false,
-      status: 400,
-      error: 'GET/HEAD requests cannot have a body',
+      error: createError(STATUS.BAD_REQUEST, 'VALIDATION_ERROR', 'Invalid URL', requestId),
+      data: null
+    };
+  }
+
+  if (fullUrl.protocol !== 'https:') {
+    return { 
+      success: false, 
+      error: createError(STATUS.BAD_REQUEST, 'VALIDATION_ERROR', 'HTTPS required', requestId),
+      data: null 
+    };
+  }
+
+  // Rate limiting
+  if (isRateLimited()) {
+    return { 
+      success: false, 
+      error: createError(STATUS.RATE_LIMITED, 'RATE_LIMIT_ERROR', 'Rate limit exceeded', requestId),
+      data: null 
+    };
+  }
+
+  // Circuit breaker
+  const circuitKey = `${fullUrl.origin}${fullUrl.pathname}`;
+  const now = Date.now();
+  if ((circuitMap.get(circuitKey) ?? 0) > now) {
+    return { 
+      success: false, 
+      error: createError(STATUS.SERVICE_UNAVAILABLE, 'SERVER_ERROR', 'Service unavailable', requestId),
+      data: null 
+    };
+  }
+
+  // Add query parameters
+  if (query) {
+    Object.entries(query).forEach(([key, val]) => {
+      if (val != null) {
+        fullUrl.searchParams.append(key, String(val));
+      }
+    });
+  }
+
+  // Validate request body for GET/HEAD
+  if (['GET', 'HEAD'].includes(method) && data !== undefined) {
+    return {
+      success: false,
+      error: createError(STATUS.BAD_REQUEST, 'VALIDATION_ERROR', 'GET/HEAD cannot have body', requestId),
       data: null,
     };
   }
 
-  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(upperMethod) && !csrfToken) {
-    return { success: false, status: 403, error: 'CSRF token is required', data: null };
+  // Validate CSRF token for mutations
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+    if (!csrfToken) {
+      return { 
+        success: false, 
+        error: createError(STATUS.FORBIDDEN, 'AUTH_ERROR', 'CSRF token required', requestId),
+        data: null 
+      };
+    }
+    if (!/^[a-zA-Z0-9-_]{32,}$/.test(csrfToken)) {
+      return { 
+        success: false, 
+        error: createError(STATUS.BAD_REQUEST, 'VALIDATION_ERROR', 'Invalid CSRF token', requestId),
+        data: null 
+      };
+    }
   }
 
-  const csrfValid = !csrfToken || /^[a-zA-Z0-9-_]{32,}$/.test(csrfToken);
-  if (csrfToken && !csrfValid) {
-    return { success: false, status: 400, error: 'Malformed CSRF token', data: null };
+  // Get auth header
+  let authHeader: string | undefined;
+  try {
+    authHeader = getAuthHeader();
+  } catch (err) {
+    return {
+      success: false,
+      error: createError(STATUS.UNAUTHORIZED, 'AUTH_ERROR', 'Authentication failed', requestId),
+      data: null
+    };
   }
 
-  const authHeader = getAuthHeader();
-
+  // Build headers
+  const isFormData = typeof FormData !== 'undefined' && data instanceof FormData;
   const headers: Record<string, string> = {
     Accept: 'application/json',
     'X-Requested-With': 'XMLHttpRequest',
-    'X-Request-ID': `req_${crypto.randomUUID()}`,
-    ...(authHeader && { Authorization: authHeader }),
-    ...(!isForm && { 'Content-Type': 'application/json' }),
-    ...(csrfToken && { 'X-CSRF-Token': csrfToken }),
+    'X-Request-ID': requestId,
+    ...customHeaders,
   };
+  
+  if (authHeader) headers.Authorization = authHeader;
+  if (!isFormData && !['GET', 'HEAD'].includes(method)) headers['Content-Type'] = 'application/json';
+  if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
 
+  // Make request with retries
   const makeRequest = async (attempt = 1): Promise<ApiResponse<T>> => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeout);
 
     try {
-      const body =
-        isForm || ['GET', 'HEAD'].includes(upperMethod) ? undefined : JSON.stringify(data ?? {});
-      if (body && body.length > MAX.PAYLOAD) {
-        return { success: false, status: 413, error: 'Payload too large', data: null };
+      // Prepare request body
+      let body: string | FormData | undefined;
+      if (!['GET', 'HEAD'].includes(method)) {
+        if (isFormData) {
+          body = data as FormData;
+        } else if (data !== undefined) {
+          body = JSON.stringify(data);
+          if (body.length > MAX.PAYLOAD) {
+            return { 
+              success: false, 
+              error: createError(STATUS.PAYLOAD_TOO_LARGE, 'VALIDATION_ERROR', 'Payload too large', requestId),
+              data: null 
+            };
+          }
+        }
       }
 
-      const res = await fetch(fullUrl.toString(), {
-        method: upperMethod,
+      // Make fetch request
+      const fetchOptions: RequestInit = {
+        method,
         headers,
         cache,
         signal: controller.signal,
         body,
-        ...(revalidate !== undefined || revalidateTags.length
-          ? { next: { revalidate, tags: sanitizeTags(revalidateTags) } }
-          : {}),
-      });
+      };
 
-      const retryAfter = res.headers.get('Retry-After');
-      const contentLength = Number(res.headers.get('Content-Length') || '0');
-      const contentType = res.headers.get('Content-Type') || '';
-
-      if (contentLength > MAX.RES_SIZE) {
-        return { success: false, status: 413, error: 'Response too large', data: null };
-      }
-
-      let parsed: T;
-      try {
-        parsed = contentType.includes('application/json')
-          ? await res.json()
-          : contentType.includes('text/plain')
-            ? ((await res.text()) as unknown as T)
-            : (() => {
-                throw new Error('Unsupported content type');
-              })();
-      } catch {
-        return { success: false, status: res.status, error: 'Failed to parse response', data: null };
-      }
-
-      if (!res.ok) {
-        if (res.status >= 500 && attempt < retryAttempts) {
-          const delay = retryAfter
-            ? Number(retryAfter) * 1000
-            : retryDelay * 2 ** (attempt - 1) * (0.5 + Math.random());
-          await new Promise((r) => setTimeout(r, delay));
-          return makeRequest(attempt + 1);
-        }
-
-        if (circuitMap.size >= MAX.CIRCUIT_MAX) {
-          const oldest = circuitMap.keys().next().value;
-          if (oldest) circuitMap.delete(oldest);
-        }
-
-        circuitMap.set(circuitKey, now + MAX.CIRCUIT_TTL);
-        return { success: false, status: res.status, error: res.statusText, data: null };
-      }
-
-      await invalidateCache(revalidatePaths, revalidateTags, revalidateType);
-
-      if (process.env.NODE_ENV === 'development' && logTypes) {
-        const typeDef = inferType(parsed);
-        console.log(`[DEBUG] Inferred Type for ${method} ${url}:\n`);
-        console.log(`type ApiResponse = ${typeDef};`);
-      }
-
-      return { success: true, data: parsed };
-    } catch (err) {
-      const isAbort =
-        typeof err === 'object' && err !== null && 'name' in err && (err as { name: string }).name === 'AbortError';
-
-      if (!['GET', 'HEAD'].includes(upperMethod) || attempt >= retryAttempts) {
-        circuitMap.set(circuitKey, now + MAX.CIRCUIT_TTL);
-        return {
-          success: false,
-          status: isAbort ? 408 : 500,
-          error: 'Request failed',
-          data: null,
+      // Add Next.js cache options
+      if (revalidate !== undefined || revalidateTags.length) {
+        (fetchOptions as any).next = { 
+          revalidate, 
+          tags: sanitizeTags(revalidateTags) 
         };
       }
 
-      await new Promise((r) =>
-        setTimeout(r, retryDelay * 2 ** (attempt - 1) * (0.5 + Math.random())),
-      );
-      return makeRequest(attempt + 1);
+      const response = await fetch(fullUrl.toString(), fetchOptions);
+
+      // Extract response headers
+      const responseHeaders: Record<string, string> = {};
+      response.headers.forEach((value, key) => {
+        responseHeaders[key] = value;
+      });
+
+      // Check response size
+      const contentLength = Number(response.headers.get('Content-Length') || '0');
+      if (contentLength > MAX.RES_SIZE) {
+        return { 
+          success: false, 
+          error: createError(STATUS.PAYLOAD_TOO_LARGE, 'VALIDATION_ERROR', 'Response too large', requestId),
+          data: null 
+        };
+      }
+
+      // Parse response
+      let parsedData: T;
+      try {
+        const contentType = response.headers.get('Content-Type') || '';
+        if (contentType.includes('application/json')) {
+          parsedData = await response.json();
+        } else if (contentType.includes('text/')) {
+          parsedData = (await response.text()) as unknown as T;
+        } else {
+          throw new Error(`Unsupported content type: ${contentType}`);
+        }
+      } catch (parseError) {
+        return { 
+          success: false, 
+          error: createError(
+            response.status as StatusCode, 
+            'NETWORK_ERROR', 
+            'Failed to parse response', 
+            requestId
+          ),
+          data: null 
+        };
+      }
+
+      // Handle non-OK responses
+      if (!response.ok) {
+        // Retry server errors
+        if (response.status >= 500 && attempt < retryAttempts) {
+          const retryAfter = response.headers.get('Retry-After');
+          const delay = retryAfter 
+            ? Number(retryAfter) * 1000
+            : retryDelay * Math.pow(2, attempt - 1) * (0.5 + Math.random());
+          
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return makeRequest(attempt + 1);
+        }
+
+        // Update circuit breaker
+        circuitMap.set(circuitKey, now + MAX.CIRCUIT_TTL);
+
+        return { 
+          success: false, 
+          error: createError(
+            response.status as StatusCode,
+            getErrorType(response.status),
+            response.statusText || 'Request failed',
+            requestId,
+            { url: url, method, attempt }
+          ),
+          data: null 
+        };
+      }
+
+      // Success - invalidate cache
+      await invalidateCache(revalidatePaths, revalidateTags, revalidateType);
+
+      // Development type logging
+      if (process.env.NODE_ENV === 'development' && logTypes) {
+        console.group(`🔍 ${method} ${url} - Type Inference`);
+        console.log('Inferred Type:', inferType(parsedData));
+        console.groupEnd();
+      }
+
+      return { 
+        success: true, 
+        data: parsedData,
+        status: response.status as StatusCode,
+        headers: responseHeaders,
+        requestId
+      };
+
+    } catch (err) {
+      const isTimeout = err instanceof Error && err.name === 'AbortError';
+      const isNetwork = err instanceof TypeError;
+
+      // Retry network/timeout errors (but not mutations to avoid duplication)
+      if ((isNetwork || isTimeout) && attempt < retryAttempts && ['GET', 'HEAD'].includes(method)) {
+        const delay = retryDelay * Math.pow(2, attempt - 1) * (0.5 + Math.random());
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return makeRequest(attempt + 1);
+      }
+
+      // Circuit breaker for repeated failures
+      circuitMap.set(circuitKey, now + MAX.CIRCUIT_TTL);
+
+      return {
+        success: false,
+        error: createError(
+          isTimeout ? 408 : 500,
+          isTimeout ? 'TIMEOUT_ERROR' : 'NETWORK_ERROR',
+          isTimeout ? 'Request timeout' : 'Network error',
+          requestId
+        ),
+        data: null,
+      };
     } finally {
       clearTimeout(timeoutId);
     }
