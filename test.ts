@@ -1,3 +1,9 @@
+/**
+ * SafeFetch – Typed fetch utility with retry, timeout & Next.js support
+ * (c) 2025 Bharathi4real – BSD 3-Clause License
+ * https://github.com/Bharathi4real/safe-fetch
+ */
+
 import { revalidatePath, revalidateTag } from 'next/cache';
 
 // Environment configuration
@@ -39,7 +45,7 @@ const MAX = {
  * HTTP methods with perfect autocomplete
  */
 export const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
-export type HttpMethod = typeof HTTP_METHODS[number];
+export type HttpMethod = (typeof HTTP_METHODS)[number];
 
 /**
  * HTTP status codes
@@ -60,12 +66,12 @@ export const STATUS = {
   SERVICE_UNAVAILABLE: 503,
 } as const;
 
-export type StatusCode = typeof STATUS[keyof typeof STATUS];
+export type StatusCode = (typeof STATUS)[keyof typeof STATUS];
 
 /**
  * Error categories for better error handling
  */
-export type ErrorType = 
+export type ErrorType =
   | 'VALIDATION_ERROR'
   | 'AUTH_ERROR'
   | 'RATE_LIMIT_ERROR'
@@ -88,13 +94,13 @@ export interface ApiError {
 /**
  * Cache options with clear descriptions
  */
-export type CacheOption = 
-  | 'no-store'         // Never cache (default)
-  | 'force-cache'      // Always use cache
-  | 'default'          // Browser default
-  | 'no-cache'         // Revalidate before use
-  | 'reload'           // Always fetch fresh
-  | 'only-if-cached';  // Use cache only
+export type CacheOption =
+  | 'no-store' // Never cache (default)
+  | 'force-cache' // Always use cache
+  | 'default' // Browser default
+  | 'no-cache' // Revalidate before use
+  | 'reload' // Always fetch fresh
+  | 'only-if-cached'; // Use cache only
 
 /**
  * Query parameter types
@@ -139,7 +145,7 @@ const getAuthHeader = (): string | undefined => {
 const sanitizeTags = (tags: string[]): string[] =>
   tags
     .filter((tag) => /^[\w:-]+$/.test(tag))
-    .map((tag) => tag.startsWith('api:') ? tag : `api:${tag}`)
+    .map((tag) => (tag.startsWith('api:') ? tag : `api:${tag}`))
     .slice(0, MAX.TAGS)
     .map((t) => t.slice(0, MAX.TAG_LEN));
 
@@ -166,83 +172,86 @@ const invalidateCache = async (
 };
 
 /**
- * Configuration options for API requests
+ * Configuration options you can pass to `apiRequest` for API requests
  */
-export interface ApiRequestOptions<TData = unknown> {
-  /** 
-   * Request data (POST/PUT/PATCH only)
-   * @example { name: "John", email: "john@example.com" }
+export interface RequestOptions<TData = unknown> {
+  /**
+   * Data to send in the request body.
+   * Only used with POST, PUT, PATCH, DELETE.
    */
   data?: TData;
-  
-  /** 
-   * URL query parameters
-   * @example { page: 1, limit: 10, search: "john" }
+
+  /**
+   * Query parameters to append to the URL.
+   * Will be converted to URLSearchParams.
    */
   query?: QueryParams;
-  
-  /** 
-   * Cache strategy
-   * @default 'no-store'
+
+  /**
+   * How you want to cache this request (Next.js cache behavior).
+   * Most people should leave this as `'no-store'` (default).
    */
   cache?: CacheOption;
-  
-  /** 
-   * Cache revalidation time in seconds
-   * @example 3600 // 1 hour
+
+  /**
+   * How long (in seconds) this response should be considered fresh.
+   * Only used with Next.js cache integration.
    */
   revalidate?: number | false;
-  
-  /** 
-   * Cache tags to invalidate on success
-   * @example ['users', 'posts']
+
+  /**
+   * Cache tags to revalidate after successful mutation.
+   * These should match tags you use with `fetch(..., { next: { tags: [...] } })`.
    */
   revalidateTags?: string[];
-  
-  /** 
-   * Paths to revalidate on success  
-   * @example ['/users', '/dashboard']
+
+  /**
+   * Paths (pages) to revalidate after success.
+   * Only works on the server.
    */
   revalidatePaths?: string[];
-  
-  /** 
-   * Revalidation type
+
+  /**
+   * Whether the revalidation targets a page or layout.
+   * Only needed if using `revalidatePath()`.
    */
   revalidateType?: 'page' | 'layout';
-  
-  /** 
-   * Request timeout in milliseconds
-   * @default 30000
+
+  /**
+   * Request timeout in milliseconds.
+   * Default: 30_000 (30 seconds)
    */
   timeout?: number;
-  
-  /** 
-   * Number of retry attempts (0-5)
-   * @default 3
+
+  /**
+   * Retry count if the request fails.
+   * Only for network/server errors. Max 5.
+   * Default: 3
    */
   retryAttempts?: 0 | 1 | 2 | 3 | 4 | 5;
-  
-  /** 
-   * Base retry delay in milliseconds
-   * @default 1000
+
+  /**
+   * Delay (in ms) between retries.
+   * Used with exponential backoff.
+   * Default: 1000
    */
   retryDelay?: number;
-  
-  /** 
-   * CSRF token (required for POST/PUT/PATCH/DELETE)
-   * Must be 32+ characters of alphanumeric, hyphens, underscores
+
+  /**
+   * CSRF token. Required for any mutation (POST, PUT, etc).
+   * Must be at least 32 chars and contain only safe characters.
    */
   csrfToken?: string;
-  
-  /** 
-   * Log inferred TypeScript types in development
-   * @default false
+
+  /**
+   * Development helper: log the TypeScript shape of the response in the console.
+   * Useful when building types from API responses.
    */
   logTypes?: boolean;
 
   /**
-   * Additional request headers
-   * @example { 'X-Client-Version': '1.0.0' }
+   * Any additional headers to send with the request.
+   * Example: { "X-Client-Version": "1.0.0" }
    */
   customHeaders?: Record<string, string>;
 }
@@ -250,26 +259,26 @@ export interface ApiRequestOptions<TData = unknown> {
 /**
  * Method-specific options with proper typing
  */
-export type GetOptions = Omit<ApiRequestOptions<never>, 'data' | 'csrfToken'>;
-export type PostOptions<T> = ApiRequestOptions<T> & { csrfToken: string };
-export type PutOptions<T> = ApiRequestOptions<T> & { csrfToken: string };
-export type PatchOptions<T> = ApiRequestOptions<T> & { csrfToken: string };
-export type DeleteOptions = ApiRequestOptions<never> & { csrfToken: string };
+export type GetOptions = Omit<RequestOptions<never>, 'data' | 'csrfToken'>;
+export type PostOptions<T> = RequestOptions<T> & { csrfToken: string };
+export type PutOptions<T> = RequestOptions<T> & { csrfToken: string };
+export type PatchOptions<T> = RequestOptions<T> & { csrfToken: string };
+export type DeleteOptions = RequestOptions<never> & { csrfToken: string };
 
 /**
  * API response with success/error states
  */
 export type ApiResponse<T> =
-  | { 
-      success: true; 
+  | {
+      success: true;
       data: T;
       status: StatusCode;
       headers: Record<string, string>;
       requestId: string;
     }
-  | { 
-      success: false; 
-      error: ApiError;
+  | {
+      success: false;
+      error: ApiError & { type: ErrorType };
       data: null;
     };
 
@@ -303,7 +312,7 @@ function createError(
   type: ErrorType,
   message: string,
   requestId: string,
-  details?: Record<string, unknown>
+  details?: Record<string, unknown>,
 ): ApiError {
   return {
     status,
@@ -327,65 +336,88 @@ function getErrorType(status: number): ErrorType {
   return 'NETWORK_ERROR';
 }
 
+function isValidMethod(method: string): method is HttpMethod {
+  return HTTP_METHODS.includes(method as HttpMethod);
+}
+
 // Overloaded function signatures for perfect IntelliSense
-export async function apiRequest<T>(method: 'GET', url: string, options?: GetOptions): Promise<ApiResponse<T>>;
-export async function apiRequest<T>(method: 'POST', url: string, options: PostOptions<T>): Promise<ApiResponse<T>>;
-export async function apiRequest<T>(method: 'PUT', url: string, options: PutOptions<T>): Promise<ApiResponse<T>>;
-export async function apiRequest<T>(method: 'PATCH', url: string, options: PatchOptions<T>): Promise<ApiResponse<T>>;
-export async function apiRequest<T>(method: 'DELETE', url: string, options: DeleteOptions): Promise<ApiResponse<T>>;
+export async function apiRequest<T>(
+  method: 'GET',
+  url: string,
+  options?: GetOptions,
+): Promise<ApiResponse<T>>;
+export async function apiRequest<T>(
+  method: 'POST',
+  url: string,
+  options: PostOptions<T>,
+): Promise<ApiResponse<T>>;
+export async function apiRequest<T>(
+  method: 'PUT',
+  url: string,
+  options: PutOptions<T>,
+): Promise<ApiResponse<T>>;
+export async function apiRequest<T>(
+  method: 'PATCH',
+  url: string,
+  options: PatchOptions<T>,
+): Promise<ApiResponse<T>>;
+export async function apiRequest<T>(
+  method: 'DELETE',
+  url: string,
+  options: DeleteOptions,
+): Promise<ApiResponse<T>>;
 
 /**
- * Production-ready HTTP client with type safety, security, and reliability.
- * 
- * Features:
- * - Full TypeScript support with method-specific options
- * - Automatic authentication (JWT/Basic Auth)
- * - Rate limiting and circuit breaker
- * - Retry logic with exponential backoff
- * - CSRF protection for mutations
- * - Next.js cache integration
- * - Request/response size limits
- * - Comprehensive error handling
- * 
- * @example GET request
- * ```typescript
- * const users = await apiRequest<User[]>('GET', '/api/users', {
+ * Makes a safe, typed HTTP request to your backend or any HTTPS API.
+ *
+ * This function:
+ * - Automatically attaches credentials (JWT or Basic Auth)
+ * - Protects mutations with CSRF checks
+ * - Handles common HTTP errors and maps them to helpful messages
+ * - Automatically retries on failures (with backoff)
+ * - Validates inputs like URLs, methods, payload size
+ * - Optionally revalidates Next.js cache after mutation
+ * - Logs inferred TypeScript types in development to help with typing
+ *
+ * ## Basic Usage:
+ *
+ * GET request:
+ * ```ts
+ * const res = await apiRequest<User[]>('GET', '/api/users', {
  *   query: { page: 1, limit: 10 }
  * });
- * 
- * if (users.success) {
- *   console.log(users.data); // User[] with full IntelliSense
+ *
+ * if (res.success) {
+ *   console.log(res.data); // Fully typed User[]
  * } else {
- *   console.error(users.error.message);
+ *   console.error(res.error.message);
  * }
  * ```
- * 
- * @example POST request  
- * ```typescript
- * const newUser = await apiRequest<User>('POST', '/api/users', {
- *   data: { name: 'John', email: 'john@example.com' },
- *   csrfToken: 'your-csrf-token', // Required for mutations
+ *
+ * POST request with CSRF and cache revalidation:
+ * ```ts
+ * const res = await apiRequest<User>('POST', '/api/users', {
+ *   data: { name: 'Jane' },
+ *   csrfToken: csrf,
  *   revalidateTags: ['users']
  * });
  * ```
- * 
- * @example Advanced usage
- * ```typescript
- * const response = await apiRequest<User>('PUT', '/api/users/123', {
- *   data: { name: 'Jane' },
- *   csrfToken: 'token',
- *   cache: 'force-cache',
- *   revalidate: 3600,
- *   revalidatePaths: ['/users'],
+ *
+ * Advanced config (PUT with retry, timeout, revalidate):
+ * ```ts
+ * const res = await apiRequest<User>('PUT', '/api/users/123', {
+ *   data: { name: 'John' },
+ *   csrfToken: csrf,
  *   timeout: 15000,
- *   retryAttempts: 2
+ *   retryAttempts: 2,
+ *   revalidatePaths: ['/users']
  * });
  * ```
  */
 export async function apiRequest<T>(
   method: HttpMethod,
   url: string,
-  options: ApiRequestOptions = {}
+  options: RequestOptions = {},
 ): Promise<ApiResponse<T>> {
   const requestId = `req_${crypto.randomUUID()}`;
   const {
@@ -404,21 +436,19 @@ export async function apiRequest<T>(
     customHeaders = {},
   } = options;
 
-  // Validate method
-  if (!HTTP_METHODS.includes(method)) {
-    return { 
-      success: false, 
+  if (!isValidMethod(method)) {
+    return {
+      success: false,
       error: createError(
-        STATUS.METHOD_NOT_ALLOWED, 
+        STATUS.METHOD_NOT_ALLOWED,
         'VALIDATION_ERROR',
-        `Invalid method: ${method}`,
-        requestId
-      ), 
-      data: null 
+        `Invalid HTTP method: ${method}`,
+        requestId,
+      ),
+      data: null,
     };
   }
 
-  // Build and validate URL
   let fullUrl: URL;
   try {
     fullUrl = new URL(url, env.BASE_URL);
@@ -426,87 +456,98 @@ export async function apiRequest<T>(
     return {
       success: false,
       error: createError(STATUS.BAD_REQUEST, 'VALIDATION_ERROR', 'Invalid URL', requestId),
-      data: null
-    };
-  }
-
-  if (fullUrl.protocol !== 'https:') {
-    return { 
-      success: false, 
-      error: createError(STATUS.BAD_REQUEST, 'VALIDATION_ERROR', 'HTTPS required', requestId),
-      data: null 
-    };
-  }
-
-  // Rate limiting
-  if (isRateLimited()) {
-    return { 
-      success: false, 
-      error: createError(STATUS.RATE_LIMITED, 'RATE_LIMIT_ERROR', 'Rate limit exceeded', requestId),
-      data: null 
-    };
-  }
-
-  // Circuit breaker
-  const circuitKey = `${fullUrl.origin}${fullUrl.pathname}`;
-  const now = Date.now();
-  if ((circuitMap.get(circuitKey) ?? 0) > now) {
-    return { 
-      success: false, 
-      error: createError(STATUS.SERVICE_UNAVAILABLE, 'SERVER_ERROR', 'Service unavailable', requestId),
-      data: null 
-    };
-  }
-
-  // Add query parameters
-  if (query) {
-    Object.entries(query).forEach(([key, val]) => {
-      if (val != null) {
-        fullUrl.searchParams.append(key, String(val));
-      }
-    });
-  }
-
-  // Validate request body for GET/HEAD
-  if (['GET', 'HEAD'].includes(method) && data !== undefined) {
-    return {
-      success: false,
-      error: createError(STATUS.BAD_REQUEST, 'VALIDATION_ERROR', 'GET/HEAD cannot have body', requestId),
       data: null,
     };
   }
 
-  // Validate CSRF token for mutations
-  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
-    if (!csrfToken) {
-      return { 
-        success: false, 
-        error: createError(STATUS.FORBIDDEN, 'AUTH_ERROR', 'CSRF token required', requestId),
-        data: null 
-      };
-    }
-    if (!/^[a-zA-Z0-9-_]{32,}$/.test(csrfToken)) {
-      return { 
-        success: false, 
-        error: createError(STATUS.BAD_REQUEST, 'VALIDATION_ERROR', 'Invalid CSRF token', requestId),
-        data: null 
-      };
-    }
-  }
-
-  // Get auth header
-  let authHeader: string | undefined;
-  try {
-    authHeader = getAuthHeader();
-  } catch (err) {
+  if (fullUrl.protocol !== 'https:') {
     return {
       success: false,
-      error: createError(STATUS.UNAUTHORIZED, 'AUTH_ERROR', 'Authentication failed', requestId),
-      data: null
+      error: createError(STATUS.BAD_REQUEST, 'VALIDATION_ERROR', 'HTTPS required', requestId),
+      data: null,
     };
   }
 
-  // Build headers
+  if (isRateLimited()) {
+    return {
+      success: false,
+      error: createError(STATUS.RATE_LIMITED, 'RATE_LIMIT_ERROR', 'Rate limit exceeded', requestId),
+      data: null,
+    };
+  }
+
+  const circuitKey = `${fullUrl.origin}${fullUrl.pathname}`;
+  const now = Date.now();
+  if ((circuitMap.get(circuitKey) ?? 0) > now) {
+    return {
+      success: false,
+      error: createError(
+        STATUS.SERVICE_UNAVAILABLE,
+        'SERVER_ERROR',
+        'Service unavailable (circuit breaker)',
+        requestId,
+      ),
+      data: null,
+    };
+  }
+
+  if (query) {
+    Object.entries(query).forEach(([key, val]) => {
+      if (val != null) fullUrl.searchParams.append(key, String(val));
+    });
+  }
+
+  if (['GET', 'HEAD'].includes(method) && data !== undefined) {
+    return {
+      success: false,
+      error: createError(
+        STATUS.BAD_REQUEST,
+        'VALIDATION_ERROR',
+        'GET/HEAD methods cannot send body payload',
+        requestId,
+      ),
+      data: null,
+    };
+  }
+
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+    if (!csrfToken) {
+      return {
+        success: false,
+        error: createError(
+          STATUS.FORBIDDEN,
+          'AUTH_ERROR',
+          'CSRF token is required for mutations (POST/PUT/PATCH/DELETE)',
+          requestId,
+        ),
+        data: null,
+      };
+    }
+    if (!/^[a-zA-Z0-9-_]{32,}$/.test(csrfToken)) {
+      return {
+        success: false,
+        error: createError(
+          STATUS.BAD_REQUEST,
+          'VALIDATION_ERROR',
+          'Invalid CSRF token format',
+          requestId,
+        ),
+        data: null,
+      };
+    }
+  }
+
+  let authHeader: string | undefined;
+  try {
+    authHeader = getAuthHeader();
+  } catch {
+    return {
+      success: false,
+      error: createError(STATUS.UNAUTHORIZED, 'AUTH_ERROR', 'Authentication failed', requestId),
+      data: null,
+    };
+  }
+
   const isFormData = typeof FormData !== 'undefined' && data instanceof FormData;
   const headers: Record<string, string> = {
     Accept: 'application/json',
@@ -514,18 +555,16 @@ export async function apiRequest<T>(
     'X-Request-ID': requestId,
     ...customHeaders,
   };
-  
   if (authHeader) headers.Authorization = authHeader;
-  if (!isFormData && !['GET', 'HEAD'].includes(method)) headers['Content-Type'] = 'application/json';
+  if (!isFormData && !['GET', 'HEAD'].includes(method))
+    headers['Content-Type'] = 'application/json';
   if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
 
-  // Make request with retries
   const makeRequest = async (attempt = 1): Promise<ApiResponse<T>> => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeout);
 
     try {
-      // Prepare request body
       let body: string | FormData | undefined;
       if (!['GET', 'HEAD'].includes(method)) {
         if (isFormData) {
@@ -533,16 +572,20 @@ export async function apiRequest<T>(
         } else if (data !== undefined) {
           body = JSON.stringify(data);
           if (body.length > MAX.PAYLOAD) {
-            return { 
-              success: false, 
-              error: createError(STATUS.PAYLOAD_TOO_LARGE, 'VALIDATION_ERROR', 'Payload too large', requestId),
-              data: null 
+            return {
+              success: false,
+              error: createError(
+                STATUS.PAYLOAD_TOO_LARGE,
+                'VALIDATION_ERROR',
+                'Payload too large',
+                requestId,
+              ),
+              data: null,
             };
           }
         }
       }
 
-      // Make fetch request
       const fetchOptions: RequestInit = {
         method,
         headers,
@@ -551,124 +594,119 @@ export async function apiRequest<T>(
         body,
       };
 
-      // Add Next.js cache options
       if (revalidate !== undefined || revalidateTags.length) {
-        (fetchOptions as any).next = { 
-          revalidate, 
-          tags: sanitizeTags(revalidateTags) 
+        (fetchOptions as any).next = {
+          revalidate,
+          tags: sanitizeTags(revalidateTags),
         };
       }
 
       const response = await fetch(fullUrl.toString(), fetchOptions);
 
-      // Extract response headers
       const responseHeaders: Record<string, string> = {};
       response.headers.forEach((value, key) => {
         responseHeaders[key] = value;
       });
 
-      // Check response size
       const contentLength = Number(response.headers.get('Content-Length') || '0');
       if (contentLength > MAX.RES_SIZE) {
-        return { 
-          success: false, 
-          error: createError(STATUS.PAYLOAD_TOO_LARGE, 'VALIDATION_ERROR', 'Response too large', requestId),
-          data: null 
+        return {
+          success: false,
+          error: createError(
+            STATUS.PAYLOAD_TOO_LARGE,
+            'VALIDATION_ERROR',
+            'Response too large',
+            requestId,
+          ),
+          data: null,
         };
       }
 
-      // Parse response
       let parsedData: T;
       try {
         const contentType = response.headers.get('Content-Type') || '';
         if (contentType.includes('application/json')) {
           parsedData = await response.json();
-        } else if (contentType.includes('text/')) {
+        } else if (contentType.startsWith('text/')) {
           parsedData = (await response.text()) as unknown as T;
+        } else if (
+          contentType.includes('application/octet-stream') ||
+          contentType.startsWith('image/')
+        ) {
+          parsedData = (await response.blob()) as unknown as T; // 🔧 basic binary support
         } else {
           throw new Error(`Unsupported content type: ${contentType}`);
         }
-      } catch (parseError) {
-        return { 
-          success: false, 
+      } catch (err) {
+        return {
+          success: false,
           error: createError(
-            response.status as StatusCode, 
-            'NETWORK_ERROR', 
-            'Failed to parse response', 
-            requestId
+            response.status as StatusCode,
+            'NETWORK_ERROR',
+            'Failed to parse response',
+            requestId,
           ),
-          data: null 
+          data: null,
         };
       }
 
-      // Handle non-OK responses
       if (!response.ok) {
-        // Retry server errors
         if (response.status >= 500 && attempt < retryAttempts) {
           const retryAfter = response.headers.get('Retry-After');
-          const delay = retryAfter 
+          const delay = retryAfter
             ? Number(retryAfter) * 1000
-            : retryDelay * Math.pow(2, attempt - 1) * (0.5 + Math.random());
-          
-          await new Promise(resolve => setTimeout(resolve, delay));
+            : retryDelay * 2 ** (attempt - 1) * (0.5 + Math.random());
+          await new Promise((r) => setTimeout(r, delay));
           return makeRequest(attempt + 1);
         }
 
-        // Update circuit breaker
         circuitMap.set(circuitKey, now + MAX.CIRCUIT_TTL);
-
-        return { 
-          success: false, 
+        return {
+          success: false,
           error: createError(
             response.status as StatusCode,
             getErrorType(response.status),
             response.statusText || 'Request failed',
             requestId,
-            { url: url, method, attempt }
+            { url, method, attempt },
           ),
-          data: null 
+          data: null,
         };
       }
 
-      // Success - invalidate cache
       await invalidateCache(revalidatePaths, revalidateTags, revalidateType);
 
-      // Development type logging
       if (process.env.NODE_ENV === 'development' && logTypes) {
-        console.group(`🔍 ${method} ${url} - Type Inference`);
-        console.log('Inferred Type:', inferType(parsedData));
+        console.group(`🔍 ${method} ${url} - Inferred Type`);
+        console.log(inferType(parsedData));
         console.groupEnd();
       }
 
-      return { 
-        success: true, 
+      return {
+        success: true,
         data: parsedData,
         status: response.status as StatusCode,
         headers: responseHeaders,
-        requestId
+        requestId,
       };
-
     } catch (err) {
       const isTimeout = err instanceof Error && err.name === 'AbortError';
       const isNetwork = err instanceof TypeError;
 
-      // Retry network/timeout errors (but not mutations to avoid duplication)
-      if ((isNetwork || isTimeout) && attempt < retryAttempts && ['GET', 'HEAD'].includes(method)) {
-        const delay = retryDelay * Math.pow(2, attempt - 1) * (0.5 + Math.random());
-        await new Promise(resolve => setTimeout(resolve, delay));
+      if ((isTimeout || isNetwork) && attempt < retryAttempts && ['GET', 'HEAD'].includes(method)) {
+        const delay = retryDelay * 2 ** (attempt - 1) * (0.5 + Math.random());
+        await new Promise((r) => setTimeout(r, delay));
         return makeRequest(attempt + 1);
       }
 
-      // Circuit breaker for repeated failures
       circuitMap.set(circuitKey, now + MAX.CIRCUIT_TTL);
-
       return {
         success: false,
         error: createError(
           isTimeout ? 408 : 500,
           isTimeout ? 'TIMEOUT_ERROR' : 'NETWORK_ERROR',
           isTimeout ? 'Request timeout' : 'Network error',
-          requestId
+          requestId,
         ),
         data: null,
       };
