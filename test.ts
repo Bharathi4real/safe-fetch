@@ -3,31 +3,50 @@
  * (c) 2025 Bharathi4real – BSD 3-Clause License
  * https://github.com/Bharathi4real/safe-fetch
  */
-'use server';
+
+"use server";
 
 import { revalidatePath, revalidateTag } from 'next/cache';
 
-// Environment configuration
-const env = {
-  AUTH_USERNAME: process.env.AUTH_USERNAME?.trim(),
-  AUTH_PASSWORD: process.env.AUTH_PASSWORD?.trim(),
-  AUTH_TOKEN: process.env.AUTH_TOKEN?.trim(),
-  BASE_URL: process.env.BASE_URL?.trim() || '',
-  ALLOW_BASIC_AUTH_IN_PROD: process.env.ALLOW_BASIC_AUTH_IN_PROD === 'true',
+/**
+ * Configuration for environment variables
+ * Allows customizing which env vars to use
+ */
+export interface EnvConfig {
+  authUsername?: string;
+  authPassword?: string;
+  authToken?: string;
+  baseUrl?: string;
+  allowBasicAuthInProd?: string;
+}
+
+/**
+ * Default environment variable names
+ */
+const DEFAULT_ENV_CONFIG: Required<EnvConfig> = {
+  authUsername: 'AUTH_USERNAME',
+  authPassword: 'AUTH_PASSWORD',
+  authToken: 'AUTH_TOKEN',
+  baseUrl: 'BASE_URL',
+  allowBasicAuthInProd: 'ALLOW_BASIC_AUTH_IN_PROD',
 };
 
-if (!env.BASE_URL?.startsWith('https://')) {
-  throw new Error('BASE_URL must start with https://');
-}
+/**
+ * Environment configuration (server-side only)
+ */
+const createEnv = (envConfig: EnvConfig = {}) => {
+  if (typeof window !== 'undefined') return {};
 
-const PROD_ALLOWED_DOMAINS = ['api.example.com', 'another.example.com'] satisfies string[];
+  const config = { ...DEFAULT_ENV_CONFIG, ...envConfig };
 
-if (
-  process.env.NODE_ENV === 'production' &&
-  !PROD_ALLOWED_DOMAINS.includes(new URL(env.BASE_URL).hostname)
-) {
-  throw new Error('BASE_URL must be one of the allowed production domains');
-}
+  return {
+    AUTH_USERNAME: process.env[config.authUsername]?.trim(),
+    AUTH_PASSWORD: process.env[config.authPassword]?.trim(),
+    AUTH_TOKEN: process.env[config.authToken]?.trim(),
+    BASE_URL: process.env[config.baseUrl]?.trim() || '',
+    ALLOW_BASIC_AUTH_IN_PROD: process.env[config.allowBasicAuthInProd] === 'true',
+  };
+};
 
 const MAX = {
   TAGS: 10,
@@ -93,15 +112,13 @@ export interface ApiError {
 }
 
 /**
- * Cache options with clear descriptions
+ * Next.js specific cache options
  */
 export type CacheOption =
-  | 'no-store' // Never cache (default)
-  | 'force-cache' // Always use cache
-  | 'default' // Browser default
-  | 'no-cache' // Revalidate before use
-  | 'reload' // Always fetch fresh
-  | 'only-if-cached'; // Use cache only
+  | 'force-cache' // Cache the request indefinitely
+  | 'no-store' // Never cache (default - always fetch fresh)
+  | 'no-cache' // Cache but revalidate every time
+  | 'default'; // Use Next.js default caching behavior
 
 /**
  * Query parameter types
@@ -109,7 +126,7 @@ export type CacheOption =
 export type QueryValue = string | number | boolean | null | undefined;
 export type QueryParams = Record<string, QueryValue>;
 
-// Rate limiting and circuit breaker
+// Rate limiting and circuit breaker (shared between client/server)
 const rateTimestamps: number[] = [];
 const circuitMap = new Map<string, number>();
 
@@ -121,8 +138,44 @@ const isRateLimited = (): boolean => {
   return false;
 };
 
-const getAuthHeader = (): string | undefined => {
-  if (typeof window !== 'undefined') throw new Error('apiRequest must run server-side');
+/**
+ * Client configuration passed from server
+ */
+export interface ClientConfig {
+  baseUrl: string;
+  authHeader?: string;
+}
+
+/**
+ * Configuration for creating SafeFetch instance
+ */
+export interface SafeFetchConfig {
+  /**
+   * Custom environment variable names
+   */
+  envConfig?: EnvConfig;
+
+  /**
+   * Allowed production domains for security
+   */
+  allowedDomains?: string[];
+
+  /**
+   * Default request options
+   */
+  defaults?: {
+    timeout?: number;
+    retryAttempts?: number | 0;
+    retryDelay?: number;
+    cache?: CacheOption;
+  };
+}
+
+/**
+ * Server-side auth header generation
+ */
+const getAuthHeader = (env: ReturnType<typeof createEnv>): string | undefined => {
+  if (typeof window !== 'undefined') throw new Error('getAuthHeader must run server-side');
 
   if (env.AUTH_TOKEN) {
     const isValidJwt = /^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/.test(env.AUTH_TOKEN);
@@ -142,6 +195,40 @@ const getAuthHeader = (): string | undefined => {
 
   throw new Error('No authentication credentials provided');
 };
+
+/**
+ * Create client config on server-side
+ * This should be called in Server Components or API routes
+ */
+export function createClientConfig(config: SafeFetchConfig = {}): ClientConfig {
+  if (typeof window !== 'undefined') {
+    throw new Error('createClientConfig must run server-side');
+  }
+
+  const env = createEnv(config.envConfig);
+
+  // Server-side validation
+  if (!env.BASE_URL?.startsWith('https://')) {
+    throw new Error('BASE_URL must start with https://');
+  }
+
+  const DEFAULT_ALLOWED_DOMAINS = ['api.example.com', 'another.example.com'];
+  const allowedDomains = config.allowedDomains || DEFAULT_ALLOWED_DOMAINS;
+
+  if (
+    process.env.NODE_ENV === 'production' &&
+    !allowedDomains.includes(new URL(env.BASE_URL).hostname)
+  ) {
+    throw new Error(
+      `BASE_URL must be one of the allowed production domains: ${allowedDomains.join(', ')}`,
+    );
+  }
+
+  return {
+    baseUrl: env.BASE_URL!,
+    authHeader: getAuthHeader(env),
+  };
+}
 
 const sanitizeTags = (tags: string[]): string[] =>
   tags
@@ -226,10 +313,10 @@ export interface RequestOptions<TData = unknown> {
 
   /**
    * Retry count if the request fails.
-   * Only for network/server errors. Max 5.
+   * Only for network/server errors.
    * Default: 3
    */
-  retryAttempts?: 0 | 1 | 2 | 3 | 4 | 5;
+  retryAttempts?: number;
 
   /**
    * Delay (in ms) between retries.
@@ -256,6 +343,12 @@ export interface RequestOptions<TData = unknown> {
    * Example: { "X-Client-Version": "1.0.0" }
    */
   customHeaders?: Record<string, string>;
+
+  /**
+   * Client config (required for client-side requests)
+   * Pass the result of createClientConfig() from server-side
+   */
+  clientConfig?: ClientConfig;
 }
 
 /**
@@ -349,78 +442,90 @@ export async function apiRequest<T>(
   options?: GetOptions,
 ): Promise<ApiResponse<T>>;
 export async function apiRequest<T>(
-  method: 'POST',
-  url: string,
-  options?: PostOptions<T>,
-): Promise<ApiResponse<T>>;
-export async function apiRequest<T>(
-  method: 'PUT',
-  url: string,
-  options?: PutOptions<T>,
-): Promise<ApiResponse<T>>;
-export async function apiRequest<T>(
-  method: 'PATCH',
-  url: string,
-  options?: PatchOptions<T>,
-): Promise<ApiResponse<T>>;
-export async function apiRequest<T>(
   method: 'DELETE',
   url: string,
   options?: DeleteOptions,
 ): Promise<ApiResponse<T>>;
+export async function apiRequest<T, TData = unknown>(
+  method: 'POST',
+  url: string,
+  options?: PostOptions<TData>,
+): Promise<ApiResponse<T>>;
+export async function apiRequest<T, TData = unknown>(
+  method: 'PUT',
+  url: string,
+  options?: PutOptions<TData>,
+): Promise<ApiResponse<T>>;
+export async function apiRequest<T, TData = unknown>(
+  method: 'PATCH',
+  url: string,
+  options?: PatchOptions<TData>,
+): Promise<ApiResponse<T>>;
+export async function apiRequest<T>(
+  method: HttpMethod,
+  url: string,
+  options?: RequestOptions,
+): Promise<ApiResponse<T>>;
 
 /**
  * Makes a safe, typed HTTP request to your backend or any HTTPS API.
+ * Works on both server and client side.
  *
- * This function:
- * - Automatically attaches credentials (JWT or Basic Auth)
- * - Optionally validates mutations with CSRF checks
- * - Handles common HTTP errors and maps them to helpful messages
- * - Automatically retries on failures (with backoff)
- * - Validates inputs like URLs, methods, payload size
- * - Optionally revalidates Next.js cache after mutation
- * - Logs inferred TypeScript types in development to help with typing
- *
- * ## Basic Usage:
- *
- * GET request:
+ * ## Server Usage (automatic credentials):
  * ```ts
- * const res = await apiRequest<User[]>('GET', '/api/users', {
- *   query: { page: 1, limit: 10 }
- * });
+ * const res = await apiRequest<User[]>('GET', '/api/users');
+ * ```
  *
- * if (res.success) {
- *   console.log(res.data); // Fully typed User[]
- * } else {
- *   console.error(res.error.message);
+ * ## Client Usage (requires clientConfig):
+ * ```ts
+ * // In your Server Component or API route:
+ * const clientConfig = createClientConfig();
+ *
+ * // Pass to client component as prop, then:
+ * const res = await apiRequest<User[]>('GET', '/api/users', {
+ *   clientConfig
+ * });
+ * ```
+ *
+ * ## Next.js App Router Pattern:
+ * ```tsx
+ * // app/page.tsx (Server Component)
+ * import { createClientConfig } from './lib/safe-fetch';
+ * import UserList from './components/UserList';
+ *
+ * export default function Page() {
+ *   const clientConfig = createClientConfig();
+ *   return <UserList clientConfig={clientConfig} />;
+ * }
+ *
+ * // components/UserList.tsx (Client Component)
+ * 'use client';
+ * import { apiRequest, ClientConfig } from '../lib/safe-fetch';
+ *
+ * interface Props {
+ *   clientConfig: ClientConfig;
+ * }
+ *
+ * export default function UserList({ clientConfig }: Props) {
+ *   const [users, setUsers] = useState([]);
+ *
+ *   useEffect(() => {
+ *     apiRequest<User[]>('GET', '/api/users', { clientConfig })
+ *       .then(res => res.success && setUsers(res.data));
+ *   }, [clientConfig]);
+ *
+ *   return <div>{users.map(user => <div key={user.id}>{user.name}</div>)}</div>;
  * }
  * ```
  *
- * POST request with optional CSRF and cache revalidation:
+ * ## Custom Environment Variables:
  * ```ts
- * const res = await apiRequest<User>('POST', '/api/users', {
- *   data: { name: 'Jane' },
- *   csrfToken: csrf, // Optional - provide if your API requires it
- *   revalidateTags: ['users']
- * });
- * ```
- *
- * POST request without CSRF (for APIs that don't require it):
- * ```ts
- * const res = await apiRequest<User>('POST', '/api/users', {
- *   data: { name: 'Jane' },
- *   revalidateTags: ['users']
- * });
- * ```
- *
- * Advanced config (PUT with retry, timeout, revalidate):
- * ```ts
- * const res = await apiRequest<User>('PUT', '/api/users/123', {
- *   data: { name: 'John' },
- *   csrfToken: csrf, // Optional
- *   timeout: 15000,
- *   retryAttempts: 2,
- *   revalidatePaths: ['/users']
+ * const clientConfig = createClientConfig({
+ *   envConfig: {
+ *     baseUrl: 'MY_API_URL',
+ *     authToken: 'MY_AUTH_TOKEN'
+ *   },
+ *   allowedDomains: ['my-api.com']
  * });
  * ```
  */
@@ -430,6 +535,8 @@ export async function apiRequest<T>(
   options: RequestOptions = {},
 ): Promise<ApiResponse<T>> {
   const requestId = `req_${crypto.randomUUID()}`;
+  const isClient = typeof window !== 'undefined';
+
   const {
     data,
     query,
@@ -444,7 +551,22 @@ export async function apiRequest<T>(
     csrfToken,
     logTypes = false,
     customHeaders = {},
+    clientConfig,
   } = options;
+
+  // Client-side validation
+  if (isClient && !clientConfig) {
+    return {
+      success: false,
+      error: createError(
+        STATUS.BAD_REQUEST,
+        'VALIDATION_ERROR',
+        'clientConfig is required for client-side requests. Create it server-side with createClientConfig()',
+        requestId,
+      ),
+      data: null,
+    };
+  }
 
   if (!isValidMethod(method)) {
     return {
@@ -459,9 +581,34 @@ export async function apiRequest<T>(
     };
   }
 
+  // Get base URL and auth from appropriate source
+  const baseUrl = isClient ? clientConfig!.baseUrl : createEnv().BASE_URL;
+  const authHeader = isClient
+    ? clientConfig!.authHeader
+    : (() => {
+        try {
+          return getAuthHeader(createEnv());
+        } catch {
+          return undefined;
+        }
+      })();
+
+  if (!baseUrl) {
+    return {
+      success: false,
+      error: createError(
+        STATUS.BAD_REQUEST,
+        'VALIDATION_ERROR',
+        'Base URL not configured',
+        requestId,
+      ),
+      data: null,
+    };
+  }
+
   let fullUrl: URL;
   try {
-    fullUrl = new URL(url, env.BASE_URL);
+    fullUrl = new URL(url, baseUrl);
   } catch {
     return {
       success: false,
@@ -536,17 +683,6 @@ export async function apiRequest<T>(
     }
   }
 
-  let authHeader: string | undefined;
-  try {
-    authHeader = getAuthHeader();
-  } catch {
-    return {
-      success: false,
-      error: createError(STATUS.UNAUTHORIZED, 'AUTH_ERROR', 'Authentication failed', requestId),
-      data: null,
-    };
-  }
-
   const isFormData = typeof FormData !== 'undefined' && data instanceof FormData;
   const headers: Record<string, string> = {
     Accept: 'application/json',
@@ -600,14 +736,8 @@ export async function apiRequest<T>(
         body,
       };
 
-      if (revalidate !== undefined || revalidateTags.length) {
-        fetchOptions.next = {
-          revalidate,
-          tags: sanitizeTags(revalidateTags),
-        };
-      }
-
-      if (revalidate !== undefined || revalidateTags.length) {
+      // Only use Next.js cache options on server-side
+      if (!isClient && (revalidate !== undefined || revalidateTags.length)) {
         fetchOptions.next = {
           revalidate,
           tags: sanitizeTags(revalidateTags),
@@ -646,7 +776,7 @@ export async function apiRequest<T>(
           contentType.includes('application/octet-stream') ||
           contentType.startsWith('image/')
         ) {
-          parsedData = (await response.blob()) as unknown as T; // 🔧 basic binary support
+          parsedData = (await response.blob()) as unknown as T;
         } else {
           throw new Error(`Unsupported content type: ${contentType}`);
         }
@@ -688,7 +818,10 @@ export async function apiRequest<T>(
         };
       }
 
-      await invalidateCache(revalidatePaths, revalidateTags, revalidateType);
+      // Only invalidate cache on server-side
+      if (!isClient) {
+        await invalidateCache(revalidatePaths, revalidateTags, revalidateType);
+      }
 
       if (process.env.NODE_ENV === 'development' && logTypes) {
         console.group(`🔍 ${method} ${url} - Inferred Type`);
@@ -730,6 +863,40 @@ export async function apiRequest<T>(
   };
 
   return makeRequest();
+}
+
+/**
+ * Create a SafeFetch instance with custom configuration
+ * Useful for multiple APIs or different configurations
+ */
+export function createSafeFetch(config: SafeFetchConfig = {}) {
+  const defaults = config.defaults || {};
+
+  return {
+    /**
+     * Create client config for this instance
+     */
+    createClientConfig: () => createClientConfig(config),
+
+    /**
+     * Make an API request with instance defaults
+     */
+    request: <T>(
+      method: HttpMethod,
+      url: string,
+      options: RequestOptions = {},
+    ): Promise<ApiResponse<T>> => {
+      const mergedOptions = {
+        timeout: defaults.timeout,
+        retryAttempts: defaults.retryAttempts,
+        retryDelay: defaults.retryDelay,
+        cache: defaults.cache,
+        ...options,
+      };
+
+      return apiRequest<T>(method, url, mergedOptions);
+    },
+  };
 }
 
 export default apiRequest;
