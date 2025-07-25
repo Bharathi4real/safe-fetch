@@ -23,6 +23,8 @@ export interface EnvConfig {
   baseUrl?: string;
   /** Environment variable name to allow basic auth in production */
   allowBasicAuthInProd?: string;
+  /** Environment variable name to enable detailed error headers in production */
+  exposeErrorHeaders?: string;
 }
 
 /**
@@ -34,6 +36,7 @@ const DEFAULT_ENV_CONFIG: Required<EnvConfig> = {
   authToken: 'AUTH_TOKEN',
   baseUrl: 'BASE_URL',
   allowBasicAuthInProd: 'ALLOW_BASIC_AUTH_IN_PROD',
+  exposeErrorHeaders: 'EXPOSE_ERROR_HEADERS',
 };
 
 /**
@@ -50,6 +53,7 @@ const createEnv = (envConfig: EnvConfig = {}) => {
     AUTH_TOKEN: process.env[config.authToken]?.trim(),
     BASE_URL: process.env[config.baseUrl]?.trim() || '',
     ALLOW_BASIC_AUTH_IN_PROD: process.env[config.allowBasicAuthInProd] === 'true',
+    ENABLE_DETAILED_ERRORS_IN_PROD: process.env[config.exposeErrorHeaders] === 'true',
   };
 };
 
@@ -57,15 +61,25 @@ const createEnv = (envConfig: EnvConfig = {}) => {
  * Maximum limits and timeouts for various operations
  */
 const MAX = {
+  /** Maximum number of cache tags allowed per request */
   TAGS: 10,
+  /** Maximum length of individual cache tag in characters */
   TAG_LEN: 64,
+  /** Maximum number of paths to revalidate per request */
   PATHS: 10,
+  /** Maximum response size in bytes (1MB) - prevents memory exhaustion */
   RES_SIZE: 1_000_000,
+  /** Maximum request payload size in bytes (100KB) - prevents large uploads */
   PAYLOAD: 100_000,
+  /** Default request timeout in milliseconds (30 seconds) */
   TIMEOUT: 30_000,
+  /** Rate limiting time window in milliseconds (60 seconds) */
   RATE_WINDOW: 60_000,
+  /** Maximum requests allowed per rate limit window */
   RATE_MAX: 500,
+  /** Circuit breaker timeout in milliseconds (30 seconds) - how long to keep circuit open */
   CIRCUIT_TTL: 30_000,
+  /** Circuit breaker failure threshold - unused but reserved for future implementation */
   CIRCUIT_MAX: 100,
 } as const;
 
@@ -121,6 +135,12 @@ export interface ApiError {
   timestamp: string;
   requestId: string;
   details?: Record<string, unknown>;
+  apiError?: unknown;
+  rawResponse?: {
+    statusText: string;
+    url: string;
+    safeHeaders?: Record<string, string>;
+  };
 }
 
 /**
@@ -168,6 +188,8 @@ export interface ClientConfig {
   baseUrl: string;
   authHeader?: string;
   forwardedHeaders?: Record<string, string>;
+  /** Whether to include detailed error information (headers, raw response) */
+  includeDetailedErrors?: boolean;
 }
 
 /**
@@ -176,6 +198,8 @@ export interface ClientConfig {
 export interface SafeFetchConfig {
   envConfig?: EnvConfig;
   allowedDomains?: string[];
+  /** Whether to include detailed error information in responses */
+  includeDetailedErrors?: boolean;
   defaults?: {
     timeout?: number;
     retryAttempts?: number | 0;
@@ -207,6 +231,27 @@ const getAuthHeader = (env: ReturnType<typeof createEnv>): string | undefined =>
   }
 
   throw new Error('No authentication credentials provided');
+};
+
+/**
+ * Determines whether to include detailed error information based on environment and configuration
+ */
+const shouldIncludeDetailedErrors = (
+  config: SafeFetchConfig = {},
+  env: ReturnType<typeof createEnv>,
+): boolean => {
+  // If explicitly configured in SafeFetchConfig, use that
+  if (config.includeDetailedErrors !== undefined) {
+    return config.includeDetailedErrors;
+  }
+
+  // In development, always include detailed errors
+  if (process.env.NODE_ENV === 'development') {
+    return true;
+  }
+
+  // In production, only include if explicitly enabled via environment variable
+  return env.ENABLE_DETAILED_ERRORS_IN_PROD || false;
 };
 
 /**
@@ -250,10 +295,13 @@ export async function createClientConfig(config: SafeFetchConfig = {}): Promise<
     // Headers not available in some contexts
   }
 
+  const includeDetailedErrors = shouldIncludeDetailedErrors(config, env);
+
   return {
     baseUrl: env.BASE_URL!,
     authHeader: getAuthHeader(env),
     forwardedHeaders,
+    includeDetailedErrors,
   };
 }
 
@@ -346,6 +394,12 @@ export interface RequestOptions<TData = unknown> {
 
   /** Client configuration (required for client-side requests) */
   clientConfig?: ClientConfig;
+
+  /**
+   * Whether to include detailed error information (headers, raw response) in error responses
+   * Overrides the global configuration for this specific request
+   */
+  includeDetailedErrors?: boolean;
 }
 
 /**
@@ -508,6 +562,42 @@ export async function apiRequest<T>(
 /**
  * Core HTTP request function with comprehensive features for Next.js applications
  *
+ * @param method - HTTP method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+ * @param url - Relative or absolute URL path
+ * @param options - Request configuration options
+ * @returns Promise resolving to typed API response
+ *
+ * @example Basic GET request
+ * ```typescript
+ * const { success, data, error } = await apiRequest('GET', '/api/users');
+ * if (success) console.log(data);
+ * ```
+ *
+ * @example POST with data
+ * ```typescript
+ * const response = await apiRequest('POST', '/api/users', {
+ *   data: { name: 'John', email: 'john@example.com' }
+ * });
+ * ```
+ *
+ * @example With caching and revalidation
+ * ```typescript
+ * const response = await apiRequest('GET', '/api/posts', {
+ *   cache: 'force-cache',
+ *   revalidate: 3600,
+ *   revalidateTags: ['posts']
+ * });
+ * ```
+ *
+ * @example With retry configuration
+ * ```typescript
+ * const response = await apiRequest('GET', '/api/data', {
+ *   retryAttempts: 5,
+ *   retryDelay: 2000,
+ *   timeout: 10000
+ * });
+ * ```
+ *
  * Key Features:
  * - Type Safety: Full TypeScript support with request/response typing
  * - Retry Logic: Automatic retries with exponential backoff and jitter
@@ -539,6 +629,7 @@ export async function apiRequest<T>(
     logTypes = false,
     customHeaders = {},
     clientConfig,
+    includeDetailedErrors,
   } = options;
 
   if (isClient && !clientConfig) {
@@ -577,6 +668,14 @@ export async function apiRequest<T>(
           return undefined;
         }
       })();
+
+  // Determine whether to include detailed errors for this request
+  const shouldIncludeDetails =
+    includeDetailedErrors !== undefined
+      ? includeDetailedErrors
+      : isClient
+        ? clientConfig?.includeDetailedErrors
+        : shouldIncludeDetailedErrors({}, createEnv());
 
   if (!baseUrl) {
     return {
@@ -756,31 +855,79 @@ export async function apiRequest<T>(
         };
       }
 
+      const getSafeHeaders = (headers: Record<string, string>): Record<string, string> => {
+        const safeHeaderKeys = [
+          'content-type',
+          'content-length',
+          'cache-control',
+          'retry-after',
+          'x-ratelimit-limit',
+          'x-ratelimit-remaining',
+          'x-ratelimit-reset',
+          'x-request-id',
+          'x-trace-id',
+          'server-timing',
+        ];
+
+        const safeHeaders: Record<string, string> = {};
+        safeHeaderKeys.forEach((key) => {
+          const value = headers[key.toLowerCase()];
+          if (value) safeHeaders[key] = value;
+        });
+
+        return safeHeaders;
+      };
+
       let parsedData: T;
+      let apiErrorData: unknown = null;
       try {
         const contentType = response.headers.get('Content-Type') || '';
         if (contentType.includes('application/json')) {
           parsedData = await response.json();
+          // For failed requests, store the parsed error response (only if expose error headers enabled)
+          if (!response.ok && shouldIncludeDetails) {
+            apiErrorData = parsedData;
+          }
         } else if (contentType.startsWith('text/')) {
-          parsedData = (await response.text()) as unknown as T;
+          const textData = await response.text();
+          parsedData = textData as unknown as T;
+          // For failed requests, store the text response (only if expose error headers enabled)
+          if (!response.ok && shouldIncludeDetails) {
+            apiErrorData = textData;
+          }
         } else if (
           contentType.includes('application/octet-stream') ||
           contentType.startsWith('image/')
         ) {
           parsedData = (await response.blob()) as unknown as T;
+          // For binary data, we can't really parse the error, so leave it null
         } else {
           throw new Error(`Unsupported content type: ${contentType}`);
         }
       } catch (error: unknown) {
         console.error('Failed to parse response:', error);
+
+        const baseError = createError(
+          response.status as StatusCode,
+          'NETWORK_ERROR',
+          'Failed to parse response',
+          requestId,
+        );
+
         return {
           success: false,
-          error: createError(
-            response.status as StatusCode,
-            'NETWORK_ERROR',
-            'Failed to parse response',
-            requestId,
-          ),
+          error: {
+            ...baseError,
+            // Include parsing error details only if expose error headers enabled
+            ...(shouldIncludeDetails && {
+              apiError: error instanceof Error ? error.message : 'Unknown parsing error',
+              rawResponse: {
+                safeHeaders: getSafeHeaders(responseHeaders),
+                statusText: response.statusText,
+                url: fullUrl.toString(),
+              },
+            }),
+          },
           data: null,
         };
       }
@@ -796,15 +943,30 @@ export async function apiRequest<T>(
         }
 
         circuitMap.set(circuitKey, now + MAX.CIRCUIT_TTL);
+
+        const baseError = createError(
+          response.status as StatusCode,
+          getErrorType(response.status),
+          response.statusText || 'Request failed',
+          requestId,
+          { url, method, attempt },
+        );
+
+        // Enhanced error response with actual API error data (only if expose error headers enabled)
         return {
           success: false,
-          error: createError(
-            response.status as StatusCode,
-            getErrorType(response.status),
-            response.statusText || 'Request failed',
-            requestId,
-            { url, method, attempt },
-          ),
+          error: {
+            ...baseError,
+            // Only include detailed error information if enabled
+            ...(shouldIncludeDetails && {
+              apiError: apiErrorData,
+              rawResponse: {
+                safeHeaders: getSafeHeaders(responseHeaders),
+                statusText: response.statusText,
+                url: fullUrl.toString(),
+              },
+            }),
+          },
           data: null,
         };
       }
@@ -838,14 +1000,35 @@ export async function apiRequest<T>(
       }
 
       circuitMap.set(circuitKey, now + MAX.CIRCUIT_TTL);
+
+      const baseError = createError(
+        isTimeout ? 408 : 500,
+        isTimeout ? 'TIMEOUT_ERROR' : 'NETWORK_ERROR',
+        isTimeout ? 'Request timeout' : 'Network error',
+        requestId,
+      );
+
       return {
         success: false,
-        error: createError(
-          isTimeout ? 408 : 500,
-          isTimeout ? 'TIMEOUT_ERROR' : 'NETWORK_ERROR',
-          isTimeout ? 'Request timeout' : 'Network error',
-          requestId,
-        ),
+        error: {
+          ...baseError,
+          // Include network error details only if expose error headers are enabled
+          ...(shouldIncludeDetails && {
+            apiError:
+              err instanceof Error
+                ? {
+                    name: err.name,
+                    message: err.message,
+                    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
+                  }
+                : err,
+            rawResponse: {
+              safeHeaders: {}, // No headers available for network errors
+              statusText: isTimeout ? 'Request Timeout' : 'Network Error',
+              url: fullUrl.toString(),
+            },
+          }),
+        },
         data: null,
       };
     } finally {
@@ -883,6 +1066,8 @@ export async function createSafeFetch(config: SafeFetchConfig = {}) {
         retryDelay: defaults.retryDelay,
         cache: defaults.cache,
         ...options,
+        // Pass through the global includeDetailedErrors setting if not overridden
+        includeDetailedErrors: options.includeDetailedErrors ?? config.includeDetailedErrors,
       };
 
       return apiRequest<T>(method, url, mergedOptions);
@@ -926,11 +1111,6 @@ export const patch = <T, TData = unknown>(
 export const del = <T>(url: string, options?: DeleteOptions): Promise<ApiResponse<T>> =>
   apiRequest<T>('DELETE', url, options);
 
-/**
- * SafeFetch Default Export - The core apiRequest function
- *
- * This is the main entry point for SafeFetch, providing a comprehensive HTTP client
- * specifically designed for Next.js applications with advanced caching, retry logic,
- * and type safety.
- */
+// SafeFetch Default Export - The core apiRequest function
+
 export default apiRequest;
