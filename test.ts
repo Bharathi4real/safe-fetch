@@ -4,14 +4,13 @@
  * https://github.com/Bharathi4real/safe-fetch
  */
 
-"use server";
+'use server';
 
 import { revalidatePath, revalidateTag } from 'next/cache';
-import { cookies, headers } from 'next/headers';
+import { headers } from 'next/headers';
 
 /**
  * Environment configuration for authentication and base URL setup
- * @interface EnvConfig
  */
 export interface EnvConfig {
   /** Environment variable name for basic auth username */
@@ -39,8 +38,6 @@ const DEFAULT_ENV_CONFIG: Required<EnvConfig> = {
 
 /**
  * Creates environment configuration object from process.env
- * @param envConfig - Custom environment variable names
- * @returns Environment values or empty object on client-side
  */
 const createEnv = (envConfig: EnvConfig = {}) => {
   if (typeof window !== 'undefined') return {};
@@ -60,25 +57,15 @@ const createEnv = (envConfig: EnvConfig = {}) => {
  * Maximum limits and timeouts for various operations
  */
 const MAX = {
-  /** Maximum number of cache tags */
   TAGS: 10,
-  /** Maximum length of a cache tag */
   TAG_LEN: 64,
-  /** Maximum number of revalidation paths */
   PATHS: 10,
-  /** Maximum response size in bytes (1MB) */
   RES_SIZE: 1_000_000,
-  /** Maximum request payload size in bytes (100KB) */
   PAYLOAD: 100_000,
-  /** Default request timeout in milliseconds */
   TIMEOUT: 30_000,
-  /** Rate limiting window in milliseconds */
   RATE_WINDOW: 60_000,
-  /** Maximum requests per rate limiting window */
   RATE_MAX: 500,
-  /** Circuit breaker timeout in milliseconds */
   CIRCUIT_TTL: 30_000,
-  /** Maximum circuit breaker failures */
   CIRCUIT_MAX: 100,
 } as const;
 
@@ -111,50 +98,43 @@ const STATUS = {
   SERVICE_UNAVAILABLE: 503,
 } as const;
 
-/**
- * HTTP status code type union
- */
 export type StatusCode = (typeof STATUS)[keyof typeof STATUS];
 
 /**
  * Error types for categorizing different failure modes
  */
 export type ErrorType =
-  | 'VALIDATION_ERROR'  // Invalid input data or parameters
-  | 'AUTH_ERROR'        // Authentication/authorization failures
-  | 'RATE_LIMIT_ERROR'  // Rate limiting triggered
-  | 'NETWORK_ERROR'     // Network connectivity issues
-  | 'TIMEOUT_ERROR'     // Request timeout
-  | 'SERVER_ERROR';     // Server-side errors (5xx)
+  | 'VALIDATION_ERROR' // Invalid input data or parameters
+  | 'AUTH_ERROR' // Authentication/authorization failures
+  | 'RATE_LIMIT_ERROR' // Rate limiting triggered
+  | 'NETWORK_ERROR' // Network connectivity issues
+  | 'TIMEOUT_ERROR' // Request timeout
+  | 'SERVER_ERROR'; // Server-side errors (5xx)
 
 /**
  * Standardized error object returned by SafeFetch
- * @interface ApiError
  */
 export interface ApiError {
-  /** HTTP status code */
   status: StatusCode;
-  /** Categorized error type */
   type: ErrorType;
-  /** Human-readable error message */
   message: string;
-  /** ISO timestamp when error occurred */
   timestamp: string;
-  /** Unique request identifier for tracing */
   requestId: string;
-  /** Additional error context and debugging information */
   details?: Record<string, unknown>;
 }
 
 /**
  * Next.js cache strategies
- * @see https://nextjs.org/docs/app/api-reference/functions/fetch#optionscache
  */
 export type NextCacheStrategy =
-  | 'force-cache'  // Cache indefinitely until manually invalidated
-  | 'no-store'     // Never cache, always fetch fresh
-  | 'no-cache'     // Cache but revalidate on every request
-  | 'default';     // Use default caching behavior
+  /** Cache indefinitely until manually invalidated */
+  | 'force-cache'
+  /** Never cache, always fetch fresh data */
+  | 'no-store'
+  /** Cache but revalidate on every request (stale-while-revalidate) */
+  | 'no-cache'
+  /** Use Next.js default caching behavior */
+  | 'default';
 
 /**
  * Valid query parameter value types
@@ -172,7 +152,6 @@ const circuitMap = new Map<string, number>();
 
 /**
  * Checks if current request would exceed rate limits
- * @returns True if rate limited, false otherwise
  */
 const isRateLimited = (): boolean => {
   const now = Date.now();
@@ -184,44 +163,29 @@ const isRateLimited = (): boolean => {
 
 /**
  * Client configuration for making requests
- * @interface ClientConfig
  */
 export interface ClientConfig {
-  /** Base URL for all API requests */
   baseUrl: string;
-  /** Pre-computed authorization header */
   authHeader?: string;
-  /** Headers to forward from Next.js request context */
   forwardedHeaders?: Record<string, string>;
 }
 
 /**
  * Configuration for SafeFetch instance
- * @interface SafeFetchConfig
  */
 export interface SafeFetchConfig {
-  /** Custom environment variable configuration */
   envConfig?: EnvConfig;
-  /** Allowed domains for production API calls */
   allowedDomains?: string[];
-  /** Default options for all requests */
   defaults?: {
-    /** Default timeout in milliseconds */
     timeout?: number;
-    /** Default number of retry attempts (0 to disable) */
     retryAttempts?: number | 0;
-    /** Default delay between retries in milliseconds */
     retryDelay?: number;
-    /** Default caching strategy */
     cache?: NextCacheStrategy;
   };
 }
 
 /**
  * Generates authorization header from environment variables
- * @param env - Environment configuration object
- * @returns Authorization header string or undefined
- * @throws Error if no valid credentials found or invalid format
  */
 const getAuthHeader = (env: ReturnType<typeof createEnv>): string | undefined => {
   if (typeof window !== 'undefined') throw new Error('getAuthHeader must run server-side');
@@ -247,20 +211,8 @@ const getAuthHeader = (env: ReturnType<typeof createEnv>): string | undefined =>
 
 /**
  * Creates client configuration for API requests (server-side only)
- * @param config - SafeFetch configuration options
- * @returns ClientConfig object with base URL, auth header, and forwarded headers
- * @throws Error if called client-side or configuration is invalid
- * 
- * @example
- * ```typescript
- * // In a server component or API route
- * const clientConfig = createClientConfig({
- *   allowedDomains: ['api.myapp.com'],
- *   envConfig: { baseUrl: 'MY_API_URL' }
- * });
- * ```
  */
-export function createClientConfig(config: SafeFetchConfig = {}): ClientConfig {
+export async function createClientConfig(config: SafeFetchConfig = {}): Promise<ClientConfig> {
   if (typeof window !== 'undefined') {
     throw new Error('createClientConfig must run server-side');
   }
@@ -271,7 +223,7 @@ export function createClientConfig(config: SafeFetchConfig = {}): ClientConfig {
     throw new Error('BASE_URL must start with https://');
   }
 
-  const DEFAULT_ALLOWED_DOMAINS = ['api.example.com', 'another.example.com'];
+  const DEFAULT_ALLOWED_DOMAINS = [`${env.BASE_URL}`, `anotherdomain.com`];
   const allowedDomains = config.allowedDomains || DEFAULT_ALLOWED_DOMAINS;
 
   if (
@@ -283,19 +235,19 @@ export function createClientConfig(config: SafeFetchConfig = {}): ClientConfig {
     );
   }
 
-  // Forward important Next.js headers for proper request context
   const forwardedHeaders: Record<string, string> = {};
+
   try {
-    const headersList = headers();
+    const headersList = await headers();
     const userAgent = headersList.get('user-agent');
     const xForwardedFor = headersList.get('x-forwarded-for');
     const xRealIp = headersList.get('x-real-ip');
-    
+
     if (userAgent) forwardedHeaders['User-Agent'] = userAgent;
     if (xForwardedFor) forwardedHeaders['X-Forwarded-For'] = xForwardedFor;
     if (xRealIp) forwardedHeaders['X-Real-IP'] = xRealIp;
   } catch {
-    // Headers not available in some contexts (e.g., generateStaticParams)
+    // Headers not available in some contexts
   }
 
   return {
@@ -307,8 +259,6 @@ export function createClientConfig(config: SafeFetchConfig = {}): ClientConfig {
 
 /**
  * Sanitizes cache tags to ensure they meet Next.js requirements
- * @param tags - Array of cache tags to sanitize
- * @returns Sanitized cache tags with 'api:' prefix
  */
 const sanitizeTags = (tags: string[]): string[] =>
   tags
@@ -319,17 +269,12 @@ const sanitizeTags = (tags: string[]): string[] =>
 
 /**
  * Sanitizes revalidation paths to prevent directory traversal
- * @param paths - Array of paths to sanitize
- * @returns Sanitized paths starting with '/' without '..' sequences
  */
 const sanitizePaths = (paths: string[]): string[] =>
   paths.filter((p) => p.startsWith('/') && !p.includes('..')).slice(0, MAX.PATHS);
 
 /**
  * Invalidates Next.js cache for specified paths and tags
- * @param paths - Paths to revalidate
- * @param tags - Cache tags to revalidate
- * @param type - Type of revalidation ('page' or 'layout')
  */
 const invalidateCache = async (
   paths: string[],
@@ -351,99 +296,102 @@ const invalidateCache = async (
 };
 
 /**
- * Base request options interface
- * @template TData - Type of request body data
+ * Base request options interface with comprehensive JSDoc for IntelliSense
  */
 export interface RequestOptions<TData = unknown> {
-  /** Request body data (for POST, PUT, PATCH) */
+  /** Request body data (for POST, PUT, PATCH methods) */
   data?: TData;
-  /** URL query parameters */
+
+  /** URL query parameters to append to the request URL */
   query?: QueryParams;
-  /** Next.js caching strategy */
+
+  /**
+   * Next.js caching strategy
+   * - 'force-cache': Cache indefinitely until manually invalidated
+   * - 'no-store': Never cache, always fetch fresh (default)
+   * - 'no-cache': Cache but revalidate on every request
+   * - 'default': Use Next.js default caching behavior
+   */
   cache?: NextCacheStrategy;
-  /** Cache revalidation interval in seconds (false to never revalidate) */
+
+  /** Cache revalidation interval in seconds (false to never auto-revalidate) */
   revalidate?: number | false;
-  /** Cache tags to associate with response for targeted invalidation */
+
+  /** Cache tags for targeted cache invalidation */
   revalidateTags?: string[];
+
   /** Paths to revalidate after successful request */
   revalidatePaths?: string[];
-  /** Type of path revalidation */
+
+  /** Type of path revalidation ('page' | 'layout') */
   revalidateType?: 'page' | 'layout';
-  /** Request timeout in milliseconds */
+
+  /** Request timeout in milliseconds @default 30000 */
   timeout?: number;
-  /** Number of retry attempts for failed requests */
+
+  /** Number of retry attempts for failed requests @default 3 */
   retryAttempts?: number;
-  /** Base delay between retries in milliseconds */
+
+  /** Base delay between retries in milliseconds @default 1000 */
   retryDelay?: number;
+
   /** CSRF token for state-changing requests */
   csrfToken?: string;
-  /** Log inferred TypeScript types in development */
+
+  /** Log inferred TypeScript types in development console */
   logTypes?: boolean;
-  /** Additional headers to include in request */
+
+  /** Additional headers to include in the request */
   customHeaders?: Record<string, string>;
+
   /** Client configuration (required for client-side requests) */
   clientConfig?: ClientConfig;
 }
 
 /**
- * Options for GET requests (no body data or CSRF token)
+ * Options for GET requests (excludes body data and CSRF token)
  */
 export type GetOptions = Omit<RequestOptions<never>, 'data' | 'csrfToken'>;
 
 /**
- * Options for POST requests
- * @template T - Type of request body data
+ * Options for POST requests with typed body data
  */
 export type PostOptions<T> = RequestOptions<T>;
 
 /**
- * Options for PUT requests
- * @template T - Type of request body data
+ * Options for PUT requests with typed body data
  */
 export type PutOptions<T> = RequestOptions<T>;
 
 /**
- * Options for PATCH requests
- * @template T - Type of request body data
+ * Options for PATCH requests with typed body data
  */
 export type PatchOptions<T> = RequestOptions<T>;
 
 /**
- * Options for DELETE requests (no body data)
+ * Options for DELETE requests (excludes body data)
  */
 export type DeleteOptions = RequestOptions<never>;
 
 /**
- * Standardized API response wrapper
- * @template T - Type of response data
+ * Standardized API response wrapper with discriminated union for type safety
  */
 export type ApiResponse<T> =
   | {
-      /** Indicates successful response */
       success: true;
-      /** Response data */
       data: T;
-      /** HTTP status code */
       status: StatusCode;
-      /** Response headers */
       headers: Record<string, string>;
-      /** Unique request identifier */
       requestId: string;
     }
   | {
-      /** Indicates failed response */
       success: false;
-      /** Error details */
       error: ApiError & { type: ErrorType };
-      /** Always null for failed requests */
       data: null;
     };
 
 /**
  * Infers TypeScript type from runtime value for development logging
- * @param val - Value to analyze
- * @param depth - Current recursion depth
- * @returns String representation of inferred type
  */
 function inferType(val: unknown, depth = 0): string {
   const indent = '  '.repeat(depth);
@@ -466,12 +414,6 @@ function inferType(val: unknown, depth = 0): string {
 
 /**
  * Creates standardized error object
- * @param status - HTTP status code
- * @param type - Error category
- * @param message - Error description
- * @param requestId - Unique request identifier
- * @param details - Additional error context
- * @returns Formatted ApiError object
  */
 function createError(
   status: StatusCode,
@@ -492,8 +434,6 @@ function createError(
 
 /**
  * Maps HTTP status codes to error categories
- * @param status - HTTP status code
- * @returns Appropriate ErrorType for the status
  */
 function getErrorType(status: number): ErrorType {
   if (status === 400 || status === 422) return 'VALIDATION_ERROR';
@@ -506,22 +446,13 @@ function getErrorType(status: number): ErrorType {
 
 /**
  * Type guard to validate HTTP methods
- * @param method - String to validate
- * @returns True if method is a valid HttpMethod
  */
 function isValidMethod(method: string): method is HttpMethod {
   return HTTP_METHODS.includes(method as HttpMethod);
 }
 
-// Method overloads for type safety and better IntelliSense
-
 /**
- * Makes a GET request to the specified URL
- * @template T - Expected response data type
- * @param method - HTTP method (must be 'GET')
- * @param url - Request URL (relative to base URL)
- * @param options - Request options (no body data allowed)
- * @returns Promise resolving to ApiResponse with typed data
+ * Makes a GET request to retrieve data from the server
  */
 export async function apiRequest<T>(
   method: 'GET',
@@ -530,12 +461,7 @@ export async function apiRequest<T>(
 ): Promise<ApiResponse<T>>;
 
 /**
- * Makes a DELETE request to the specified URL
- * @template T - Expected response data type
- * @param method - HTTP method (must be 'DELETE')
- * @param url - Request URL (relative to base URL)
- * @param options - Request options (no body data allowed)
- * @returns Promise resolving to ApiResponse with typed data
+ * Makes a DELETE request to remove a resource from the server
  */
 export async function apiRequest<T>(
   method: 'DELETE',
@@ -544,13 +470,7 @@ export async function apiRequest<T>(
 ): Promise<ApiResponse<T>>;
 
 /**
- * Makes a POST request to the specified URL
- * @template T - Expected response data type
- * @template TData - Type of request body data
- * @param method - HTTP method (must be 'POST')
- * @param url - Request URL (relative to base URL)
- * @param options - Request options including body data
- * @returns Promise resolving to ApiResponse with typed data
+ * Makes a POST request to create new resources or submit data
  */
 export async function apiRequest<T, TData = unknown>(
   method: 'POST',
@@ -559,13 +479,7 @@ export async function apiRequest<T, TData = unknown>(
 ): Promise<ApiResponse<T>>;
 
 /**
- * Makes a PUT request to the specified URL
- * @template T - Expected response data type
- * @template TData - Type of request body data
- * @param method - HTTP method (must be 'PUT')
- * @param url - Request URL (relative to base URL)
- * @param options - Request options including body data
- * @returns Promise resolving to ApiResponse with typed data
+ * Makes a PUT request to replace or fully update a resource
  */
 export async function apiRequest<T, TData = unknown>(
   method: 'PUT',
@@ -574,13 +488,7 @@ export async function apiRequest<T, TData = unknown>(
 ): Promise<ApiResponse<T>>;
 
 /**
- * Makes a PATCH request to the specified URL
- * @template T - Expected response data type
- * @template TData - Type of request body data
- * @param method - HTTP method (must be 'PATCH')
- * @param url - Request URL (relative to base URL)
- * @param options - Request options including body data
- * @returns Promise resolving to ApiResponse with typed data
+ * Makes a PATCH request to partially update a resource
  */
 export async function apiRequest<T, TData = unknown>(
   method: 'PATCH',
@@ -589,12 +497,7 @@ export async function apiRequest<T, TData = unknown>(
 ): Promise<ApiResponse<T>>;
 
 /**
- * Makes an HTTP request to the specified URL (generic overload)
- * @template T - Expected response data type
- * @param method - HTTP method
- * @param url - Request URL (relative to base URL)
- * @param options - Request options
- * @returns Promise resolving to ApiResponse with typed data
+ * Makes an HTTP request with the specified method (generic overload)
  */
 export async function apiRequest<T>(
   method: HttpMethod,
@@ -603,45 +506,15 @@ export async function apiRequest<T>(
 ): Promise<ApiResponse<T>>;
 
 /**
- * Core HTTP request function with retry logic, caching, and error handling
- * 
- * Features:
- * - Automatic retries with exponential backoff
- * - Rate limiting and circuit breaker protection
- * - Next.js cache integration
- * - Type-safe request/response handling
- * - Comprehensive error categorization
- * - CSRF protection
- * - Request/response size validation
- * 
- * @template T - Expected response data type
- * @param method - HTTP method to use
- * @param url - Request URL (relative to configured base URL)
- * @param options - Request configuration options
- * @returns Promise resolving to typed ApiResponse
- * 
- * @example
- * ```typescript
- * // GET request
- * const response = await apiRequest<User>('GET', '/users/123');
- * if (response.success) {
- *   console.log(response.data.name); // TypeScript knows this is User.name
- * }
- * 
- * // POST request with data
- * const createResponse = await apiRequest<User, CreateUserData>(
- *   'POST', 
- *   '/users', 
- *   { data: { name: 'John', email: 'john@example.com' } }
- * );
- * 
- * // With caching and revalidation
- * const cachedResponse = await apiRequest<Post[]>('GET', '/posts', {
- *   cache: 'force-cache',
- *   revalidate: 3600, // 1 hour
- *   revalidateTags: ['posts']
- * });
- * ```
+ * Core HTTP request function with comprehensive features for Next.js applications
+ *
+ * Key Features:
+ * - Type Safety: Full TypeScript support with request/response typing
+ * - Retry Logic: Automatic retries with exponential backoff and jitter
+ * - Caching: Deep Next.js cache integration with granular control
+ * - Error Handling: Comprehensive error categorization and debugging
+ * - Security: CSRF protection, rate limiting, circuit breakers
+ * - Performance: Request/response size validation, timeout controls
  */
 export async function apiRequest<T>(
   method: HttpMethod,
@@ -654,7 +527,7 @@ export async function apiRequest<T>(
   const {
     data,
     query,
-    cache = 'no-store',
+    cache = 'default',
     revalidate,
     revalidateTags = [],
     revalidatePaths = [],
@@ -984,44 +857,22 @@ export async function apiRequest<T>(
 }
 
 /**
- * SafeFetch factory function that creates a configured instance
- * @param config - Configuration options for the instance
- * @returns Object with createClientConfig and request methods
- * 
- * @example
- * ```typescript
- * const safeFetch = createSafeFetch({
- *   allowedDomains: ['api.myapp.com'],
- *   defaults: {
- *     timeout: 10000,
- *     retryAttempts: 2,
- *     cache: 'no-store'
- *   }
- * });
- * 
- * // Use the configured instance
- * const response = await safeFetch.request<User>('GET', '/users/123');
- * ```
+ * SafeFetch factory function that creates a configured instance with defaults
  */
-export function createSafeFetch(config: SafeFetchConfig = {}) {
+export async function createSafeFetch(config: SafeFetchConfig = {}) {
   const defaults = config.defaults || {};
+  const clientConfig = await createClientConfig(config);
 
   return {
     /**
-     * Creates client configuration for this SafeFetch instance
-     * @returns ClientConfig object
+     * Returns the previously resolved ClientConfig for client-side usage
      */
-    createClientConfig: () => createClientConfig(config),
-    
+    createClientConfig: async () => clientConfig,
+
     /**
      * Makes an HTTP request using this SafeFetch instance's configuration
-     * @template T - Expected response data type
-     * @param method - HTTP method
-     * @param url - Request URL
-     * @param options - Request options (merged with instance defaults)
-     * @returns Promise resolving to ApiResponse
      */
-    request: <T>(
+    request: async <T>(
       method: HttpMethod,
       url: string,
       options: RequestOptions = {},
@@ -1040,62 +891,13 @@ export function createSafeFetch(config: SafeFetchConfig = {}) {
 }
 
 /**
- * Makes a GET request to retrieve data
- * @template T - Expected response data type
- * @param url - Request URL (relative to base URL)
- * @param options - GET request options
- * @returns Promise resolving to ApiResponse with data
- * 
- * @example
- * ```typescript
- * // Simple GET request
- * const response = await get<User>('/users/123');
- * 
- * // GET with query parameters and caching
- * const response = await get<User[]>('/users', {
- *   query: { limit: 10, sort: 'name' },
- *   cache: 'force-cache',
- *   revalidate: 3600
- * });
- * 
- * if (response.success) {
- *   console.log(response.data); // TypeScript knows this is User[]
- * } else {
- *   console.error(response.error.message);
- * }
- * ```
+ * Makes a GET request to retrieve data from the server
  */
 export const get = <T>(url: string, options?: GetOptions): Promise<ApiResponse<T>> =>
   apiRequest<T>('GET', url, options);
 
 /**
- * Makes a POST request to create or submit data
- * @template T - Expected response data type
- * @template TData - Type of request body data
- * @param url - Request URL (relative to base URL)
- * @param options - POST request options including data
- * @returns Promise resolving to ApiResponse with created/updated data
- * 
- * @example
- * ```typescript
- * interface CreateUserData {
- *   name: string;
- *   email: string;
- * }
- * 
- * // POST with typed data
- * const response = await post<User, CreateUserData>('/users', {
- *   data: { name: 'John Doe', email: 'john@example.com' },
- *   csrfToken: 'abc123...'
- * });
- * 
- * // POST with FormData
- * const formData = new FormData();
- * formData.append('file', file);
- * const uploadResponse = await post<UploadResult>('/upload', {
- *   data: formData
- * });
- * ```
+ * Makes a POST request to create resources or submit data to the server
  */
 export const post = <T, TData = unknown>(
   url: string,
@@ -1103,26 +905,7 @@ export const post = <T, TData = unknown>(
 ): Promise<ApiResponse<T>> => apiRequest<T, TData>('POST', url, options);
 
 /**
- * Makes a PUT request to replace/update a resource
- * @template T - Expected response data type
- * @template TData - Type of request body data
- * @param url - Request URL (relative to base URL)
- * @param options - PUT request options including data
- * @returns Promise resolving to ApiResponse with updated data
- * 
- * @example
- * ```typescript
- * interface UpdateUserData {
- *   name?: string;
- *   email?: string;
- * }
- * 
- * const response = await put<User, UpdateUserData>('/users/123', {
- *   data: { name: 'Jane Doe' },
- *   revalidateTags: ['user-123', 'users'],
- *   csrfToken: getCsrfToken()
- * });
- * ```
+ * Makes a PUT request to completely replace or update a resource
  */
 export const put = <T, TData = unknown>(
   url: string,
@@ -1131,20 +914,6 @@ export const put = <T, TData = unknown>(
 
 /**
  * Makes a PATCH request to partially update a resource
- * @template T - Expected response data type
- * @template TData - Type of request body data (typically partial)
- * @param url - Request URL (relative to base URL)
- * @param options - PATCH request options including data
- * @returns Promise resolving to ApiResponse with updated data
- * 
- * @example
- * ```typescript
- * // Partial update
- * const response = await patch<User, Partial<User>>('/users/123', {
- *   data: { email: 'newemail@example.com' },
- *   revalidatePaths: ['/users/123']
- * });
- * ```
  */
 export const patch = <T, TData = unknown>(
   url: string,
@@ -1152,42 +921,16 @@ export const patch = <T, TData = unknown>(
 ): Promise<ApiResponse<T>> => apiRequest<T, TData>('PATCH', url, options);
 
 /**
- * Makes a DELETE request to remove a resource
- * @template T - Expected response data type (usually void or confirmation)
- * @param url - Request URL (relative to base URL)
- * @param options - DELETE request options
- * @returns Promise resolving to ApiResponse
- * 
- * @example
- * ```typescript
- * // Delete a resource
- * const response = await del<void>('/users/123', {
- *   csrfToken: getCsrfToken(),
- *   revalidateTags: ['users'],
- *   revalidatePaths: ['/users']
- * });
- * 
- * if (response.success) {
- *   console.log('User deleted successfully');
- * }
- * ```
+ * Makes a DELETE request to remove a resource from the server
  */
 export const del = <T>(url: string, options?: DeleteOptions): Promise<ApiResponse<T>> =>
   apiRequest<T>('DELETE', url, options);
 
 /**
- * Default export - the core apiRequest function
- * Can be used directly or through convenience methods
- * 
- * @example
- * ```typescript
- * import apiRequest, { get, post } from './safefetch';
- * 
- * // Using default export
- * const response1 = await apiRequest<User>('GET', '/users/123');
- * 
- * // Using convenience methods
- * const response2 = await get<User>('/users/123');
- * ```
+ * SafeFetch Default Export - The core apiRequest function
+ *
+ * This is the main entry point for SafeFetch, providing a comprehensive HTTP client
+ * specifically designed for Next.js applications with advanced caching, retry logic,
+ * and type safety.
  */
 export default apiRequest;
