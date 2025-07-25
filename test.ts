@@ -1,5 +1,6 @@
 /**
  * SafeFetch – Next.js typed fetch utility with retry, timeout & caching
+ * Enhanced with configurable limits and better defaults
  * (c) 2025 Bharathi4real – BSD 3-Clause License
  * https://github.com/Bharathi4real/safe-fetch
  */
@@ -26,6 +27,48 @@ export interface EnvConfig {
   /** Environment variable name to enable detailed error headers in production */
   exposeErrorHeaders?: string;
 }
+
+/**
+ * Configurable limits for various operations
+ */
+export interface SafeFetchLimits {
+  /** Maximum number of cache tags allowed per request @default 10 */
+  maxTags?: number;
+  /** Maximum length of individual cache tag in characters @default 64 */
+  maxTagLength?: number;
+  /** Maximum number of paths to revalidate per request @default 10 */
+  maxPaths?: number;
+  /** Maximum response size in bytes @default 5MB */
+  maxResponseSize?: number;
+  /** Maximum request payload size in bytes @default 1MB */
+  maxPayloadSize?: number;
+  /** Default request timeout in milliseconds @default 60s */
+  defaultTimeout?: number;
+  /** Rate limiting time window in milliseconds @default 60s */
+  rateLimitWindow?: number;
+  /** Maximum requests allowed per rate limit window @default 1000 */
+  rateLimitMax?: number;
+  /** Circuit breaker timeout in milliseconds @default 30s */
+  circuitBreakerTtl?: number;
+  /** Circuit breaker failure threshold @default 10 */
+  circuitBreakerMax?: number;
+}
+
+/**
+ * Default limits with more reasonable values for modern applications
+ */
+const DEFAULT_LIMITS: Required<SafeFetchLimits> = {
+  maxTags: 20,
+  maxTagLength: 128,
+  maxPaths: 20,
+  maxResponseSize: 5_000_000, // 5MB - better for modern APIs
+  maxPayloadSize: 1_000_000, // 1MB - reasonable for file uploads
+  defaultTimeout: 60_000, // 60 seconds - better for slower APIs
+  rateLimitWindow: 60_000,
+  rateLimitMax: 1000, // More generous rate limiting
+  circuitBreakerTtl: 30_000,
+  circuitBreakerMax: 10, // Actually use this threshold
+} as const;
 
 /**
  * Default environment variable names used by SafeFetch
@@ -56,32 +99,6 @@ const createEnv = (envConfig: EnvConfig = {}) => {
     ENABLE_DETAILED_ERRORS_IN_PROD: process.env[config.exposeErrorHeaders] === 'true',
   };
 };
-
-/**
- * Maximum limits and timeouts for various operations
- */
-const MAX = {
-  /** Maximum number of cache tags allowed per request */
-  TAGS: 10,
-  /** Maximum length of individual cache tag in characters */
-  TAG_LEN: 64,
-  /** Maximum number of paths to revalidate per request */
-  PATHS: 10,
-  /** Maximum response size in bytes (1MB) - prevents memory exhaustion */
-  RES_SIZE: 1_000_000,
-  /** Maximum request payload size in bytes (100KB) - prevents large uploads */
-  PAYLOAD: 100_000,
-  /** Default request timeout in milliseconds (30 seconds) */
-  TIMEOUT: 30_000,
-  /** Rate limiting time window in milliseconds (60 seconds) */
-  RATE_WINDOW: 60_000,
-  /** Maximum requests allowed per rate limit window */
-  RATE_MAX: 500,
-  /** Circuit breaker timeout in milliseconds (30 seconds) - how long to keep circuit open */
-  CIRCUIT_TTL: 30_000,
-  /** Circuit breaker failure threshold - unused but reserved for future implementation */
-  CIRCUIT_MAX: 100,
-} as const;
 
 /**
  * Supported HTTP methods
@@ -168,17 +185,70 @@ export type QueryParams = Record<string, QueryValue>;
 
 // Shared rate limiting and circuit breaker state
 const rateTimestamps: number[] = [];
-const circuitMap = new Map<string, number>();
+const circuitMap = new Map<string, { count: number; lastFailure: number; openUntil: number }>();
 
 /**
  * Checks if current request would exceed rate limits
  */
-const isRateLimited = (): boolean => {
+const isRateLimited = (limits: Required<SafeFetchLimits>): boolean => {
   const now = Date.now();
-  while (rateTimestamps.length && rateTimestamps[0] < now - MAX.RATE_WINDOW) rateTimestamps.shift();
-  if (rateTimestamps.length >= MAX.RATE_MAX) return true;
+  while (rateTimestamps.length && rateTimestamps[0] < now - limits.rateLimitWindow) {
+    rateTimestamps.shift();
+  }
+  if (rateTimestamps.length >= limits.rateLimitMax) return true;
   rateTimestamps.push(now);
   return false;
+};
+
+/**
+ * Circuit breaker implementation with configurable thresholds
+ */
+const checkCircuitBreaker = (
+  circuitKey: string,
+  _limits: Required<SafeFetchLimits>,
+): { isOpen: boolean; shouldRetry: boolean } => {
+  const now = Date.now();
+  const circuit = circuitMap.get(circuitKey);
+
+  if (!circuit) {
+    return { isOpen: false, shouldRetry: true };
+  }
+
+  // Circuit is open, check if it should remain open
+  if (circuit.openUntil > now) {
+    return { isOpen: true, shouldRetry: false };
+  }
+
+  // Circuit was open but timeout expired, allow one retry
+  if (circuit.openUntil > 0 && circuit.openUntil <= now) {
+    return { isOpen: false, shouldRetry: true };
+  }
+
+  return { isOpen: false, shouldRetry: true };
+};
+
+/**
+ * Records a failure in the circuit breaker
+ */
+const recordCircuitFailure = (circuitKey: string, limits: Required<SafeFetchLimits>): void => {
+  const now = Date.now();
+  const circuit = circuitMap.get(circuitKey) || { count: 0, lastFailure: 0, openUntil: 0 };
+
+  circuit.count += 1;
+  circuit.lastFailure = now;
+
+  if (circuit.count >= limits.circuitBreakerMax) {
+    circuit.openUntil = now + limits.circuitBreakerTtl;
+  }
+
+  circuitMap.set(circuitKey, circuit);
+};
+
+/**
+ * Records a success in the circuit breaker (resets failure count)
+ */
+const recordCircuitSuccess = (circuitKey: string): void => {
+  circuitMap.delete(circuitKey);
 };
 
 /**
@@ -190,6 +260,8 @@ export interface ClientConfig {
   forwardedHeaders?: Record<string, string>;
   /** Whether to include detailed error information (headers, raw response) */
   includeDetailedErrors?: boolean;
+  /** Custom limits for this client */
+  limits?: SafeFetchLimits;
 }
 
 /**
@@ -200,6 +272,8 @@ export interface SafeFetchConfig {
   allowedDomains?: string[];
   /** Whether to include detailed error information in responses */
   includeDetailedErrors?: boolean;
+  /** Global limits configuration */
+  limits?: SafeFetchLimits;
   defaults?: {
     timeout?: number;
     retryAttempts?: number | 0;
@@ -302,24 +376,25 @@ export async function createClientConfig(config: SafeFetchConfig = {}): Promise<
     authHeader: getAuthHeader(env),
     forwardedHeaders,
     includeDetailedErrors,
+    limits: config.limits,
   };
 }
 
 /**
  * Sanitizes cache tags to ensure they meet Next.js requirements
  */
-const sanitizeTags = (tags: string[]): string[] =>
+const sanitizeTags = (tags: string[], limits: Required<SafeFetchLimits>): string[] =>
   tags
     .filter((tag) => /^[\w:-]+$/.test(tag))
     .map((tag) => (tag.startsWith('api:') ? tag : `api:${tag}`))
-    .slice(0, MAX.TAGS)
-    .map((t) => t.slice(0, MAX.TAG_LEN));
+    .slice(0, limits.maxTags)
+    .map((t) => t.slice(0, limits.maxTagLength));
 
 /**
  * Sanitizes revalidation paths to prevent directory traversal
  */
-const sanitizePaths = (paths: string[]): string[] =>
-  paths.filter((p) => p.startsWith('/') && !p.includes('..')).slice(0, MAX.PATHS);
+const sanitizePaths = (paths: string[], limits: Required<SafeFetchLimits>): string[] =>
+  paths.filter((p) => p.startsWith('/') && !p.includes('..')).slice(0, limits.maxPaths);
 
 /**
  * Invalidates Next.js cache for specified paths and tags
@@ -327,11 +402,12 @@ const sanitizePaths = (paths: string[]): string[] =>
 const invalidateCache = async (
   paths: string[],
   tags: string[],
+  limits: Required<SafeFetchLimits>,
   type?: 'page' | 'layout',
 ): Promise<void> => {
   if (typeof window !== 'undefined') return;
-  const safePaths = sanitizePaths(paths);
-  const safeTags = sanitizeTags(tags);
+  const safePaths = sanitizePaths(paths, limits);
+  const safeTags = sanitizeTags(tags, limits);
 
   try {
     await Promise.all([
@@ -374,7 +450,7 @@ export interface RequestOptions<TData = unknown> {
   /** Type of path revalidation ('page' | 'layout') */
   revalidateType?: 'page' | 'layout';
 
-  /** Request timeout in milliseconds @default 30000 */
+  /** Request timeout in milliseconds @default 60000 */
   timeout?: number;
 
   /** Number of retry attempts for failed requests @default 3 */
@@ -400,6 +476,12 @@ export interface RequestOptions<TData = unknown> {
    * Overrides the global configuration for this specific request
    */
   includeDetailedErrors?: boolean;
+
+  /**
+   * Custom limits for this specific request
+   * Overrides global and client limits
+   */
+  limits?: SafeFetchLimits;
 }
 
 /**
@@ -506,6 +588,22 @@ function isValidMethod(method: string): method is HttpMethod {
 }
 
 /**
+ * Merges limits from multiple sources with precedence
+ */
+function mergeLimits(
+  globalLimits?: SafeFetchLimits,
+  clientLimits?: SafeFetchLimits,
+  requestLimits?: SafeFetchLimits,
+): Required<SafeFetchLimits> {
+  return {
+    ...DEFAULT_LIMITS,
+    ...globalLimits,
+    ...clientLimits,
+    ...requestLimits,
+  };
+}
+
+/**
  * Makes a GET request to retrieve data from the server
  */
 export async function apiRequest<T>(
@@ -561,50 +659,7 @@ export async function apiRequest<T>(
 
 /**
  * Core HTTP request function with comprehensive features for Next.js applications
- *
- * @param method - HTTP method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
- * @param url - Relative or absolute URL path
- * @param options - Request configuration options
- * @returns Promise resolving to typed API response
- *
- * @example Basic GET request
- * ```typescript
- * const { success, data, error } = await apiRequest('GET', '/api/users');
- * if (success) console.log(data);
- * ```
- *
- * @example POST with data
- * ```typescript
- * const response = await apiRequest('POST', '/api/users', {
- *   data: { name: 'John', email: 'john@example.com' }
- * });
- * ```
- *
- * @example With caching and revalidation
- * ```typescript
- * const response = await apiRequest('GET', '/api/posts', {
- *   cache: 'force-cache',
- *   revalidate: 3600,
- *   revalidateTags: ['posts']
- * });
- * ```
- *
- * @example With retry configuration
- * ```typescript
- * const response = await apiRequest('GET', '/api/data', {
- *   retryAttempts: 5,
- *   retryDelay: 2000,
- *   timeout: 10000
- * });
- * ```
- *
- * Key Features:
- * - Type Safety: Full TypeScript support with request/response typing
- * - Retry Logic: Automatic retries with exponential backoff and jitter
- * - Caching: Deep Next.js cache integration with granular control
- * - Error Handling: Comprehensive error categorization and debugging
- * - Security: CSRF protection, rate limiting, circuit breakers
- * - Performance: Request/response size validation, timeout controls
+ * Now with configurable limits and better defaults
  */
 export async function apiRequest<T>(
   method: HttpMethod,
@@ -617,12 +672,12 @@ export async function apiRequest<T>(
   const {
     data,
     query,
-    cache = 'default',
+    cache = 'no-store', // Changed default to no-store for better predictability
     revalidate,
     revalidateTags = [],
     revalidatePaths = [],
     revalidateType,
-    timeout = MAX.TIMEOUT,
+    timeout, // Will use merged limits default
     retryAttempts = 3,
     retryDelay = 1000,
     csrfToken,
@@ -630,7 +685,15 @@ export async function apiRequest<T>(
     customHeaders = {},
     clientConfig,
     includeDetailedErrors,
+    limits: requestLimits,
   } = options;
+
+  // Merge limits from all sources (no global limits from env, use defaults)
+  const clientLimits = clientConfig?.limits;
+  const limits = mergeLimits(undefined, clientLimits, requestLimits);
+
+  // Use the merged timeout if not specified in options
+  const finalTimeout = timeout ?? limits.defaultTimeout;
 
   if (isClient && !clientConfig) {
     return {
@@ -709,7 +772,7 @@ export async function apiRequest<T>(
     };
   }
 
-  if (isRateLimited()) {
+  if (isRateLimited(limits)) {
     return {
       success: false,
       error: createError(STATUS.RATE_LIMITED, 'RATE_LIMIT_ERROR', 'Rate limit exceeded', requestId),
@@ -718,8 +781,8 @@ export async function apiRequest<T>(
   }
 
   const circuitKey = `${fullUrl.origin}${fullUrl.pathname}`;
-  const now = Date.now();
-  if ((circuitMap.get(circuitKey) ?? 0) > now) {
+  const circuitStatus = checkCircuitBreaker(circuitKey, limits);
+  if (circuitStatus.isOpen) {
     return {
       success: false,
       error: createError(
@@ -787,7 +850,7 @@ export async function apiRequest<T>(
 
   const makeRequest = async (attempt = 1): Promise<ApiResponse<T>> => {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    const timeoutId = setTimeout(() => controller.abort(), finalTimeout);
 
     try {
       let body: string | FormData | undefined;
@@ -796,13 +859,13 @@ export async function apiRequest<T>(
           body = data as FormData;
         } else if (data !== undefined) {
           body = JSON.stringify(data);
-          if (body.length > MAX.PAYLOAD) {
+          if (body.length > limits.maxPayloadSize) {
             return {
               success: false,
               error: createError(
                 STATUS.PAYLOAD_TOO_LARGE,
                 'VALIDATION_ERROR',
-                'Payload too large',
+                `Payload too large (${body.length} bytes, max: ${limits.maxPayloadSize})`,
                 requestId,
               ),
               data: null,
@@ -830,7 +893,7 @@ export async function apiRequest<T>(
       if (!isClient && (revalidate !== undefined || revalidateTags.length)) {
         fetchOptions.next = {
           revalidate,
-          tags: sanitizeTags(revalidateTags),
+          tags: sanitizeTags(revalidateTags, limits),
         };
       }
 
@@ -842,13 +905,13 @@ export async function apiRequest<T>(
       });
 
       const contentLength = Number(response.headers.get('Content-Length') || '0');
-      if (contentLength > MAX.RES_SIZE) {
+      if (contentLength > limits.maxResponseSize) {
         return {
           success: false,
           error: createError(
             STATUS.PAYLOAD_TOO_LARGE,
             'VALIDATION_ERROR',
-            'Response too large',
+            `Response too large (${contentLength} bytes, max: ${limits.maxResponseSize})`,
             requestId,
           ),
           data: null,
@@ -906,6 +969,7 @@ export async function apiRequest<T>(
         }
       } catch (error: unknown) {
         console.error('Failed to parse response:', error);
+        recordCircuitFailure(circuitKey, limits);
 
         const baseError = createError(
           response.status as StatusCode,
@@ -934,6 +998,7 @@ export async function apiRequest<T>(
 
       if (!response.ok) {
         if (response.status >= 500 && attempt < retryAttempts) {
+          recordCircuitFailure(circuitKey, limits);
           const retryAfter = response.headers.get('Retry-After');
           const delay = retryAfter
             ? Number(retryAfter) * 1000
@@ -942,7 +1007,7 @@ export async function apiRequest<T>(
           return makeRequest(attempt + 1);
         }
 
-        circuitMap.set(circuitKey, now + MAX.CIRCUIT_TTL);
+        recordCircuitFailure(circuitKey, limits);
 
         const baseError = createError(
           response.status as StatusCode,
@@ -971,9 +1036,12 @@ export async function apiRequest<T>(
         };
       }
 
+      // Record success in circuit breaker
+      recordCircuitSuccess(circuitKey);
+
       // Only invalidate cache on server-side
       if (!isClient) {
-        await invalidateCache(revalidatePaths, revalidateTags, revalidateType);
+        await invalidateCache(revalidatePaths, revalidateTags, limits, revalidateType);
       }
 
       if (process.env.NODE_ENV === 'development' && logTypes) {
@@ -999,7 +1067,7 @@ export async function apiRequest<T>(
         return makeRequest(attempt + 1);
       }
 
-      circuitMap.set(circuitKey, now + MAX.CIRCUIT_TTL);
+      recordCircuitFailure(circuitKey, limits);
 
       const baseError = createError(
         isTimeout ? 408 : 500,
@@ -1064,10 +1132,12 @@ export async function createSafeFetch(config: SafeFetchConfig = {}) {
         timeout: defaults.timeout,
         retryAttempts: defaults.retryAttempts,
         retryDelay: defaults.retryDelay,
-        cache: defaults.cache,
+        cache: defaults.cache || 'no-store',
         ...options,
         // Pass through the global includeDetailedErrors setting if not overridden
         includeDetailedErrors: options.includeDetailedErrors ?? config.includeDetailedErrors,
+        // Pass through the global limits setting if not overridden
+        limits: options.limits ? { ...config.limits, ...options.limits } : config.limits,
       };
 
       return apiRequest<T>(method, url, mergedOptions);
@@ -1078,39 +1148,38 @@ export async function createSafeFetch(config: SafeFetchConfig = {}) {
 /**
  * Makes a GET request to retrieve data from the server
  */
-export const get = <T>(url: string, options?: GetOptions): Promise<ApiResponse<T>> =>
-  apiRequest<T>('GET', url, options);
+export const get = async <T>(url: string, options?: GetOptions): Promise<ApiResponse<T>> =>
+  await apiRequest<T>('GET', url, options);
 
 /**
  * Makes a POST request to create resources or submit data to the server
  */
-export const post = <T, TData = unknown>(
+export const post = async <T, TData = unknown>(
   url: string,
   options?: PostOptions<TData>,
-): Promise<ApiResponse<T>> => apiRequest<T, TData>('POST', url, options);
+): Promise<ApiResponse<T>> => await apiRequest<T, TData>('POST', url, options);
 
 /**
  * Makes a PUT request to completely replace or update a resource
  */
-export const put = <T, TData = unknown>(
+export const put = async <T, TData = unknown>(
   url: string,
   options?: PutOptions<TData>,
-): Promise<ApiResponse<T>> => apiRequest<T, TData>('PUT', url, options);
+): Promise<ApiResponse<T>> => await apiRequest<T, TData>('PUT', url, options);
 
 /**
  * Makes a PATCH request to partially update a resource
  */
-export const patch = <T, TData = unknown>(
+export const patch = async <T, TData = unknown>(
   url: string,
-  options?: PatchOptions<TData>,
-): Promise<ApiResponse<T>> => apiRequest<T, TData>('PATCH', url, options);
+  options?: PutOptions<TData>,
+): Promise<ApiResponse<T>> => await apiRequest<T, TData>('PATCH', url, options);
 
 /**
  * Makes a DELETE request to remove a resource from the server
  */
-export const del = <T>(url: string, options?: DeleteOptions): Promise<ApiResponse<T>> =>
-  apiRequest<T>('DELETE', url, options);
+export const del = async <T>(url: string, options?: DeleteOptions): Promise<ApiResponse<T>> =>
+  await apiRequest<T>('DELETE', url, options);
 
 // SafeFetch Default Export - The core apiRequest function
-
 export default apiRequest;
