@@ -28,9 +28,7 @@ export interface EnvConfig {
   exposeErrorHeaders?: string;
 }
 
-/**
- * Configurable limits for various operations
- */
+// Configurable limits for various operations
 export interface SafeFetchLimits {
   /** Maximum number of cache tags allowed per request @default 10 */
   maxTags?: number;
@@ -54,9 +52,7 @@ export interface SafeFetchLimits {
   circuitBreakerMax?: number;
 }
 
-/**
- * Default limits with more reasonable values for modern applications
- */
+// Default limits with reasonable values for modern applications
 const DEFAULT_LIMITS: Required<SafeFetchLimits> = {
   maxTags: 20,
   maxTagLength: 128,
@@ -82,9 +78,7 @@ const DEFAULT_ENV_CONFIG: Required<EnvConfig> = {
   exposeErrorHeaders: 'EXPOSE_ERROR_HEADERS',
 };
 
-/**
- * Creates environment configuration object from process.env
- */
+// Creates environment configuration object from process.env
 const createEnv = (envConfig: EnvConfig = {}) => {
   if (typeof window !== 'undefined') return {};
 
@@ -101,14 +95,20 @@ const createEnv = (envConfig: EnvConfig = {}) => {
 };
 
 /**
- * Supported HTTP methods
+ * Supported HTTP methods with enhanced IntelliSense
+ * @example 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
  */
-const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
+export type HttpMethod = 
+  | 'GET'    // Retrieve data from server
+  | 'POST'   // Create new resource
+  | 'PUT'    // Update entire resource
+  | 'PATCH'  // Partial update of resource
+  | 'DELETE' // Remove resource from server;
 
 /**
- * HTTP method type union
+ * Supported HTTP methods array for validation
  */
-export type HttpMethod = (typeof HTTP_METHODS)[number];
+const HTTP_METHODS: readonly HttpMethod[] = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
 
 /**
  * HTTP status codes used throughout the library
@@ -187,9 +187,7 @@ export type QueryParams = Record<string, QueryValue>;
 const rateTimestamps: number[] = [];
 const circuitMap = new Map<string, { count: number; lastFailure: number; openUntil: number }>();
 
-/**
- * Checks if current request would exceed rate limits
- */
+// Checks if current request would exceed rate limits
 const isRateLimited = (limits: Required<SafeFetchLimits>): boolean => {
   const now = Date.now();
   while (rateTimestamps.length && rateTimestamps[0] < now - limits.rateLimitWindow) {
@@ -200,9 +198,7 @@ const isRateLimited = (limits: Required<SafeFetchLimits>): boolean => {
   return false;
 };
 
-/**
- * Circuit breaker implementation with configurable thresholds
- */
+// Circuit breaker implementation with configurable thresholds
 const checkCircuitBreaker = (
   circuitKey: string,
   _limits: Required<SafeFetchLimits>,
@@ -227,9 +223,7 @@ const checkCircuitBreaker = (
   return { isOpen: false, shouldRetry: true };
 };
 
-/**
- * Records a failure in the circuit breaker
- */
+// Records a failure in the circuit breaker
 const recordCircuitFailure = (circuitKey: string, limits: Required<SafeFetchLimits>): void => {
   const now = Date.now();
   const circuit = circuitMap.get(circuitKey) || { count: 0, lastFailure: 0, openUntil: 0 };
@@ -244,35 +238,29 @@ const recordCircuitFailure = (circuitKey: string, limits: Required<SafeFetchLimi
   circuitMap.set(circuitKey, circuit);
 };
 
-/**
- * Records a success in the circuit breaker (resets failure count)
- */
+// Records a success in the circuit breaker (resets failure count)
 const recordCircuitSuccess = (circuitKey: string): void => {
   circuitMap.delete(circuitKey);
 };
 
-/**
- * Client configuration for making requests
- */
+// Client configuration for making requests
 export interface ClientConfig {
   baseUrl: string;
   authHeader?: string;
   forwardedHeaders?: Record<string, string>;
-  /** Whether to include detailed error information (headers, raw response) */
+  // Whether to include detailed error information (headers, raw response)
   includeDetailedErrors?: boolean;
-  /** Custom limits for this client */
+  // Custom limits for this client
   limits?: SafeFetchLimits;
 }
 
-/**
- * Configuration for SafeFetch instance
- */
+// Configuration for SafeFetch instance
 export interface SafeFetchConfig {
   envConfig?: EnvConfig;
   allowedDomains?: string[];
-  /** Whether to include detailed error information in responses */
+  // Whether to include detailed error information in responses
   includeDetailedErrors?: boolean;
-  /** Global limits configuration */
+  // Global limits configuration
   limits?: SafeFetchLimits;
   defaults?: {
     timeout?: number;
@@ -282,9 +270,7 @@ export interface SafeFetchConfig {
   };
 }
 
-/**
- * Generates authorization header from environment variables
- */
+// Generates authorization header from environment variables
 const getAuthHeader = (env: ReturnType<typeof createEnv>): string | undefined => {
   if (typeof window !== 'undefined') throw new Error('getAuthHeader must run server-side');
 
@@ -307,9 +293,7 @@ const getAuthHeader = (env: ReturnType<typeof createEnv>): string | undefined =>
   throw new Error('No authentication credentials provided');
 };
 
-/**
- * Determines whether to include detailed error information based on environment and configuration
- */
+// Determines whether to include detailed error information based on environment and configuration
 const shouldIncludeDetailedErrors = (
   config: SafeFetchConfig = {},
   env: ReturnType<typeof createEnv>,
@@ -380,9 +364,7 @@ export async function createClientConfig(config: SafeFetchConfig = {}): Promise<
   };
 }
 
-/**
- * Sanitizes cache tags to ensure they meet Next.js requirements
- */
+// Sanitizes cache tags to ensure they meet Next.js requirements
 const sanitizeTags = (tags: string[], limits: Required<SafeFetchLimits>): string[] =>
   tags
     .filter((tag) => /^[\w:-]+$/.test(tag))
@@ -390,15 +372,11 @@ const sanitizeTags = (tags: string[], limits: Required<SafeFetchLimits>): string
     .slice(0, limits.maxTags)
     .map((t) => t.slice(0, limits.maxTagLength));
 
-/**
- * Sanitizes revalidation paths to prevent directory traversal
- */
+// Sanitizes revalidation paths to prevent directory traversal
 const sanitizePaths = (paths: string[], limits: Required<SafeFetchLimits>): string[] =>
   paths.filter((p) => p.startsWith('/') && !p.includes('..')).slice(0, limits.maxPaths);
 
-/**
- * Invalidates Next.js cache for specified paths and tags
- */
+// Invalidates Next.js cache for specified paths and tags
 const invalidateCache = async (
   paths: string[],
   tags: string[],
@@ -509,9 +487,7 @@ export type PatchOptions<T> = RequestOptions<T>;
  */
 export type DeleteOptions = RequestOptions<never>;
 
-/**
- * Standardized API response wrapper with discriminated union for type safety
- */
+// Standardized API response wrapper with discriminated union for type safety
 export type ApiResponse<T> =
   | {
       success: true;
@@ -526,9 +502,7 @@ export type ApiResponse<T> =
       data: null;
     };
 
-/**
- * Infers TypeScript type from runtime value for development logging
- */
+// Infers TypeScript type from runtime value for development logging
 function inferType(val: unknown, depth = 0): string {
   const indent = '  '.repeat(depth);
   if (val === null) return 'null';
@@ -548,9 +522,7 @@ function inferType(val: unknown, depth = 0): string {
   return typeof val;
 }
 
-/**
- * Creates standardized error object
- */
+// Creates standardized error object
 function createError(
   status: StatusCode,
   type: ErrorType,
@@ -568,9 +540,7 @@ function createError(
   };
 }
 
-/**
- * Maps HTTP status codes to error categories
- */
+// Maps HTTP status codes to error categories
 function getErrorType(status: number): ErrorType {
   if (status === 400 || status === 422) return 'VALIDATION_ERROR';
   if (status === 401 || status === 403) return 'AUTH_ERROR';
@@ -580,16 +550,12 @@ function getErrorType(status: number): ErrorType {
   return 'NETWORK_ERROR';
 }
 
-/**
- * Type guard to validate HTTP methods
- */
+// Type guard to validate HTTP methods
 function isValidMethod(method: string): method is HttpMethod {
   return HTTP_METHODS.includes(method as HttpMethod);
 }
 
-/**
- * Merges limits from multiple sources with precedence
- */
+// Merges limits from multiple sources with precedence
 function mergeLimits(
   globalLimits?: SafeFetchLimits,
   clientLimits?: SafeFetchLimits,
@@ -604,62 +570,75 @@ function mergeLimits(
 }
 
 /**
- * Makes a GET request to retrieve data from the server
- */
-export async function apiRequest<T>(
-  method: 'GET',
-  url: string,
-  options?: GetOptions,
-): Promise<ApiResponse<T>>;
-
-/**
- * Makes a DELETE request to remove a resource from the server
- */
-export async function apiRequest<T>(
-  method: 'DELETE',
-  url: string,
-  options?: DeleteOptions,
-): Promise<ApiResponse<T>>;
-
-/**
- * Makes a POST request to create new resources or submit data
- */
-export async function apiRequest<T, TData = unknown>(
-  method: 'POST',
-  url: string,
-  options?: PostOptions<TData>,
-): Promise<ApiResponse<T>>;
-
-/**
- * Makes a PUT request to replace or fully update a resource
- */
-export async function apiRequest<T, TData = unknown>(
-  method: 'PUT',
-  url: string,
-  options?: PutOptions<TData>,
-): Promise<ApiResponse<T>>;
-
-/**
- * Makes a PATCH request to partially update a resource
- */
-export async function apiRequest<T, TData = unknown>(
-  method: 'PATCH',
-  url: string,
-  options?: PatchOptions<TData>,
-): Promise<ApiResponse<T>>;
-
-/**
- * Makes an HTTP request with the specified method (generic overload)
- */
-export async function apiRequest<T>(
-  method: HttpMethod,
-  url: string,
-  options?: RequestOptions,
-): Promise<ApiResponse<T>>;
-
-/**
- * Core HTTP request function with comprehensive features for Next.js applications
- * Now with configurable limits and better defaults
+ * Core HTTP request function with comprehensive features for Next.js applications.
+ * 
+ * @param method HTTP method - Available options:
+ * - `'GET'` - Retrieve data from server (no body data allowed)
+ * - `'POST'` - Create new resource (with optional body data)
+ * - `'PUT'` - Update entire resource (with optional body data)  
+ * - `'PATCH'` - Partial update of resource (with optional body data)
+ * - `'DELETE'` - Remove resource from server (no body data allowed)
+ * 
+ * @param url Request URL (relative to baseUrl or absolute HTTPS URL)
+ * 
+ * @param options Request configuration options:
+ * - `data?` - Request body (for POST/PUT/PATCH methods)
+ * - `query?` - URL query parameters object
+ * - `cache?` - Next.js cache strategy: 'force-cache' | 'no-store' | 'no-cache' | 'default'
+ * - `timeout?` - Request timeout in milliseconds (default: 60000)
+ * - `retryAttempts?` - Number of retry attempts (default: 3)
+ * - `customHeaders?` - Additional HTTP headers
+ * - `revalidateTags?` - Cache tags for Next.js revalidation
+ * - `revalidatePaths?` - Paths to revalidate after successful request
+ * 
+ * @returns Promise<ApiResponse<T>> - Discriminated union:
+ * - `{ success: true, data: T, status: number, headers: object, requestId: string }`
+ * - `{ success: false, error: ApiError, data: null }`
+ * 
+ * @example Basic Usage
+ * ```typescript
+ * // GET request - retrieve data
+ * const users = await apiRequest<User[]>('GET', '/api/users');
+ * if (users.success) {
+ *   console.log(users.data); // User[] type
+ * }
+ * 
+ * // POST request - create resource
+ * const newUser = await apiRequest<User>('POST', '/api/users', {
+ *   data: { name: 'John Doe', email: 'john@example.com' }
+ * });
+ * 
+ * // PUT request - full update
+ * const updatedUser = await apiRequest<User>('PUT', '/api/users/1', {
+ *   data: { name: 'Jane Doe', email: 'jane@example.com' }
+ * });
+ * 
+ * // PATCH request - partial update  
+ * const patchedUser = await apiRequest<User>('PATCH', '/api/users/1', {
+ *   data: { email: 'newemail@example.com' }
+ * });
+ * 
+ * // DELETE request - remove resource
+ * const deleted = await apiRequest<void>('DELETE', '/api/users/1');
+ * ```
+ * 
+ * @example Advanced Configuration
+ * ```typescript
+ * // With caching and revalidation
+ * const cachedData = await apiRequest<Product[]>('GET', '/api/products', {
+ *   cache: 'force-cache',
+ *   revalidate: 3600, // 1 hour
+ *   revalidateTags: ['products'],
+ *   query: { category: 'electronics', limit: 10 }
+ * });
+ * 
+ * // With custom headers and timeout
+ * const response = await apiRequest<ApiResponse>('POST', '/api/upload', {
+ *   data: formData,
+ *   timeout: 120000, // 2 minutes
+ *   customHeaders: { 'X-Upload-Type': 'profile-image' }
+ * });
+ * ```
  */
 export async function apiRequest<T>(
   method: HttpMethod,
@@ -1122,6 +1101,10 @@ export async function createSafeFetch(config: SafeFetchConfig = {}) {
 
     /**
      * Makes an HTTP request using this SafeFetch instance's configuration
+     * 
+     * @param method HTTP method - 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+     * @param url Request URL
+     * @param options Request configuration options
      */
     request: async <T>(
       method: HttpMethod,
@@ -1144,42 +1127,6 @@ export async function createSafeFetch(config: SafeFetchConfig = {}) {
     },
   };
 }
-
-/**
- * Makes a GET request to retrieve data from the server
- */
-export const get = async <T>(url: string, options?: GetOptions): Promise<ApiResponse<T>> =>
-  await apiRequest<T>('GET', url, options);
-
-/**
- * Makes a POST request to create resources or submit data to the server
- */
-export const post = async <T, TData = unknown>(
-  url: string,
-  options?: PostOptions<TData>,
-): Promise<ApiResponse<T>> => await apiRequest<T, TData>('POST', url, options);
-
-/**
- * Makes a PUT request to completely replace or update a resource
- */
-export const put = async <T, TData = unknown>(
-  url: string,
-  options?: PutOptions<TData>,
-): Promise<ApiResponse<T>> => await apiRequest<T, TData>('PUT', url, options);
-
-/**
- * Makes a PATCH request to partially update a resource
- */
-export const patch = async <T, TData = unknown>(
-  url: string,
-  options?: PutOptions<TData>,
-): Promise<ApiResponse<T>> => await apiRequest<T, TData>('PATCH', url, options);
-
-/**
- * Makes a DELETE request to remove a resource from the server
- */
-export const del = async <T>(url: string, options?: DeleteOptions): Promise<ApiResponse<T>> =>
-  await apiRequest<T>('DELETE', url, options);
 
 // SafeFetch Default Export - The core apiRequest function
 export default apiRequest;
