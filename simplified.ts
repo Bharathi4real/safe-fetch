@@ -1,6 +1,6 @@
 /**
  * SafeFetch – Next.js typed fetch utility with retry, timeout & caching
- * Simplified version with essential features
+ * Optimized version with essential features
  * (c) 2025 Bharathi4real – BSD 3-Clause License
  * https://github.com/Bharathi4real/safe-fetch
  */
@@ -30,12 +30,12 @@ export interface EnvConfig {
  * Supported HTTP methods with enhanced IntelliSense
  * @example 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
  */
-export type HttpMethod = 
-  | 'GET'    // Retrieve data from server
-  | 'POST'   // Create new resource
-  | 'PUT'    // Update entire resource
-  | 'PATCH'  // Partial update of resource
-  | 'DELETE' // Remove resource from server;
+export type HttpMethod =
+  | 'GET' // Retrieve data from server
+  | 'POST' // Create new resource
+  | 'PUT' // Update entire resource
+  | 'PATCH' // Partial update of resource
+  | 'DELETE'; // Remove resource from server;
 
 /**
  * HTTP status codes used throughout the library
@@ -110,26 +110,41 @@ const DEFAULT_ENV_CONFIG = {
   allowBasicAuthInProd: 'ALLOW_BASIC_AUTH_IN_PROD',
 };
 
-const DEFAULT_TIMEOUT = 60000; // 60 seconds
+const DEFAULT_TIMEOUT = 60000;
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
+const RATE_LIMIT_WINDOW = 60000;
+const RATE_LIMIT_MAX = 100;
+
+// Environment variables type
+interface EnvVars {
+  AUTH_USERNAME?: string;
+  AUTH_PASSWORD?: string;
+  AUTH_TOKEN?: string;
+  BASE_URL: string;
+  ALLOW_BASIC_AUTH_IN_PROD: boolean;
+}
 
 // Simple rate limiting
 const rateLimitMap = new Map<string, number[]>();
+let envCache: EnvVars | null = null;
 
 // Creates environment configuration object from process.env
-const createEnv = (envConfig: EnvConfig = {}) => {
+const createEnv = (envConfig: EnvConfig = {}): EnvVars | Record<string, never> => {
   if (typeof window !== 'undefined') return {};
 
-  const config = { ...DEFAULT_ENV_CONFIG, ...envConfig };
+  if (!envCache) {
+    const config = { ...DEFAULT_ENV_CONFIG, ...envConfig };
+    envCache = {
+      AUTH_USERNAME: process.env[config.authUsername]?.trim(),
+      AUTH_PASSWORD: process.env[config.authPassword]?.trim(),
+      AUTH_TOKEN: process.env[config.authToken]?.trim(),
+      BASE_URL: process.env[config.baseUrl]?.trim() || '',
+      ALLOW_BASIC_AUTH_IN_PROD: process.env[config.allowBasicAuthInProd] === 'true',
+    };
+  }
 
-  return {
-    AUTH_USERNAME: process.env[config.authUsername]?.trim(),
-    AUTH_PASSWORD: process.env[config.authPassword]?.trim(),
-    AUTH_TOKEN: process.env[config.authToken]?.trim(),
-    BASE_URL: process.env[config.baseUrl]?.trim() || '',
-    ALLOW_BASIC_AUTH_IN_PROD: process.env[config.allowBasicAuthInProd] === 'true',
-  };
+  return envCache;
 };
 
 // Client configuration for making requests
@@ -152,19 +167,22 @@ export interface SafeFetchConfig {
 }
 
 // Generates authorization header from environment variables
-const getAuthHeader = (env: ReturnType<typeof createEnv>): string | undefined => {
+const getAuthHeader = (env: EnvVars | Record<string, never>): string | undefined => {
   if (typeof window !== 'undefined') throw new Error('getAuthHeader must run server-side');
 
-  if (env.AUTH_TOKEN) {
-    return `Bearer ${env.AUTH_TOKEN}`;
-  }
+  // Type guard to check if env has the required properties
+  if (!('AUTH_TOKEN' in env)) return undefined;
 
-  if (process.env.NODE_ENV === 'production' && !env.ALLOW_BASIC_AUTH_IN_PROD) {
+  const envVars = env as EnvVars;
+
+  if (envVars.AUTH_TOKEN) return `Bearer ${envVars.AUTH_TOKEN}`;
+
+  if (process.env.NODE_ENV === 'production' && !envVars.ALLOW_BASIC_AUTH_IN_PROD) {
     throw new Error('Basic Auth not allowed in production without ALLOW_BASIC_AUTH_IN_PROD=true');
   }
 
-  if (env.AUTH_USERNAME && env.AUTH_PASSWORD) {
-    return `Basic ${Buffer.from(`${env.AUTH_USERNAME}:${env.AUTH_PASSWORD}`).toString('base64')}`;
+  if (envVars.AUTH_USERNAME && envVars.AUTH_PASSWORD) {
+    return `Basic ${Buffer.from(`${envVars.AUTH_USERNAME}:${envVars.AUTH_PASSWORD}`).toString('base64')}`;
   }
 
   return undefined;
@@ -178,7 +196,7 @@ export async function createClientConfig(config: SafeFetchConfig = {}): Promise<
     throw new Error('createClientConfig must run server-side');
   }
 
-  const env = createEnv(config.envConfig);
+  const env = createEnv(config.envConfig) as EnvVars;
 
   if (!env.BASE_URL?.startsWith('https://')) {
     throw new Error('BASE_URL must start with https://');
@@ -208,12 +226,10 @@ export async function createClientConfig(config: SafeFetchConfig = {}): Promise<
 const isRateLimited = (key: string): boolean => {
   const now = Date.now();
   const timestamps = rateLimitMap.get(key) || [];
-  
-  // Clean old timestamps (older than 1 minute)
-  const recent = timestamps.filter(t => now - t < 60000);
-  
-  if (recent.length >= 100) return true; // 100 requests per minute
-  
+  const recent = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW);
+
+  if (recent.length >= RATE_LIMIT_MAX) return true;
+
   recent.push(now);
   rateLimitMap.set(key, recent);
   return false;
@@ -233,7 +249,7 @@ const invalidateCache = async (
   type?: 'page' | 'layout',
 ): Promise<void> => {
   if (typeof window !== 'undefined') return;
-  
+
   const safePaths = paths.filter((p) => p.startsWith('/') && !p.includes('..')).slice(0, 10);
   const safeTags = sanitizeTags(tags);
 
@@ -342,7 +358,6 @@ export type ApiResponse<T> =
 
 // Infers TypeScript type from runtime value for development logging
 function inferType(val: unknown, depth = 0): string {
-  const indent = '  '.repeat(depth);
   if (val === null) return 'null';
   if (val === undefined) return 'undefined';
   if (Array.isArray(val)) {
@@ -351,6 +366,7 @@ function inferType(val: unknown, depth = 0): string {
   }
   if (typeof val === 'object' && val !== null) {
     if (depth > 2) return 'object';
+    const indent = '  '.repeat(depth);
     const entries = Object.entries(val)
       .slice(0, 8)
       .map(([k, v]) => `${indent}  ${k}: ${inferType(v, depth + 1)};`)
@@ -390,22 +406,21 @@ function getErrorType(status: number): ErrorType {
 
 // Type guard to validate HTTP methods
 const HTTP_METHODS: readonly HttpMethod[] = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
-function isValidMethod(method: string): method is HttpMethod {
-  return HTTP_METHODS.includes(method as HttpMethod);
-}
+const isValidMethod = (method: string): method is HttpMethod =>
+  HTTP_METHODS.includes(method as HttpMethod);
 
 /**
  * Core HTTP request function with comprehensive features for Next.js applications.
- * 
+ *
  * @param method HTTP method - Available options:
  * - `'GET'` - Retrieve data from server (no body data allowed)
  * - `'POST'` - Create new resource (with optional body data)
- * - `'PUT'` - Update entire resource (with optional body data)  
+ * - `'PUT'` - Update entire resource (with optional body data)
  * - `'PATCH'` - Partial update of resource (with optional body data)
  * - `'DELETE'` - Remove resource from server (no body data allowed)
- * 
+ *
  * @param url Request URL (relative to baseUrl or absolute HTTPS URL)
- * 
+ *
  * @param options Request configuration options:
  * - `data?` - Request body (for POST/PUT/PATCH methods)
  * - `query?` - URL query parameters object
@@ -415,11 +430,11 @@ function isValidMethod(method: string): method is HttpMethod {
  * - `customHeaders?` - Additional HTTP headers
  * - `revalidateTags?` - Cache tags for Next.js revalidation
  * - `revalidatePaths?` - Paths to revalidate after successful request
- * 
+ *
  * @returns Promise<ApiResponse<T>> - Discriminated union:
  * - `{ success: true, data: T, status: number, headers: object, requestId: string }`
  * - `{ success: false, error: ApiError, data: null }`
- * 
+ *
  * @example Basic Usage
  * ```typescript
  * // GET request - retrieve data
@@ -427,26 +442,26 @@ function isValidMethod(method: string): method is HttpMethod {
  * if (users.success) {
  *   console.log(users.data); // User[] type
  * }
- * 
+ *
  * // POST request - create resource
  * const newUser = await apiRequest<User>('POST', '/api/users', {
  *   data: { name: 'John Doe', email: 'john@example.com' }
  * });
- * 
+ *
  * // PUT request - full update
  * const updatedUser = await apiRequest<User>('PUT', '/api/users/1', {
  *   data: { name: 'Jane Doe', email: 'jane@example.com' }
  * });
- * 
- * // PATCH request - partial update  
+ *
+ * // PATCH request - partial update
  * const patchedUser = await apiRequest<User>('PATCH', '/api/users/1', {
  *   data: { email: 'newemail@example.com' }
  * });
- * 
+ *
  * // DELETE request - remove resource
  * const deleted = await apiRequest<void>('DELETE', '/api/users/1');
  * ```
- * 
+ *
  * @example Advanced Configuration
  * ```typescript
  * // With caching and revalidation
@@ -456,7 +471,7 @@ function isValidMethod(method: string): method is HttpMethod {
  *   revalidateTags: ['products'],
  *   query: { category: 'electronics', limit: 10 }
  * });
- * 
+ *
  * // With custom headers and timeout
  * const response = await apiRequest<ApiResponse>('POST', '/api/upload', {
  *   data: formData,
@@ -516,10 +531,9 @@ export async function apiRequest<T>(
     };
   }
 
-  const baseUrl = isClient ? clientConfig!.baseUrl : createEnv().BASE_URL;
-  const authHeader = isClient
-    ? clientConfig!.authHeader
-    : getAuthHeader(createEnv());
+  const env = createEnv() as EnvVars;
+  const baseUrl = isClient ? clientConfig!.baseUrl : env.BASE_URL;
+  const authHeader = isClient ? clientConfig!.authHeader : getAuthHeader(env);
 
   if (!baseUrl) {
     return {
@@ -553,7 +567,6 @@ export async function apiRequest<T>(
     };
   }
 
-  // Simple rate limiting
   if (isRateLimited(fullUrl.hostname)) {
     return {
       success: false,
@@ -563,9 +576,9 @@ export async function apiRequest<T>(
   }
 
   if (query) {
-    Object.entries(query).forEach(([key, val]) => {
+    for (const [key, val] of Object.entries(query)) {
       if (val != null) fullUrl.searchParams.append(key, String(val));
-    });
+    }
   }
 
   if (['GET', 'HEAD'].includes(method) && data !== undefined) {
@@ -652,7 +665,7 @@ export async function apiRequest<T>(
         } else {
           parsedData = (await response.blob()) as unknown as T;
         }
-      } catch (error) {
+      } catch (_error) {
         return {
           success: false,
           error: createError(
@@ -667,7 +680,7 @@ export async function apiRequest<T>(
 
       if (!response.ok) {
         if (response.status >= 500 && attempt < retryAttempts) {
-          const delay = retryDelay * Math.pow(2, attempt - 1);
+          const delay = retryDelay * 2 ** (attempt - 1);
           await new Promise((r) => setTimeout(r, delay));
           return makeRequest(attempt + 1);
         }
@@ -707,7 +720,7 @@ export async function apiRequest<T>(
       const isNetwork = err instanceof TypeError;
 
       if ((isTimeout || isNetwork) && attempt < retryAttempts && ['GET', 'HEAD'].includes(method)) {
-        const delay = retryDelay * Math.pow(2, attempt - 1);
+        const delay = retryDelay * 2 ** (attempt - 1);
         await new Promise((r) => setTimeout(r, delay));
         return makeRequest(attempt + 1);
       }
@@ -745,7 +758,7 @@ export async function createSafeFetch(config: SafeFetchConfig = {}) {
 
     /**
      * Makes an HTTP request using this SafeFetch instance's configuration
-     * 
+     *
      * @param method HTTP method - 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
      * @param url Request URL
      * @param options Request configuration options
@@ -769,4 +782,5 @@ export async function createSafeFetch(config: SafeFetchConfig = {}) {
 }
 
 // SafeFetch Default Export - The core apiRequest function
+
 export default apiRequest;
