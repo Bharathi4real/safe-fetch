@@ -2,6 +2,9 @@
  * SafeFetch – Typed Fetch Utility for Next.js
  * (c) 2025 Bharathi4real – BSD 3-Clause License
  * Optimized for Next.js 14.x.x & 15.x.x
+ *
+ * A robust, type-safe HTTP client for Next.js with advanced caching, retry logic,
+ * and error handling. Provides excellent IntelliSense and autocomplete support.
  */
 
 'use server';
@@ -11,18 +14,45 @@ import { fetch as nextFetch } from 'next/dist/compiled/@edge-runtime/primitives/
 
 // Define HTTP methods with stricter type safety
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const;
+
+/** HTTP methods supported by SafeFetch. */
 export type HttpMethod = typeof HTTP_METHODS[number];
 
-// Type definitions
+/** Request body types: JSON object, FormData, string, or null. */
 export type RequestBody = Record<string, unknown> | FormData | string | null;
+
+/** Query parameters as key-value pairs施
+
+/** Query parameters as key-value pairs. */
 export type QueryParams = Record<string, string | number | boolean | null | undefined>;
 
+/**
+ * Cache configuration for Next.js caching.
+ * @property revalidate - Cache revalidation time in seconds or false to disable.
+ * @property tags - Cache tags for targeted revalidation.
+ * @property key - Unique cache key for the request.
+ */
 export interface NextCacheOptions {
   revalidate?: number | false;
   tags?: string[];
   key?: string;
 }
 
+/**
+ * Request configuration options.
+ * @typeParam TBody - Type of the request body.
+ * @typeParam TResponse - Type of the response data.
+ * @property data - Request body data (JSON, FormData, or string).
+ * @property params - Query parameters to append to the URL.
+ * @property retries - Number of retry attempts for failed requests.
+ * @property timeout - Request timeout in milliseconds.
+ * @property cache - Cache mode for the request.
+ * @property next - Next.js cache configuration.
+ * @property headers - Custom HTTP headers.
+ * @property logTypes - Log inferred TypeScript types in development mode.
+ * @property transform - Transform response data before returning.
+ * @property onError - Callback for handling errors during retries.
+ */
 export interface RequestOptions<TBody extends RequestBody = RequestBody, TResponse = unknown> {
   data?: TBody;
   params?: QueryParams;
@@ -36,6 +66,14 @@ export interface RequestOptions<TBody extends RequestBody = RequestBody, TRespon
   onError?: (error: ApiError, attempt: number) => void;
 }
 
+/**
+ * Error object for failed requests.
+ * @property name - Error type (e.g., HttpError, NetworkError).
+ * @property message - Descriptive error message.
+ * @property status - HTTP status code.
+ * @property attempt - Current retry attempt number.
+ * @property context - Additional error context.
+ */
 export interface ApiError {
   readonly name: string;
   readonly message: string;
@@ -49,6 +87,10 @@ export interface ApiError {
   };
 }
 
+/**
+ * Response object for API requests.
+ * @typeParam T - Type of the response data.
+ */
 export type ApiResponse<T = unknown> =
   | {
       success: true;
@@ -66,7 +108,7 @@ export type ApiResponse<T = unknown> =
 
 // Configuration with secure defaults
 const CONFIG = {
-  API_URL:process.env.NEXT_PUBLIC_API_URL ?? process.env.BASE_URL ?? '',
+  API_URL: process.env.NEXT_PUBLIC_API_URL ?? process.env.BASE_URL ?? '',
   IS_DEV: process.env.NODE_ENV === 'development',
   RETRY_CODES: new Set<number>([429, 500, 502, 503, 504]),
   IDEMPOTENT_METHODS: new Set<HttpMethod>(['GET', 'PUT', 'DELETE']),
@@ -324,11 +366,47 @@ async function executeFetch<TResponse>(
 }
 
 /**
- * Main API request function with strict generics and secure handling
- * @param method HTTP method (GET, POST, PUT, DELETE, PATCH)
- * @param endpoint API endpoint (relative or absolute URL)
- * @param options Request options
- * @returns Promise resolving to ApiResponse
+ * Performs a type-safe HTTP request with advanced features.
+ * @param method - HTTP method to use (GET, POST, PUT, DELETE, PATCH).
+ * @param endpoint - API endpoint (relative or absolute URL).
+ * @param options - Configuration options for the request.
+ * @typeParam TResponse - Expected response data type.
+ * @typeParam TBody - Request body type.
+ * @returns A promise resolving to the API response.
+ * @example
+ * ```ts
+ * // Comprehensive example using all available options
+ * const response = await apiRequest<
+ *   { id: number; name: string; email: string }, // Response type
+ *   { name: string; email: string } // Body type
+ * >(
+ *   'POST',
+ *   '/api/users',
+ *   {
+ *     data: { name: 'John Doe', email: 'john@example.com' }, // Request body
+ *     params: { role: 'admin', active: true }, // Query parameters
+ *     retries: 3, // Retry up to 3 times
+ *     timeout: 10000, // 10-second timeout
+ *     cache: 'no-store', // Cache mode
+ *     next: { revalidate: 3600, tags: ['users'], key: 'user-create' }, // Next.js cache options
+ *     headers: { 'X-Custom-Header': 'value' }, // Custom headers
+ *     logTypes: true, // Log inferred types in development
+ *     transform: (data) => ({ // Transform response data
+ *       ...data,
+ *       name: data.name.toUpperCase(),
+ *     }),
+ *     onError: (error, attempt) => { // Error handling callback
+ *       console.error(`Attempt ${attempt + 1} failed: ${error.message}`);
+ *     },
+ *   }
+ * );
+ *
+ * if (apiRequest.isSuccess(response)) {
+ *   console.log(response.data); // Strongly typed: { id: number; name: string; email: string }
+ * } else {
+ *   console.error(response.error.message); // Access error details
+ * }
+ * ```
  */
 export default async function apiRequest<
   TResponse = unknown,
@@ -417,16 +495,45 @@ export default async function apiRequest<
   return { success: false, status: lastError!.status, error: lastError!, data: null };
 }
 
-// Type guards
+/**
+ * Type guard to check if the response is successful.
+ * @param response - The API response to check.
+ * @returns True if the response is successful.
+ */
 apiRequest.isSuccess = <T>(
   response: ApiResponse<T>,
 ): response is Extract<ApiResponse<T>, { success: true }> => response.success;
 
+/**
+ * Type guard to check if the response is an error.
+ * @param response - The API response to check.
+ * @returns True if the response is an error.
+ */
 apiRequest.isError = <T>(
   response: ApiResponse<T>,
 ): response is Extract<ApiResponse<T>, { success: false }> => !response.success;
 
-// Cache helpers
+/**
+ * Cache helper utilities for Next.js caching.
+ * @property revalidateByTag - Revalidate cache by tag.
+ * @property revalidateByPath - Revalidate cache by path.
+ * @property cached - Wrap apiRequest with Next.js unstable_cache.
+ * @example
+ * ```ts
+ * // Create a cached request
+ * const getCachedUsers = apiRequest.cacheHelpers.cached<
+ *   { users: { id: number; name: string }[] }
+ * >('users_cache_key', 3600, ['users']);
+ *
+ * const response = await getCachedUsers('GET', '/api/users');
+ * if (apiRequest.isSuccess(response)) {
+ *   console.log(response.data.users); // Strongly typed
+ * }
+ *
+ * // Revalidate cache
+ * apiRequest.cacheHelpers.revalidateByTag('users');
+ * ```
+ */
 apiRequest.cacheHelpers = {
   revalidateByTag: revalidateTag,
   revalidateByPath: revalidatePath,
