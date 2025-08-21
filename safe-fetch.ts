@@ -27,7 +27,7 @@ export type ErrorData =
   | ArrayBuffer
   | FormData
   | ReadableStream
-  | BigInt
+  | bigint
   | symbol;
 
 /** Next.js specific options */
@@ -328,6 +328,7 @@ const buildUrl = (endpoint: string, params?: QueryParams, allowedHosts?: string[
         const sanitizedKey = key.replace(/[^\w\-_.]/g, '').substring(0, 100);
         const sanitizedValue = String(value)
           .substring(0, 1000)
+          // biome-ignore lint/suspicious/noControlCharactersInRegex: <needed>
           .replace(/[\x00-\x1f\x7f-\x9f]/g, ''); // Remove control characters
 
         if (sanitizedKey && sanitizedValue) {
@@ -359,6 +360,7 @@ const buildHeaders = (data?: RequestBody, custom?: Record<string, string>): Head
       if (/^[!#$%&'*+\-.0-9A-Z^_`a-z|~]+$/.test(key)) {
         // Sanitize header value: remove control characters including CR/LF
         const sanitizedValue = value
+          // biome-ignore lint/suspicious/noControlCharactersInRegex: <needed>
           .replace(/[\x00-\x1f\x7f-\xff\r\n]/g, '') // Explicitly remove CR/LF
           .substring(0, CONFIG.security.maxHeaderLength);
         if (sanitizedValue) headers[key] = sanitizedValue;
@@ -416,7 +418,7 @@ const parseResponse = async <T>(response: Response, maxSize: number): Promise<T>
 
     try {
       return JSON.parse(text) as T;
-    } catch (error) {
+    } catch (_error) {
       // If JSON parsing fails, return the raw text as fallback
       // This ensures we don't lose any error information
       if (IS_DEV) {
@@ -545,7 +547,7 @@ const createTimeout = (ms: number): TimeoutController => {
  */
 const delay = (attempt: number): Promise<void> => {
   // Max delay of 10 seconds
-  const baseMs = Math.min(1000 * Math.pow(2, attempt), 10000);
+  const baseMs = Math.min(1000 * 2 ** attempt, 10000);
   const jitter = baseMs * 0.25 * (Math.random() - 0.5); // +/- 12.5% jitter
   const finalMs = Math.max(100, Math.min(baseMs + jitter, 10000)); // Min 100ms, Max 10s
   return new Promise((resolve) => setTimeout(resolve, finalMs));
@@ -792,7 +794,6 @@ const executeFetch = async <TResponse>(
 
         currentUrl = resolvedRedirectUrl;
         redirectCount++;
-        continue;
       } else {
         break;
       }
