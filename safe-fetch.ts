@@ -15,21 +15,6 @@ export type RequestBody = Record<string, unknown> | FormData | string | ArrayBuf
 /** Query parameter types */
 export type QueryParams = Record<string, string | number | boolean | null | undefined>;
 
-export type ErrorData =
-  | string
-  | number
-  | boolean
-  | null
-  | undefined
-  | Record<string, unknown>
-  | Array<unknown>
-  | Blob
-  | ArrayBuffer
-  | FormData
-  | ReadableStream
-  | bigint
-  | symbol;
-
 /** Next.js specific options */
 export interface NextOptions {
   revalidate?: number | false;
@@ -47,6 +32,7 @@ export interface RequestOptions<
 > {
   /** Request body - auto-serialized to JSON unless FormData/Blob/ArrayBuffer */
   data?: TBody;
+  body?: TBody;
   /** Query parameters appended to URL */
   params?: QueryParams;
   /** Max retry attempts for idempotent methods (default: 1) */
@@ -83,12 +69,8 @@ export interface ApiError {
   readonly message: string;
   readonly status: number;
   readonly attempt?: number;
-  readonly data?: ErrorData;
-  readonly devMessage?: string;
-  readonly originalError?: Error;
-  readonly contentType?: string;
-  readonly dataType?: string;
-  readonly dataSizeBytes?: number;
+  readonly data?: unknown;
+  readonly devMessage?: string; // For more verbose error details in dev
 }
 
 /** Type-safe API response with success/error discrimination */
@@ -179,47 +161,15 @@ const createApiError = (
   status: number,
   attempt?: number,
   data?: unknown,
-  devMessage?: string,
-  originalError?: Error,
-  contentType?: string,
-): ApiError => {
-  // Safely determine data type and size
-  const getDataInfo = (data: unknown): { dataType: string; dataSizeBytes?: number } => {
-    if (data === null) return { dataType: 'null' };
-    if (data === undefined) return { dataType: 'undefined' };
-    if (typeof data === 'string')
-      return { dataType: 'string', dataSizeBytes: new TextEncoder().encode(data).length };
-    if (typeof data === 'number') return { dataType: 'number' };
-    if (typeof data === 'boolean') return { dataType: 'boolean' };
-    if (typeof data === 'bigint') return { dataType: 'bigint' };
-    if (typeof data === 'symbol') return { dataType: 'symbol' };
-    if (data instanceof Blob) return { dataType: 'Blob', dataSizeBytes: data.size };
-    if (data instanceof ArrayBuffer)
-      return { dataType: 'ArrayBuffer', dataSizeBytes: data.byteLength };
-    if (data instanceof FormData) return { dataType: 'FormData' };
-    if (data instanceof ReadableStream) return { dataType: 'ReadableStream' };
-    if (Array.isArray(data))
-      return { dataType: 'Array', dataSizeBytes: JSON.stringify(data).length };
-    if (typeof data === 'object')
-      return { dataType: 'Object', dataSizeBytes: JSON.stringify(data).length };
-    return { dataType: 'unknown' };
-  };
-
-  const { dataType, dataSizeBytes } = getDataInfo(data);
-
-  return {
-    name,
-    message: IS_DEV && devMessage ? devMessage : message,
-    status,
-    attempt,
-    data: data as ErrorData,
-    ...(IS_DEV && devMessage && { devMessage }),
-    ...(originalError && { originalError }),
-    ...(contentType && { contentType }),
-    dataType,
-    ...(dataSizeBytes && { dataSizeBytes }),
-  };
-};
+  devMessage?: string, // More verbose message for development
+): ApiError => ({
+  name,
+  message: IS_DEV && devMessage ? devMessage : message,
+  status,
+  attempt,
+  data,
+  ...(IS_DEV && devMessage && { devMessage }),
+});
 
 /**
  * Validates a URL for SSRF protection by checking protocols, blocked hosts/IPs,
@@ -386,11 +336,13 @@ const buildHeaders = (data?: RequestBody, custom?: Record<string, string>): Head
 };
 
 /**
- * Enhanced parseResponse function that preserves actual API error structure
+ * Parses the response body, applying size limits and intelligently handling
+ * different content types (JSON, text).
  * @template T The expected type of the response data.
  * @param response The raw Response object from fetch.
  * @param maxSize The maximum allowed response size in bytes.
  * @returns A Promise resolving to the parsed response data.
+ * @throws Error if response is too large, or JSON parsing fails.
  */
 const parseResponse = async <T>(response: Response, maxSize: number): Promise<T> => {
   const contentType = response.headers.get('content-type') || '';
@@ -402,119 +354,66 @@ const parseResponse = async <T>(response: Response, maxSize: number): Promise<T>
     });
   }
 
-  // Handle JSON responses (most common for API errors)
-  if (contentType.includes('application/json')) {
-    const text = await response.text();
-    if (text.length > maxSize) {
-      throw new Error(`Response too large: ${text.length} bytes (max: ${maxSize})`, {
-        cause: 'PayloadTooLarge',
-      });
-    }
+  const reader = response.body?.getReader();
+  if (!reader) return '' as T; // Return empty string for no body
 
-    if (!text.trim()) {
-      // Return empty object for empty JSON responses
-      return {} as T;
-    }
+  const chunks: Uint8Array[] = [];
+  let totalSize = 0;
 
-    try {
-      return JSON.parse(text) as T;
-    } catch (_error) {
-      // If JSON parsing fails, return the raw text as fallback
-      // This ensures we don't lose any error information
-      if (IS_DEV) {
-        console.warn('Failed to parse JSON, returning raw text:', text);
-      }
-      return text as unknown as T;
-    }
-  }
-
-  // Handle text responses (some APIs return plain text errors)
-  if (contentType.includes('text/')) {
-    const reader = response.body?.getReader();
-    if (!reader) return '' as T;
-
-    const chunks: Uint8Array[] = [];
-    let totalSize = 0;
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        totalSize += value.length;
-        if (totalSize > maxSize) {
-          throw new Error(`Response too large: exceeded ${maxSize} bytes`, {
-            cause: 'PayloadTooLarge',
-          });
-        }
-        chunks.push(value);
-      }
-
-      const combined = new Uint8Array(totalSize);
-      let offset = 0;
-      for (const chunk of chunks) {
-        combined.set(chunk, offset);
-        offset += chunk.length;
-      }
-
-      const text = new TextDecoder('utf-8', { fatal: false }).decode(combined);
-
-      // Try to parse as JSON if it looks like JSON (for APIs that return JSON with text/plain)
-      if (/^\s*[{[]/.test(text.trim())) {
-        try {
-          return JSON.parse(text) as T;
-        } catch {
-          // If JSON parsing fails, return as text to preserve error info
-          return text as T;
-        }
-      }
-
-      return text as T;
-    } catch (error) {
-      if (
-        error instanceof Error &&
-        (error.message.includes('too large') || error.cause === 'PayloadTooLarge')
-      ) {
-        throw error;
-      }
-      throw new Error('Failed to read response body', { cause: error });
-    }
-  }
-
-  // Handle binary responses
-  if (contentType.includes('application/octet-stream') || contentType.includes('application/pdf')) {
-    return response.arrayBuffer() as Promise<T>;
-  }
-
-  if (contentType.includes('multipart/form-data')) {
-    return response.formData() as Promise<T>;
-  }
-
-  if (
-    contentType.includes('image/') ||
-    contentType.includes('video/') ||
-    contentType.includes('audio/')
-  ) {
-    return response.blob() as Promise<T>;
-  }
-
-  // Default fallback - try to get any response content
   try {
-    const text = await response.text();
-    if (!text.trim()) {
-      return {} as T;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      totalSize += value.length;
+      if (totalSize > maxSize)
+        throw new Error(`Response too large: exceeded ${maxSize} bytes`, {
+          cause: 'PayloadTooLarge',
+        });
+      chunks.push(value);
     }
 
-    // Attempt JSON parsing for unknown content types
-    try {
-      return JSON.parse(text) as T;
-    } catch {
-      // Return raw text if JSON parsing fails
-      return text as unknown as T;
+    const combined = new Uint8Array(totalSize);
+    let offset = 0;
+    for (const chunk of chunks) {
+      combined.set(chunk, offset);
+      offset += chunk.length;
     }
-  } catch {
-    // Last resort - return empty object
-    return {} as T;
+
+    // Use TextDecoder with 'fatal: false' for robustness against malformed UTF-8
+    const text = new TextDecoder('utf-8', { fatal: false }).decode(combined);
+
+    // Parse JSON if content-type indicates or text heuristically looks like JSON
+    if (
+      contentType.includes('application/json') ||
+      /^\s*[{[]/.test(text.trim()) // Check for starting with { or [ after trimming whitespace
+    ) {
+      try {
+        return JSON.parse(text) as T;
+      } catch (error) {
+        // Only throw "Invalid JSON" if content-type was explicitly JSON
+        if (contentType.includes('application/json')) {
+          throw new Error(
+            `Invalid JSON response: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: 'InvalidJson' },
+          );
+        }
+        // Otherwise, return as plain text if it wasn't strictly JSON
+      }
+    }
+
+    return text as T;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.message.includes('too large') || error.cause === 'PayloadTooLarge')
+    ) {
+      throw error; // Re-throw specific size error
+    }
+    if (error instanceof Error && error.cause === 'InvalidJson') {
+      throw error; // Re-throw specific JSON error
+    }
+    throw new Error('Failed to read or parse response body', { cause: error });
   }
 };
 
@@ -594,36 +493,37 @@ const shouldRetryRequest = (
  * @param endpoint The API endpoint.
  * @param data The data from which to infer types.
  */
-const logTypes = (endpoint: string, data: unknown, prefix = ''): void => {
+const logTypes = (endpoint: string, data: unknown): void => {
   if (!IS_DEV) return;
 
-  const inferType = (val: unknown, depth = 0, path = ''): string => {
+  const inferType = (val: unknown, depth = 0): string => {
     if (depth > 10) return 'unknown /* depth exceeded */';
     if (val === null) return 'null';
     if (val === undefined) return 'undefined';
 
     if (Array.isArray(val)) {
       if (val.length === 0) return 'unknown[]';
-      const firstType = inferType(val[0], depth + 1, `${path}[0]`);
+      // Infer type based on the first element, assuming homogeneous array
+      const firstType = inferType(val[0], depth + 1);
+      // Check if all elements are of the same basic type to avoid overly complex unions
       const allSameBasicType = val.every(
         (item) => typeof item === typeof val[0] || (item === null && val[0] === null),
       );
-      return allSameBasicType ? `${firstType}[]` : `Array<${firstType} | unknown>`;
+      return allSameBasicType ? `${firstType}[]` : `Array<${firstType} | unknown>`; // More specific if not all same
     }
 
     if (typeof val === 'object' && val !== null) {
       const obj = val as Record<string, unknown>;
       const props = Object.entries(obj)
-        .slice(0, 50)
+        .slice(0, 999) // Limit number of properties to infer for very large objects
         .map(([k, v]) => {
-          const keyPath = path ? `${path}.${k}` : k;
           const valueType = /password|token|secret|key|auth/i.test(k)
             ? 'string /* redacted */'
-            : inferType(v, depth + 1, keyPath);
-          return `    ${JSON.stringify(k)}: ${valueType}; // ${keyPath}`;
+            : inferType(v, depth + 1);
+          return `    ${JSON.stringify(k)}: ${valueType};`;
         })
         .join('\n');
-      const ellipsis = Object.keys(obj).length > 50 ? '\n    // ... more properties' : '';
+      const ellipsis = Object.keys(obj).length > 999 ? '\n    // ... more properties' : '';
       return `{\n${props}${ellipsis}\n}`;
     }
 
@@ -631,31 +531,14 @@ const logTypes = (endpoint: string, data: unknown, prefix = ''): void => {
   };
 
   try {
-    const typeName = (prefix + endpoint)
+    const typeName = endpoint
       .replace(/[^a-zA-Z0-9]/g, '_')
       .replace(/^_+|_+$/g, '')
       .replace(/_{2,}/g, '_')
       .replace(/^(\d)/, '_$1');
     const inferred = inferType(data);
-    console.log(`🔍 ${prefix}Inferred Type for "${endpoint}"`);
+    console.log(`🔍 Inferred Type for "${endpoint}"`);
     console.log(`type ${typeName}Type = ${inferred};`);
-
-    // Log common error properties if they exist
-    if (data && typeof data === 'object' && !Array.isArray(data)) {
-      const obj = data as Record<string, unknown>;
-      if ('error' in obj) {
-        console.log(`// Error message type: ${typeof obj.error}`);
-        if (typeof obj.error === 'string') {
-          console.log(`// Error: "${obj.error}"`);
-        }
-      }
-      if ('message' in obj) {
-        console.log(`// Message type: ${typeof obj.message}`);
-        if (typeof obj.message === 'string') {
-          console.log(`// Message: "${obj.message}"`);
-        }
-      }
-    }
   } catch (err) {
     console.warn('[logTypes] Failed to infer types:', err);
   }
@@ -757,7 +640,6 @@ const executeFetch = async <TResponse>(
   let response: Response;
   let currentResponseStatus = 500;
   let timeoutController: TimeoutController | null = null;
-  let responseContentType: string | null = null;
 
   try {
     while (true) {
@@ -772,19 +654,18 @@ const executeFetch = async <TResponse>(
         body,
         cache,
         signal: timeoutController.controller.signal,
-        redirect: 'manual',
+        redirect: 'manual', // Crucial for manual redirect handling and SSRF protection
         ...nextOptions,
       });
       timeoutController.cleanup();
-      timeoutController = null;
+      timeoutController = null; // Clear reference
 
       currentResponseStatus = response.status;
-      responseContentType = response.headers.get('content-type');
 
-      // Handle redirects
+      // Handle redirects (3xx status codes)
       if (response.status >= 300 && response.status < 400 && response.headers.has('Location')) {
         const redirectUrl = response.headers.get('Location')!;
-        const resolvedRedirectUrl = new URL(redirectUrl, currentUrl).toString();
+        const resolvedRedirectUrl = new URL(redirectUrl, currentUrl).toString(); // Resolve relative redirects
 
         if (!isUrlSafe(resolvedRedirectUrl)) {
           throw new Error('Redirect URL not allowed: potential SSRF risk', {
@@ -794,12 +675,16 @@ const executeFetch = async <TResponse>(
 
         currentUrl = resolvedRedirectUrl;
         redirectCount++;
+        // For 301, 302, 303, GET is usually used for the redirect. For 307, 308, original method is preserved.
+        // Node.js fetch generally follows this, but for manual, we'll keep the method for simplicity.
+        // If strict adherence to RFCs for method changes on redirect is needed, this logic would expand.
       } else {
+        // Not a redirect, or no Location header, so break and process response
         break;
       }
     }
 
-    // Parse response - this will preserve actual API error structure
+    // Process final response
     const responseData = await parseResponse<TResponse>(response, maxResponseSize);
 
     if (response.ok) {
@@ -811,27 +696,22 @@ const executeFetch = async <TResponse>(
       };
     }
 
-    // For HTTP errors, preserve the actual API error response
-    // The responseData now contains the actual error structure from the API
+    // HTTP error response
     return {
       success: false,
       error: createApiError(
         'HttpError',
-        `HTTP ${response.status}`, // Keep message simple
+        `HTTP ${response.status} Error`,
         response.status,
         attempt,
-        responseData, // This contains the ACTUAL API error response
+        responseData,
         IS_DEV ? `HTTP ${response.status} error for URL: ${currentUrl}` : undefined,
-        undefined,
-        responseContentType || undefined,
       ),
     };
   } catch (err) {
-    timeoutController?.cleanup();
+    timeoutController?.cleanup(); // Ensure cleanup if error occurs before response is received
 
-    const originalError = err instanceof Error ? err : new Error(String(err));
-
-    // Handle specific error types while preserving original error info
+    // Determine specific error type
     if (err instanceof Error) {
       if (err.name === 'AbortError' || err.message.includes('timeout')) {
         return {
@@ -843,30 +723,113 @@ const executeFetch = async <TResponse>(
             attempt,
             null,
             IS_DEV ? `Request to ${currentUrl} timed out after ${timeout}ms` : undefined,
-            originalError,
-            responseContentType || undefined,
           ),
         };
       }
-
-      // ... [keep all other error handling as is] ...
+      if (err.message.includes('too large') || err.cause === 'PayloadTooLarge') {
+        return {
+          success: false,
+          error: createApiError(
+            'PayloadTooLargeError',
+            'Response or request body too large',
+            413,
+            attempt,
+            null,
+            IS_DEV ? `Payload too large for URL: ${currentUrl}` : undefined,
+          ),
+        };
+      }
+      if (
+        err.message.includes('not allowed') ||
+        err.message.includes('SSRF') ||
+        err.cause === 'SecurityError'
+      ) {
+        return {
+          success: false,
+          error: createApiError(
+            'SecurityError',
+            'Request blocked for security reasons',
+            403,
+            attempt,
+            null,
+            IS_DEV ? `Security error for URL: ${currentUrl} - ${err.message}` : undefined,
+          ),
+        };
+      }
+      if (err.cause === 'TooManyRedirects') {
+        return {
+          success: false,
+          error: createApiError(
+            'TooManyRedirectsError',
+            'Too many redirects',
+            400, // Or 500, depending on how you classify this
+            attempt,
+            null,
+            IS_DEV ? `Exceeded max redirects (${CONFIG.security.maxRedirects}) for URL: ${currentUrl}` : undefined,
+          ),
+        };
+      }
+      if (err.cause === 'InvalidJson') {
+        return {
+          success: false,
+          error: createApiError(
+            'ParseError',
+            'Invalid JSON response',
+            currentResponseStatus,
+            attempt,
+            null,
+            IS_DEV ? `Failed to parse JSON response from ${currentUrl}: ${err.message}` : undefined,
+          ),
+        };
+      }
+      // Catch other network-related errors
+      if (
+        err.message.includes('network') ||
+        err.message.includes('fetch') ||
+        err.message.includes('connection') ||
+        (err as NodeJS.ErrnoException).code
+      ) {
+        return {
+          success: false,
+          error: createApiError(
+            'NetworkError',
+            'Network request failed',
+            500,
+            attempt,
+            null,
+            IS_DEV ? `Network error for URL: ${currentUrl} - ${err.message} (Code: ${(err as NodeJS.ErrnoException).code || 'N/A'})` : undefined,
+          ),
+        };
+      }
+      // Fallback for any other unexpected errors
+      return {
+        success: false,
+        error: createApiError(
+          'UnknownError',
+          'An unexpected error occurred',
+          currentResponseStatus,
+          attempt,
+          null,
+          IS_DEV ? `An unknown non-Error type was thrown for URL: ${currentUrl}` : undefined,
+        ),
+      };
     }
 
+    // If error is not an instance of Error
     return {
       success: false,
       error: createApiError(
         'UnknownError',
-        'Request failed',
+        'An unexpected error occurred',
         currentResponseStatus,
         attempt,
         null,
-        IS_DEV ? `Unknown error for URL: ${currentUrl}` : undefined,
-        originalError,
-        responseContentType || undefined,
+        IS_DEV ? `An unknown non-Error type was thrown for URL: ${currentUrl}` : undefined,
       ),
     };
   }
 };
+
 /**
  * API request function with comprehensive TypeScript support, retry, timeout,
  * and enhanced security features including SSRF protection against redirects.
@@ -1050,7 +1013,7 @@ export default async function apiRequest<
           result.status,
           attempt,
           null,
-          `Response transformation failed for URL: ${url}. Error: ${error instanceof Error ? error.message : String(error)}`,
+          IS_DEV ? `Response transformation failed for URL: ${url}. Error: ${error instanceof Error ? error.message : String(error)}` : undefined
         );
         onError?.(lastError, attempt);
         return {
