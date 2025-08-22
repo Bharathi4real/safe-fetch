@@ -1,7 +1,7 @@
 /**
  * SafeFetch – Typed Fetch Utility for Next.js
  * (c) 2025 Bharathi4real – BSD 3-Clause License
- * Optimized for Next.js 14.x.x & 15.x.x
+ * for Next.js 14.x.x & 15.x.x
  *
  * A robust, type-safe HTTP client for Next.js with advanced caching, retry logic,
  * and error handling. Provides excellent IntelliSense and autocomplete support.
@@ -21,16 +21,11 @@ export type HttpMethod = typeof HTTP_METHODS[number];
 /** Request body types: JSON object, FormData, string, or null. */
 export type RequestBody = Record<string, unknown> | FormData | string | null;
 
-/** Query parameters as key-value pairs施
-
 /** Query parameters as key-value pairs. */
 export type QueryParams = Record<string, string | number | boolean | null | undefined>;
 
 /**
  * Cache configuration for Next.js caching.
- * @property revalidate - Cache revalidation time in seconds or false to disable.
- * @property tags - Cache tags for targeted revalidation.
- * @property key - Unique cache key for the request.
  */
 export interface NextCacheOptions {
   revalidate?: number | false;
@@ -40,18 +35,6 @@ export interface NextCacheOptions {
 
 /**
  * Request configuration options.
- * @typeParam TBody - Type of the request body.
- * @typeParam TResponse - Type of the response data.
- * @property data - Request body data (JSON, FormData, or string).
- * @property params - Query parameters to append to the URL.
- * @property retries - Number of retry attempts for failed requests.
- * @property timeout - Request timeout in milliseconds.
- * @property cache - Cache mode for the request.
- * @property next - Next.js cache configuration.
- * @property headers - Custom HTTP headers.
- * @property logTypes - Log inferred TypeScript types in development mode.
- * @property transform - Transform response data before returning.
- * @property onError - Callback for handling errors during retries.
  */
 export interface RequestOptions<TBody extends RequestBody = RequestBody, TResponse = unknown> {
   data?: TBody;
@@ -68,11 +51,6 @@ export interface RequestOptions<TBody extends RequestBody = RequestBody, TRespon
 
 /**
  * Error object for failed requests.
- * @property name - Error type (e.g., HttpError, NetworkError).
- * @property message - Descriptive error message.
- * @property status - HTTP status code.
- * @property attempt - Current retry attempt number.
- * @property context - Additional error context.
  */
 export interface ApiError {
   readonly name: string;
@@ -89,7 +67,6 @@ export interface ApiError {
 
 /**
  * Response object for API requests.
- * @typeParam T - Type of the response data.
  */
 export type ApiResponse<T = unknown> =
   | {
@@ -106,7 +83,7 @@ export type ApiResponse<T = unknown> =
       data: null;
     };
 
-// Configuration with secure defaults
+// Configuration
 const CONFIG = {
   API_URL: process.env.NEXT_PUBLIC_API_URL ?? process.env.BASE_URL ?? '',
   IS_DEV: process.env.NODE_ENV === 'development',
@@ -115,22 +92,33 @@ const CONFIG = {
   MAX_CONCURRENT: 10,
   DEFAULT_TIMEOUT: 30000,
   DEFAULT_RETRIES: 1,
-};
+  SENSITIVE_KEY_REGEX: /password|token|secret/i,
+  NON_ALPHANUMERIC_REGEX: /[^a-zA-Z0-9]/g,
+  AUTH_CREDENTIALS: {
+    username: process.env.AUTH_USERNAME,
+    password: process.env.AUTH_PASSWORD,
+    token: process.env.API_TOKEN,
+  },
+} as const;
 
-// Secure auth header generation
+// Auth header generation
 const getAuthHeader = (): string | undefined => {
-  const { AUTH_USERNAME, AUTH_PASSWORD, API_TOKEN } = process.env;
-  if (!AUTH_USERNAME && !AUTH_PASSWORD && !API_TOKEN) {
+  const { username, password, token } = CONFIG.AUTH_CREDENTIALS;
+
+  if (!username && !password && !token) {
     if (CONFIG.IS_DEV) console.warn('[SafeFetch] No authentication credentials provided');
     return undefined;
   }
-  if (AUTH_USERNAME && AUTH_PASSWORD) {
-    return `Basic ${Buffer.from(`${AUTH_USERNAME}:${AUTH_PASSWORD}`, 'utf8').toString('base64')}`;
+
+  if (username && password) {
+    const encoded = Buffer.from(`${username}:${password}`, 'utf8').toString('base64');
+    return `Basic ${encoded}`;
   }
-  return API_TOKEN ? `Bearer ${API_TOKEN}` : undefined;
+
+  return token ? `Bearer ${token}` : undefined;
 };
 
-// Utility to create ApiError with stack trace in dev mode
+// Error creation
 const createApiError = (
   name: string,
   message: string,
@@ -149,14 +137,19 @@ const createApiError = (
   },
 });
 
-// Build URL with sanitization
+// URL building
 const buildUrl = (endpoint: string, params?: QueryParams): string => {
   try {
-    const base = endpoint.startsWith('http://') || endpoint.startsWith('https://')
-      ? endpoint
-      : `${CONFIG.API_URL.replace(/\/+$/, '')}/${endpoint.replace(/^\//, '')}`;
+    let url: URL;
 
-    const url = new URL(base);
+    if (endpoint.startsWith('http://') || endpoint.startsWith('https://')) {
+      url = new URL(endpoint);
+    } else {
+      const baseUrl = CONFIG.API_URL.replace(/\/+$/, '') || 'http://localhost';
+      const cleanEndpoint = endpoint.replace(/^\//, '');
+      url = new URL(`${baseUrl}/${cleanEndpoint}`);
+    }
+
     if (params) {
       Object.entries(params).forEach(([key, value]) => {
         if (value !== null && value !== undefined) {
@@ -164,6 +157,7 @@ const buildUrl = (endpoint: string, params?: QueryParams): string => {
         }
       });
     }
+
     return url.toString();
   } catch (error) {
     throw createApiError(
@@ -176,46 +170,56 @@ const buildUrl = (endpoint: string, params?: QueryParams): string => {
   }
 };
 
-// Build headers with secure handling
+// Header building
 const buildHeaders = (data?: RequestBody, custom?: Record<string, string>): HeadersInit => {
-  const authHeader = getAuthHeader();
-  return {
+  const headers: Record<string, string> = {
     Accept: 'application/json',
-    ...(authHeader && { Authorization: authHeader }),
-    ...(data && !(data instanceof FormData) && { 'Content-Type': 'application/json' }),
-    ...custom,
   };
+
+  const authHeader = getAuthHeader();
+  if (authHeader) {
+    headers.Authorization = authHeader;
+  }
+
+  if (data && !(data instanceof FormData)) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  if (custom) {
+    Object.assign(headers, custom);
+  }
+
+  return headers;
 };
 
-// Parse response with type safety
+// Response parsing
 const parseResponse = async <T>(response: Response): Promise<T> => {
-  const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
-  if (contentType.includes('application/json')) {
+  const contentType = response.headers.get('content-type')?.toLowerCase() || '';
+  
+  if (contentType.includes('json')) {
     return (await response.json()) as T;
   }
   return (await response.text()) as T;
 };
 
-// Create timeout with AbortController
+// Timeout handling
 const createTimeout = (ms: number): { controller: AbortController; cleanup: () => void } => {
   const controller = new AbortController();
-  let cleaned = false;
   const timeoutId = setTimeout(() => {
-    if (!cleaned) controller.abort(new Error('Request timeout'));
+    controller.abort(new Error('Request timeout'));
   }, ms);
+
   return {
     controller,
-    cleanup: () => {
-      cleaned = true;
-      clearTimeout(timeoutId);
-    },
+    cleanup: () => clearTimeout(timeoutId),
   };
 };
 
-// Exponential backoff with jitter
+// Delay with exponential backoff
 const delay = (attempt: number): Promise<void> => {
-  const ms = Math.min(1000 * 2 ** attempt, 10000) + Math.random() * 100;
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  const baseDelay = Math.min(1000 * (2 ** attempt), 10000);
+  const jitteredDelay = baseDelay + Math.random() * 100;
+  return new Promise((resolve) => setTimeout(resolve, jitteredDelay));
 };
 
 // Retry logic
@@ -229,22 +233,25 @@ const shouldRetryRequest = (
   CONFIG.IDEMPOTENT_METHODS.has(method) &&
   (error.name === 'AbortError' || CONFIG.RETRY_CODES.has(error.status));
 
-// Sanitize sensitive data in logs
+// Data sanitization
 const sanitizeData = (data: unknown): unknown => {
   if (!data || typeof data !== 'object') return data;
   if (Array.isArray(data)) return data.map(sanitizeData);
+
   const result = { ...data } as Record<string, unknown>;
+
   for (const [key, value] of Object.entries(result)) {
-    if (/password|token|secret/i.test(key)) {
+    if (CONFIG.SENSITIVE_KEY_REGEX.test(key)) {
       result[key] = '[REDACTED]';
-    } else if (typeof value === 'object') {
+    } else if (typeof value === 'object' && value !== null) {
       result[key] = sanitizeData(value);
     }
   }
+
   return result;
 };
 
-// Log types in development mode
+// Type inference logging
 const logTypes = <T>(
   endpoint: string,
   data: T,
@@ -252,39 +259,38 @@ const logTypes = <T>(
 ): void => {
   if (!CONFIG.IS_DEV) return;
 
-  if (JSON.stringify(data).length > 50000) {
+  const dataStr = JSON.stringify(data);
+  if (dataStr.length > 50000) {
     console.log(`🔍 [SafeFetch] "${endpoint}" - Skipping type analysis (data too large)`);
     return;
   }
 
-  const inferType = (val: unknown, depth = 0, indent = ''): string => {
-    if (depth > 20) return '[Max depth reached]';
+  const inferType = (val: unknown, depth = 0): string => {
+    if (depth > 10) return '[Max depth reached]';
+
     if (val === null) return 'null';
     if (val === undefined) return 'undefined';
+
     if (Array.isArray(val)) {
       if (!val.length) return 'unknown[]';
-      const types = [
-        ...new Set(
-          val.map((item) => inferType(item, depth + 1, `${indent}  `))
-        ),
-      ];
+      const types = [...new Set(val.slice(0, 10).map(item => inferType(item, depth + 1)))];
       return types.length === 1 ? `${types[0]}[]` : `(${types.join(' | ')})[]`;
     }
-    if (typeof val === 'object' && val !== null) {
+
+    if (typeof val === 'object') {
       const obj = sanitizeData(val) as Record<string, unknown>;
-      const entries = Object.entries(obj);
+      const entries = Object.entries(obj).slice(0, 20);
       const props = entries
-        .map(
-          ([key, value]) =>
-            `${indent}  ${key}: ${inferType(value, depth + 1, `${indent}  `)};`,
-        )
+        .map(([key, value]) => `  ${key}: ${inferType(value, depth + 1)};`)
         .join('\n');
-      return `{\n${props}\n${indent}}`;
+      return `{\n${props}\n}`;
     }
+
     return typeof val;
   };
+
   try {
-    const typeName = endpoint.replace(/[^a-zA-Z0-9]/g, '_') || 'ApiResponse';
+    const typeName = endpoint.replace(CONFIG.NON_ALPHANUMERIC_REGEX, '_') || 'ApiResponse';
     console.log(`🔍 [SafeFetch] Type for "${endpoint}"`);
     console.log(`type ${typeName}Response = ${inferType(data)};`);
     if (metadata?.cached) console.log(`💾 Cache hit: ${metadata.cached}`);
@@ -294,22 +300,22 @@ const logTypes = <T>(
   }
 };
 
-// Concurrent request limiter
+// Concurrent request limiting
 const requestQueue = new Set<Promise<unknown>>();
 const limitConcurrentRequests = async <T>(request: () => Promise<T>): Promise<T> => {
-  if (requestQueue.size >= CONFIG.MAX_CONCURRENT) {
+  while (requestQueue.size >= CONFIG.MAX_CONCURRENT) {
     await Promise.race(requestQueue);
   }
-  const promise = request();
-  requestQueue.add(promise);
-  try {
-    return await promise;
-  } finally {
+
+  const promise = request().finally(() => {
     requestQueue.delete(promise);
-  }
+  });
+
+  requestQueue.add(promise);
+  return promise;
 };
 
-// Execute fetch with strict typing
+// Fetch execution
 async function executeFetch<TResponse>(
   url: string,
   method: HttpMethod,
@@ -322,6 +328,7 @@ async function executeFetch<TResponse>(
 ): Promise<ApiResponse<TResponse>> {
   return limitConcurrentRequests(async () => {
     const timeoutController = createTimeout(timeout);
+
     try {
       const response = await nextFetch(url, {
         method,
@@ -332,20 +339,18 @@ async function executeFetch<TResponse>(
         ...nextOptions,
       });
 
-      timeoutController.cleanup();
       const data = await parseResponse<TResponse>(response);
 
       if (response.ok) {
+        const cacheStatus = response.headers.get('x-cache-status') || response.headers.get('cf-cache-status');
+        const cacheHit = cacheStatus === 'hit' || cacheStatus === 'HIT';
+
         return {
           success: true,
           data,
           status: response.status,
           headers: response.headers,
-          cache: {
-            hit:
-              response.headers.get('x-cache-status') === 'hit' ||
-              response.headers.get('cf-cache-status') === 'HIT',
-          },
+          cache: { hit: cacheHit },
         };
       }
 
@@ -359,7 +364,6 @@ async function executeFetch<TResponse>(
         data: null,
       };
     } catch (err) {
-      timeoutController.cleanup();
       const errorMessage = err instanceof Error ? err.message : 'Unknown error';
       return {
         success: false,
@@ -370,6 +374,8 @@ async function executeFetch<TResponse>(
         status: 500,
         data: null,
       };
+    } finally {
+      timeoutController.cleanup();
     }
   });
 }
@@ -425,6 +431,7 @@ export default async function apiRequest<
   endpoint: string,
   options: RequestOptions<TBody, TResponse> = {},
 ): Promise<ApiResponse<TResponse>> {
+  // Validate HTTP method
   if (!HTTP_METHODS.includes(method)) {
     const error = createApiError('ValidationError', `Invalid HTTP method: ${method}`, 400, undefined, {
       url: '[REDACTED]',
@@ -432,6 +439,7 @@ export default async function apiRequest<
     return { success: false, status: 400, error, data: null };
   }
 
+  // Extract options with defaults
   const {
     data,
     params,
@@ -451,13 +459,19 @@ export default async function apiRequest<
   try {
     url = buildUrl(endpoint, params);
     headers = buildHeaders(data, customHeaders);
-    body = data
-      ? data instanceof FormData
-        ? data
-        : typeof data === 'string'
-        ? data
-        : JSON.stringify(data)
-      : undefined;
+
+    // Prepare request body
+    if (data) {
+      if (data instanceof FormData) {
+        body = data;
+      } else if (typeof data === 'string') {
+        body = data;
+      } else {
+        body = JSON.stringify(data);
+      }
+    } else {
+      body = undefined;
+    }
   } catch (error) {
     const apiError = createApiError(
       'ValidationError',
@@ -470,8 +484,9 @@ export default async function apiRequest<
   }
 
   const nextOptions = nextCacheOptions ? { next: nextCacheOptions } : {};
-
   let lastError: ApiError | undefined;
+
+  // Retry loop
   for (let attempt = 0; attempt <= retries; attempt++) {
     const result = await executeFetch<TResponse>(
       url,
@@ -486,19 +501,28 @@ export default async function apiRequest<
 
     if (result.success) {
       const finalData = transform ? transform(result.data) : result.data;
+
       if (shouldLogTypes) {
         logTypes(endpoint, finalData, {
           cached: result.cache?.hit,
           duration: Date.now() - startTime,
         });
       }
+
       return { ...result, data: finalData };
     }
 
     lastError = result.error;
     onError?.(lastError, attempt);
-    if (!shouldRetryRequest(lastError, attempt, retries, method)) break;
-    if (attempt < retries) await delay(attempt);
+
+    // Check if we should retry
+    if (!shouldRetryRequest(lastError, attempt, retries, method)) {
+      break;
+    }
+
+    if (attempt < retries) {
+      await delay(attempt);
+    }
   }
 
   return { success: false, status: lastError!.status, error: lastError!, data: null };
@@ -506,8 +530,6 @@ export default async function apiRequest<
 
 /**
  * Type guard to check if the response is successful.
- * @param response - The API response to check.
- * @returns True if the response is successful.
  */
 apiRequest.isSuccess = <T>(
   response: ApiResponse<T>,
@@ -515,8 +537,6 @@ apiRequest.isSuccess = <T>(
 
 /**
  * Type guard to check if the response is an error.
- * @param response - The API response to check.
- * @returns True if the response is an error.
  */
 apiRequest.isError = <T>(
   response: ApiResponse<T>,
@@ -524,9 +544,6 @@ apiRequest.isError = <T>(
 
 /**
  * Cache helper utilities for Next.js caching.
- * @property revalidateByTag - Revalidate cache by tag.
- * @property revalidateByPath - Revalidate cache by path.
- * @property cached - Wrap apiRequest with Next.js unstable_cache.
  * @example
  * ```ts
  * // Create a cached request
@@ -544,8 +561,8 @@ apiRequest.isError = <T>(
  * ```
  */
 apiRequest.cacheHelpers = {
-  revalidateByTag: revalidateTag,
-  revalidateByPath: revalidatePath,
+  revalidateTag,
+  revalidatePath,
   cached: <TResponse = unknown, TBody extends RequestBody = RequestBody>(
     cacheKey: string,
     revalidateSeconds = 3600,
