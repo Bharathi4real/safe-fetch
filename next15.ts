@@ -252,25 +252,27 @@ const logTypes = <T>(
 ): void => {
   if (!CONFIG.IS_DEV) return;
 
+  if (JSON.stringify(data).length > 50000) {
+    console.log(`🔍 [SafeFetch] "${endpoint}" - Skipping type analysis (data too large)`);
+    return;
+  }
+
   const inferType = (val: unknown, depth = 0, indent = ''): string => {
+    if (depth > 20) return '[Max depth reached]';
     if (val === null) return 'null';
     if (val === undefined) return 'undefined';
-
     if (Array.isArray(val)) {
       if (!val.length) return 'unknown[]';
       const types = [
         ...new Set(
-          val
-            .slice(0, 10)
-            .map((item) => inferType(item, depth + 1, `${indent}  `)),
+          val.map((item) => inferType(item, depth + 1, `${indent}  `))
         ),
       ];
       return types.length === 1 ? `${types[0]}[]` : `(${types.join(' | ')})[]`;
     }
-
     if (typeof val === 'object' && val !== null) {
       const obj = sanitizeData(val) as Record<string, unknown>;
-      const entries = Object.entries(obj).slice(0, 30);
+      const entries = Object.entries(obj);
       const props = entries
         .map(
           ([key, value]) =>
@@ -279,10 +281,8 @@ const logTypes = <T>(
         .join('\n');
       return `{\n${props}\n${indent}}`;
     }
-
     return typeof val;
   };
-
   try {
     const typeName = endpoint.replace(/[^a-zA-Z0-9]/g, '_') || 'ApiResponse';
     console.log(`🔍 [SafeFetch] Type for "${endpoint}"`);
