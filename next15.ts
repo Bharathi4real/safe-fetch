@@ -16,7 +16,7 @@ import { fetch as nextFetch } from 'next/dist/compiled/@edge-runtime/primitives/
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const;
 
 /** HTTP methods supported by SafeFetch. */
-export type HttpMethod = typeof HTTP_METHODS[number];
+export type HttpMethod = (typeof HTTP_METHODS)[number];
 
 /** Request body types: JSON object, FormData, string, or null. */
 export type RequestBody = Record<string, unknown> | FormData | string | null;
@@ -195,7 +195,7 @@ const buildHeaders = (data?: RequestBody, custom?: Record<string, string>): Head
 // Response parsing
 const parseResponse = async <T>(response: Response): Promise<T> => {
   const contentType = response.headers.get('content-type')?.toLowerCase() || '';
-  
+
   if (contentType.includes('json')) {
     return (await response.json()) as T;
   }
@@ -217,7 +217,7 @@ const createTimeout = (ms: number): { controller: AbortController; cleanup: () =
 
 // Delay with exponential backoff
 const delay = (attempt: number): Promise<void> => {
-  const baseDelay = Math.min(1000 * (2 ** attempt), 10000);
+  const baseDelay = Math.min(1000 * 2 ** attempt, 10000);
   const jitteredDelay = baseDelay + Math.random() * 100;
   return new Promise((resolve) => setTimeout(resolve, jitteredDelay));
 };
@@ -273,7 +273,7 @@ const logTypes = <T>(
 
     if (Array.isArray(val)) {
       if (!val.length) return 'unknown[]';
-      const types = [...new Set(val.slice(0, 10).map(item => inferType(item, depth + 1)))];
+      const types = [...new Set(val.slice(0, 10).map((item) => inferType(item, depth + 1)))];
       return types.length === 1 ? `${types[0]}[]` : `(${types.join(' | ')})[]`;
     }
 
@@ -342,7 +342,8 @@ async function executeFetch<TResponse>(
       const data = await parseResponse<TResponse>(response);
 
       if (response.ok) {
-        const cacheStatus = response.headers.get('x-cache-status') || response.headers.get('cf-cache-status');
+        const cacheStatus =
+          response.headers.get('x-cache-status') || response.headers.get('cf-cache-status');
         const cacheHit = cacheStatus === 'hit' || cacheStatus === 'HIT';
 
         return {
@@ -433,9 +434,15 @@ export default async function apiRequest<
 ): Promise<ApiResponse<TResponse>> {
   // Validate HTTP method
   if (!HTTP_METHODS.includes(method)) {
-    const error = createApiError('ValidationError', `Invalid HTTP method: ${method}`, 400, undefined, {
-      url: '[REDACTED]',
-    });
+    const error = createApiError(
+      'ValidationError',
+      `Invalid HTTP method: ${method}`,
+      400,
+      undefined,
+      {
+        url: '[REDACTED]',
+      },
+    );
     return { success: false, status: 400, error, data: null };
   }
 
