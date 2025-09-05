@@ -4,7 +4,7 @@
  * for Next.js 14.x.x & 15.x.x
  *
  * The ultimate type-safe HTTP client combining blazing performance with
- * comprehensive features, robust error handling, and excellent DX.
+ * comprehensive features and robust error handling.
  */
 
 'use server';
@@ -389,10 +389,16 @@ const sanitizeData = (
 const TYPE_CACHE = new Map<string, { type: string; timestamp: number }>();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
+interface LogMetadata {
+  cached?: boolean;
+  duration?: number;
+  attempt?: number;
+}
+
 const logTypes = <T>(
   endpoint: string,
   data: T,
-  metadata?: { cached?: boolean; duration?: number; attempt?: number },
+  metadata?: LogMetadata,
   performanceMode: 'balanced' | 'speed' | 'safety' = 'balanced',
 ): void => {
   if (!CONFIG.IS_DEV) return;
@@ -1014,6 +1020,41 @@ apiRequest.delete = <TResponse = unknown>(
   apiRequest<TResponse, null>('DELETE', endpoint, { ...options, data: null });
 
 /**
+ * Batch request configuration interface
+ */
+interface BatchRequestItem {
+  method: HttpMethod;
+  endpoint: string;
+  options?: RequestOptions;
+}
+
+/**
+ * Batch request options
+ */
+interface BatchOptions {
+  concurrency?: number;
+  failFast?: boolean;
+  performanceMode?: 'balanced' | 'speed' | 'safety';
+}
+
+/**
+ * Poll request options
+ */
+interface PollOptions<TResponse = unknown> extends RequestOptions<RequestBody, TResponse> {
+  interval?: number;
+  maxAttempts?: number;
+  exponentialBackoff?: boolean;
+}
+
+/**
+ * Circuit breaker options
+ */
+interface CircuitBreakerOptions<TResponse = unknown, TBody extends RequestBody = RequestBody> extends RequestOptions<TBody, TResponse> {
+  failureThreshold?: number;
+  resetTimeout?: number;
+}
+
+/**
  * Utility functions for common patterns
  */
 apiRequest.utils = {
@@ -1021,20 +1062,12 @@ apiRequest.utils = {
    * Create a batch request handler
    */
   batch: async <TResponse = unknown>(
-    requests: Array<{
-      method: HttpMethod;
-      endpoint: string;
-      options?: RequestOptions;
-    }>,
-    options: { 
-      concurrency?: number; 
-      failFast?: boolean; 
-      performanceMode?: 'balanced' | 'speed' | 'safety';
-    } = {},
+    requests: BatchRequestItem[],
+    options: BatchOptions = {},
   ): Promise<ApiResponse<TResponse>[]> => {
     const { concurrency = 5, failFast = false, performanceMode = 'balanced' } = options;
     
-    const executeRequest = async (request: typeof requests[0]) => {
+    const executeRequest = async (request: BatchRequestItem): Promise<ApiResponse<TResponse>> => {
       try {
         return await apiRequest<TResponse>(
           request.method, 
@@ -1092,11 +1125,7 @@ apiRequest.utils = {
     method: HttpMethod,
     endpoint: string,
     condition: (response: ApiResponse<TResponse>) => boolean,
-    options: RequestOptions<any, TResponse> & {
-      interval?: number;
-      maxAttempts?: number;
-      exponentialBackoff?: boolean;
-    } = {},
+    options: PollOptions<TResponse> = {},
   ): Promise<ApiResponse<TResponse>> => {
     const {
       interval = 1000,
@@ -1113,8 +1142,8 @@ apiRequest.utils = {
       }
 
       if (attempt < maxAttempts - 1) {
-        const delay = exponentialBackoff ? interval * (2 ** attempt) : interval;
-        await new Promise(resolve => setTimeout(resolve, delay));
+        const delayTime = exponentialBackoff ? interval * (2 ** attempt) : interval;
+        await new Promise(resolve => setTimeout(resolve, delayTime));
       }
     }
 
@@ -1137,20 +1166,19 @@ apiRequest.utils = {
    * Create a request with circuit breaker pattern
    */
   circuitBreaker: (() => {
-    const circuits = new Map<string, {
+    interface CircuitState {
       failures: number;
       lastFailure: number;
       state: 'closed' | 'open' | 'half-open';
-    }>();
+    }
+
+    const circuits = new Map<string, CircuitState>();
 
     return async <TResponse = unknown, TBody extends RequestBody = RequestBody>(
       key: string,
       method: HttpMethod,
       endpoint: string,
-      options: RequestOptions<TBody, TResponse> & {
-        failureThreshold?: number;
-        resetTimeout?: number;
-      } = {},
+      options: CircuitBreakerOptions<TResponse, TBody> = {},
     ): Promise<ApiResponse<TResponse>> => {
       const {
         failureThreshold = 5,
@@ -1232,7 +1260,7 @@ apiRequest.utils = {
     totalDuration: 0,
     averageLatency: 0,
     
-    record(response: ApiResponse<any>) {
+    record(response: ApiResponse<unknown>): void {
       this.requests++;
       if (response.success) {
         this.successes++;
@@ -1246,7 +1274,7 @@ apiRequest.utils = {
       }
     },
 
-    reset() {
+    reset(): void {
       this.requests = 0;
       this.successes = 0;
       this.failures = 0;
@@ -1286,4 +1314,3 @@ if (CONFIG.IS_DEV) {
   Object.setPrototypeOf(wrappedApiRequest, originalApiRequest);
   Object.assign(wrappedApiRequest, originalApiRequest);
 }
-
