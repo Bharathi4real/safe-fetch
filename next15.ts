@@ -1,18 +1,15 @@
-/**
- * SafeFetch – Typed Fetch Utility for Next.js
+ * SafeFetch – High-Performance Typed Fetch Utility for Next.js
  * (c) 2025 Bharathi4real – BSD 3-Clause License
  * for Next.js 14.x.x & 15.x.x
  *
  * A robust, type-safe HTTP client for Next.js with advanced caching, retry logic,
- * and error handling. Provides excellent IntelliSense and autocomplete support.
+ * error handling, and type inference logging. Optimized for maximum performance.
  */
 
 'use server';
 
 import { revalidatePath, revalidateTag, unstable_cache } from 'next/cache';
-import { fetch as nextFetch } from 'next/dist/compiled/@edge-runtime/primitives/fetch';
 
-// Define HTTP methods with stricter type safety
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const;
 
 /** HTTP methods supported by SafeFetch. */
@@ -25,12 +22,17 @@ export type RequestBody = Record<string, unknown> | FormData | string | null;
 export type QueryParams = Record<string, string | number | boolean | null | undefined>;
 
 /**
+ * Next.js supported cache options only.
+ * Excludes browser-specific options like 'only-if-cached' that aren't supported in server environments.
+ */
+export type NextJSRequestCache = 'default' | 'no-store' | 'reload' | 'no-cache' | 'force-cache';
+
+/**
  * Cache configuration for Next.js caching.
  */
 export interface NextCacheOptions {
   revalidate?: number | false;
   tags?: string[];
-  key?: string;
 }
 
 /**
@@ -41,12 +43,11 @@ export interface RequestOptions<TBody extends RequestBody = RequestBody, TRespon
   params?: QueryParams;
   retries?: number;
   timeout?: number;
-  cache?: RequestCache;
+  cache?: NextJSRequestCache;
   next?: NextCacheOptions;
   headers?: Record<string, string>;
   logTypes?: boolean;
-  transform?: <T = TResponse, R = TResponse>(data: T) => R;
-  onError?: (error: ApiError, attempt: number) => void;
+  transform?: (data: TResponse) => TResponse;
 }
 
 /**
@@ -56,190 +57,100 @@ export interface ApiError {
   readonly name: string;
   readonly message: string;
   readonly status: number;
-  readonly attempt?: number;
-  readonly context?: {
-    url?: string;
-    method?: HttpMethod;
-    timestamp: number;
-    stack?: string;
-  };
 }
 
 /**
  * Response object for API requests.
  */
 export type ApiResponse<T = unknown> =
-  | {
-      success: true;
-      status: number;
-      data: T;
-      headers: Headers;
-      cache?: { hit: boolean; key?: string };
-    }
-  | {
-      success: false;
-      status: number;
-      error: ApiError;
-      data: null;
-    };
+  | { success: true; status: number; data: T }
+  | { success: false; status: number; error: ApiError; data: null };
 
-// Configuration
+// Optimized configuration with pre-calculated values
 const CONFIG = {
   API_URL: process.env.NEXT_PUBLIC_API_URL ?? process.env.BASE_URL ?? '',
   IS_DEV: process.env.NODE_ENV === 'development',
-  RETRY_CODES: new Set<number>([429, 500, 502, 503, 504]),
+  RETRY_CODES: new Set([429, 500, 502, 503, 504]),
   IDEMPOTENT_METHODS: new Set<HttpMethod>(['GET', 'PUT', 'DELETE']),
-  MAX_CONCURRENT: 10,
-  DEFAULT_TIMEOUT: 30000,
+  DEFAULT_TIMEOUT: 10000,
   DEFAULT_RETRIES: 1,
-  SENSITIVE_KEY_REGEX: /password|token|secret/i,
   NON_ALPHANUMERIC_REGEX: /[^a-zA-Z0-9]/g,
-  AUTH_CREDENTIALS: {
-    username: process.env.AUTH_USERNAME,
-    password: process.env.AUTH_PASSWORD,
-    token: process.env.API_TOKEN,
-  },
+  SENSITIVE_KEY_REGEX: /password|token|secret/i,
+  // Pre-calculate auth header once for performance
+  AUTH_HEADER: (() => {
+    const username = process.env.AUTH_USERNAME;
+    const password = process.env.AUTH_PASSWORD;
+    const token = process.env.API_TOKEN;
+
+    if (username && password) {
+      return `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`;
+    }
+    return token ? `Bearer ${token}` : undefined;
+  })(),
 } as const;
 
-// Auth header generation
-const getAuthHeader = (): string | undefined => {
-  const { username, password, token } = CONFIG.AUTH_CREDENTIALS;
-
-  if (!username && !password && !token) {
-    if (CONFIG.IS_DEV) console.warn('[SafeFetch] No authentication credentials provided');
-    return undefined;
-  }
-
-  if (username && password) {
-    const encoded = Buffer.from(`${username}:${password}`, 'utf8').toString('base64');
-    return `Basic ${encoded}`;
-  }
-
-  return token ? `Bearer ${token}` : undefined;
-};
-
-// Error creation
-const createApiError = (
-  name: string,
-  message: string,
-  status: number,
-  attempt?: number,
-  context?: Omit<ApiError['context'], 'timestamp'>,
-): ApiError => ({
+// Simplified error creation
+const createError = (name: string, message: string, status: number): ApiError => ({
   name,
   message,
   status,
-  attempt,
-  context: {
-    timestamp: Date.now(),
-    ...context,
-    ...(CONFIG.IS_DEV && { stack: new Error().stack }),
-  },
 });
 
-// URL building
+// Fast URL building
 const buildUrl = (endpoint: string, params?: QueryParams): string => {
-  try {
-    let url: URL;
+  let url = endpoint.startsWith('http')
+    ? endpoint
+    : `${CONFIG.API_URL}/${endpoint.replace(/^\//, '')}`;
 
-    if (endpoint.startsWith('http://') || endpoint.startsWith('https://')) {
-      url = new URL(endpoint);
-    } else {
-      const baseUrl = CONFIG.API_URL.replace(/\/+$/, '') || 'http://localhost';
-      const cleanEndpoint = endpoint.replace(/^\//, '');
-      url = new URL(`${baseUrl}/${cleanEndpoint}`);
+  if (params) {
+    const searchParams = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      if (value != null) searchParams.append(key, String(value));
     }
-
-    if (params) {
-      Object.entries(params).forEach(([key, value]) => {
-        if (value !== null && value !== undefined) {
-          url.searchParams.append(key, String(value));
-        }
-      });
-    }
-
-    return url.toString();
-  } catch (error) {
-    throw createApiError(
-      'URLError',
-      `URL construction failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      400,
-      undefined,
-      { url: '[REDACTED]' },
-    );
+    const query = searchParams.toString();
+    if (query) url += `?${query}`;
   }
+
+  return url;
 };
 
-// Header building
+// Optimized header building
 const buildHeaders = (data?: RequestBody, custom?: Record<string, string>): HeadersInit => {
-  const headers: Record<string, string> = {
-    Accept: 'application/json',
-  };
+  const headers: Record<string, string> = { Accept: 'application/json' };
 
-  const authHeader = getAuthHeader();
-  if (authHeader) {
-    headers.Authorization = authHeader;
-  }
-
-  if (data && !(data instanceof FormData)) {
-    headers['Content-Type'] = 'application/json';
-  }
-
-  if (custom) {
-    Object.assign(headers, custom);
-  }
+  if (CONFIG.AUTH_HEADER) headers.Authorization = CONFIG.AUTH_HEADER;
+  if (data && !(data instanceof FormData)) headers['Content-Type'] = 'application/json';
+  if (custom) Object.assign(headers, custom);
 
   return headers;
 };
 
-// Response parsing
-const parseResponse = async <T>(response: Response): Promise<T> => {
-  const contentType = response.headers.get('content-type')?.toLowerCase() || '';
+// Simple timeout with proper error handling
+const withTimeout = async <T>(promise: Promise<T>, ms: number): Promise<T> => {
+  let timeoutId: NodeJS.Timeout | undefined;
 
-  if (contentType.includes('json')) {
-    return (await response.json()) as T;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(createError('TimeoutError', `Request timed out after ${ms}ms`, 408));
+    }, ms);
+  });
+
+  try {
+    const result = await Promise.race([promise, timeoutPromise]);
+    if (timeoutId) clearTimeout(timeoutId);
+    return result;
+  } catch (error) {
+    if (timeoutId) clearTimeout(timeoutId);
+    throw error;
   }
-  return (await response.text()) as T;
 };
 
-// Timeout handling
-const createTimeout = (ms: number): { controller: AbortController; cleanup: () => void } => {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => {
-    controller.abort(new Error('Request timeout'));
-  }, ms);
-
-  return {
-    controller,
-    cleanup: () => clearTimeout(timeoutId),
-  };
-};
-
-// Delay with exponential backoff
-const delay = (attempt: number): Promise<void> => {
-  const baseDelay = Math.min(1000 * 2 ** attempt, 10000);
-  const jitteredDelay = baseDelay + Math.random() * 100;
-  return new Promise((resolve) => setTimeout(resolve, jitteredDelay));
-};
-
-// Retry logic
-const shouldRetryRequest = (
-  error: ApiError,
-  attempt: number,
-  maxRetries: number,
-  method: HttpMethod,
-): boolean =>
-  attempt < maxRetries &&
-  CONFIG.IDEMPOTENT_METHODS.has(method) &&
-  (error.name === 'AbortError' || CONFIG.RETRY_CODES.has(error.status));
-
-// Data sanitization
+// Data sanitization for logTypes
 const sanitizeData = (data: unknown): unknown => {
   if (!data || typeof data !== 'object') return data;
   if (Array.isArray(data)) return data.map(sanitizeData);
 
   const result = { ...data } as Record<string, unknown>;
-
   for (const [key, value] of Object.entries(result)) {
     if (CONFIG.SENSITIVE_KEY_REGEX.test(key)) {
       result[key] = '[REDACTED]';
@@ -247,11 +158,10 @@ const sanitizeData = (data: unknown): unknown => {
       result[key] = sanitizeData(value);
     }
   }
-
   return result;
 };
 
-// Type inference logging
+// Type inference logging - exactly as before
 const logTypes = <T>(
   endpoint: string,
   data: T,
@@ -300,85 +210,79 @@ const logTypes = <T>(
   }
 };
 
-// Concurrent request limiting
-const requestQueue = new Set<Promise<unknown>>();
-const limitConcurrentRequests = async <T>(request: () => Promise<T>): Promise<T> => {
-  while (requestQueue.size >= CONFIG.MAX_CONCURRENT) {
-    await Promise.race(requestQueue);
-  }
+// Exponential backoff delay
+const delay = (attempt: number) =>
+  new Promise((resolve) => setTimeout(resolve, Math.min(1000 * 2 ** attempt, 5000)));
 
-  const promise = request().finally(() => {
-    requestQueue.delete(promise);
-  });
-
-  requestQueue.add(promise);
-  return promise;
-};
-
-// Fetch execution
-async function executeFetch<TResponse>(
+// Core fetch function with proper error details
+async function executeFetch<T>(
   url: string,
   method: HttpMethod,
   headers: HeadersInit,
-  body: BodyInit | undefined,
-  cache: RequestCache,
-  timeout: number,
-  nextOptions: { next?: NextCacheOptions },
-  attempt: number,
-): Promise<ApiResponse<TResponse>> {
-  return limitConcurrentRequests(async () => {
-    const timeoutController = createTimeout(timeout);
+  body?: BodyInit,
+  cache: NextJSRequestCache = 'default',
+  nextOptions?: { next?: NextCacheOptions },
+): Promise<ApiResponse<T>> {
+  try {
+    const response = await fetch(url, {
+      method,
+      headers,
+      body,
+      cache,
+      ...nextOptions,
+    });
+
+    const contentType = response.headers.get('content-type') || '';
+    let data: T;
 
     try {
-      const response = await nextFetch(url, {
-        method,
-        headers,
-        body,
-        cache,
-        signal: timeoutController.controller.signal,
-        ...nextOptions,
-      });
-
-      const data = await parseResponse<TResponse>(response);
-
-      if (response.ok) {
-        const cacheStatus =
-          response.headers.get('x-cache-status') || response.headers.get('cf-cache-status');
-        const cacheHit = cacheStatus === 'hit' || cacheStatus === 'HIT';
-
-        return {
-          success: true,
-          data,
-          status: response.status,
-          headers: response.headers,
-          cache: { hit: cacheHit },
-        };
-      }
-
+      data = contentType.includes('json') ? await response.json() : await response.text();
+    } catch (_parseError) {
       return {
         success: false,
-        error: createApiError('HttpError', `HTTP ${response.status}`, response.status, attempt, {
-          url: '[REDACTED]',
-          method,
-        }),
         status: response.status,
+        error: createError('ParseError', 'Failed to parse response', response.status),
         data: null,
       };
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+    }
+
+    if (response.ok) {
+      return { success: true, status: response.status, data };
+    }
+
+    // Return actual HTTP error with response data if available
+    const errorMessage =
+      typeof data === 'string'
+        ? data
+        : data && typeof data === 'object' && 'message' in data
+          ? String(data.message)
+          : `HTTP ${response.status} ${response.statusText}`;
+
+    return {
+      success: false,
+      status: response.status,
+      error: createError('HttpError', errorMessage, response.status),
+      data: null,
+    };
+  } catch (err) {
+    // Network errors, timeouts, etc.
+    if (err instanceof Error && err.message.includes('timed out')) {
       return {
         success: false,
-        error: createApiError('NetworkError', errorMessage, 500, attempt, {
-          url: '[REDACTED]',
-          method,
-        }),
-        status: 500,
+        status: 408,
+        error: createError('TimeoutError', err.message, 408),
         data: null,
       };
-    } finally {
-      timeoutController.cleanup();
     }
-  });
+
+    const errorMessage = err instanceof Error ? err.message : 'Network error occurred';
+    return {
+      success: false,
+      status: 0, // Network error
+      error: createError('NetworkError', errorMessage, 0),
+      data: null,
+    };
+  }
 }
 
 /**
@@ -391,37 +295,38 @@ async function executeFetch<TResponse>(
  * @returns A promise resolving to the API response.
  * @example
  * ```ts
- * // Comprehensive example using all available options
- * const response = await apiRequest<
- *   { id: number; name: string; email: string }, // Response type
- *   { name: string; email: string } // Body type
- * >(
- *   'POST',
- *   '/api/users',
- *   {
- *     data: { name: 'John Doe', email: 'john@example.com' }, // Request body
- *     params: { role: 'admin', active: true }, // Query parameters
- *     retries: 3, // Retry up to 3 times
- *     timeout: 10000, // 10-second timeout
- *     cache: 'no-store', // Cache mode
- *     next: { revalidate: 3600, tags: ['users'], key: 'user-create' }, // Next.js cache options
- *     headers: { 'X-Custom-Header': 'value' }, // Custom headers
- *     logTypes: true, // Log inferred types in development
- *     transform: (data) => ({ // Transform response data
- *       ...data,
- *       name: data.name.toUpperCase(),
- *     }),
- *     onError: (error, attempt) => { // Error handling callback
- *       console.error(`Attempt ${attempt + 1} failed: ${error.message}`);
- *     },
- *   }
- * );
+ * // Basic usage with type safety
+ * const response = await apiRequest<UserResponse>('GET', '/api/users', {
+ *   params: { page: 1, limit: 10 },
+ *   logTypes: true, // Shows inferred types in development
+ *   timeout: 5000,
+ *   retries: 2,
+ *   cache: 'no-store' // Only Next.js supported cache options
+ * });
  *
  * if (apiRequest.isSuccess(response)) {
- *   console.log(response.data); // Strongly typed: { id: number; name: string; email: string }
+ *   console.log(response.data); // Fully typed UserResponse
  * } else {
- *   console.error(response.error.message); // Access error details
+ *   console.error(response.error.message); // Real error message
  * }
+ *
+ * // POST with data and caching
+ * const createResponse = await apiRequest<User, CreateUserData>('POST', '/api/users', {
+ *   data: { name: 'John', email: 'john@example.com' },
+ *   cache: 'force-cache', // Cache the response
+ *   next: { revalidate: 3600, tags: ['users'] },
+ *   transform: (user) => ({ ...user, processed: true })
+ * });
+ *
+ * // Different cache strategies
+ * const freshData = await apiRequest('GET', '/api/real-time-data', {
+ *   cache: 'no-store' // Always fetch fresh data
+ * });
+ *
+ * const cachedData = await apiRequest('GET', '/api/static-data', {
+ *   cache: 'force-cache', // Use cache if available
+ *   next: { revalidate: 86400 } // Revalidate daily
+ * });
  * ```
  */
 export default async function apiRequest<
@@ -432,87 +337,55 @@ export default async function apiRequest<
   endpoint: string,
   options: RequestOptions<TBody, TResponse> = {},
 ): Promise<ApiResponse<TResponse>> {
-  // Validate HTTP method
-  if (!HTTP_METHODS.includes(method)) {
-    const error = createApiError(
-      'ValidationError',
-      `Invalid HTTP method: ${method}`,
-      400,
-      undefined,
-      {
-        url: '[REDACTED]',
-      },
-    );
-    return { success: false, status: 400, error, data: null };
-  }
-
-  // Extract options with defaults
   const {
     data,
     params,
     retries = CONFIG.DEFAULT_RETRIES,
     timeout = CONFIG.DEFAULT_TIMEOUT,
     cache = 'default',
-    next: nextCacheOptions,
+    next,
     headers: customHeaders,
     logTypes: shouldLogTypes = false,
     transform,
-    onError,
   } = options;
 
-  const startTime = Date.now();
-  let url: string, headers: HeadersInit, body: BodyInit | undefined;
+  const startTime = performance.now();
+  let url: string;
+  let headers: HeadersInit;
+  let body: BodyInit | undefined;
 
   try {
     url = buildUrl(endpoint, params);
     headers = buildHeaders(data, customHeaders);
 
-    // Prepare request body
     if (data) {
-      if (data instanceof FormData) {
-        body = data;
-      } else if (typeof data === 'string') {
-        body = data;
-      } else {
-        body = JSON.stringify(data);
-      }
-    } else {
-      body = undefined;
+      body =
+        data instanceof FormData ? data : typeof data === 'string' ? data : JSON.stringify(data);
     }
   } catch (error) {
-    const apiError = createApiError(
-      'ValidationError',
-      `Request validation failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      400,
-      undefined,
-      { url: '[REDACTED]', method },
-    );
-    return { success: false, status: 400, error: apiError, data: null };
+    const errorMessage = error instanceof Error ? error.message : 'Request validation failed';
+    return {
+      success: false,
+      status: 400,
+      error: createError('ValidationError', errorMessage, 400),
+      data: null,
+    };
   }
 
-  const nextOptions = nextCacheOptions ? { next: nextCacheOptions } : {};
+  const nextOptions = next ? { next } : undefined;
   let lastError: ApiError | undefined;
 
   // Retry loop
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const result = await executeFetch<TResponse>(
-      url,
-      method,
-      headers,
-      body,
-      cache,
-      timeout,
-      nextOptions,
-      attempt,
-    );
+    const fetchPromise = executeFetch<TResponse>(url, method, headers, body, cache, nextOptions);
+    const result = await withTimeout(fetchPromise, timeout);
 
     if (result.success) {
       const finalData = transform ? transform(result.data) : result.data;
 
       if (shouldLogTypes) {
         logTypes(endpoint, finalData, {
-          cached: result.cache?.hit,
-          duration: Date.now() - startTime,
+          duration: performance.now() - startTime,
         });
       }
 
@@ -520,19 +393,25 @@ export default async function apiRequest<
     }
 
     lastError = result.error;
-    onError?.(lastError, attempt);
 
-    // Check if we should retry
-    if (!shouldRetryRequest(lastError, attempt, retries, method)) {
-      break;
-    }
-
-    if (attempt < retries) {
+    // Should retry?
+    if (
+      attempt < retries &&
+      CONFIG.IDEMPOTENT_METHODS.has(method) &&
+      CONFIG.RETRY_CODES.has(result.status)
+    ) {
       await delay(attempt);
+    } else {
+      break;
     }
   }
 
-  return { success: false, status: lastError!.status, error: lastError!, data: null };
+  return {
+    success: false,
+    status: lastError?.status ?? 500,
+    error: lastError ?? createError('UnknownError', 'Request failed', 500),
+    data: null,
+  };
 }
 
 /**
@@ -554,9 +433,9 @@ apiRequest.isError = <T>(
  * @example
  * ```ts
  * // Create a cached request
- * const getCachedUsers = apiRequest.cacheHelpers.cached<
- *   { users: { id: number; name: string }[] }
- * >('users_cache_key', 3600, ['users']);
+ * const getCachedUsers = apiRequest.cacheHelpers.cached<UserListResponse>(
+ *   'users_list', 3600, ['users']
+ * );
  *
  * const response = await getCachedUsers('GET', '/api/users');
  * if (apiRequest.isSuccess(response)) {
@@ -565,6 +444,15 @@ apiRequest.isError = <T>(
  *
  * // Revalidate cache
  * apiRequest.cacheHelpers.revalidateByTag('users');
+ *
+ * // Different cache strategies with helpers
+ * const getStaticData = apiRequest.cacheHelpers.cached<StaticData>(
+ *   'static_data', 86400, ['static'] // Cache for 24 hours
+ * );
+ *
+ * const getRealTimeData = apiRequest.cacheHelpers.cached<RealTimeData>(
+ *   'realtime_data', 60, ['realtime'] // Cache for 1 minute
+ * );
  * ```
  */
 apiRequest.cacheHelpers = {
@@ -582,3 +470,4 @@ apiRequest.cacheHelpers = {
       { revalidate: revalidateSeconds, tags },
     ),
 };
+
