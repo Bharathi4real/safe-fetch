@@ -398,7 +398,12 @@ const isUrlSafe = (url: string, allowedHosts?: string[]): boolean => {
 const buildUrl = (endpoint: string, params?: QueryParams, allowedHosts?: string[]): string => {
   let finalUrl: URL;
 
-  if (endpoint.startsWith('http://') || endpoint.startsWith('https://')) {
+  // SSRF prevention: require allowlist for absolute URLs
+  const isAbsoluteUrl = endpoint.startsWith('http://') || endpoint.startsWith('https://');
+  if (isAbsoluteUrl) {
+    if (!allowedHosts || allowedHosts.length === 0) {
+      throw new Error('SSRF protection: allowedHosts must be configured and non-empty for absolute URLs');
+    }
     if (!isUrlSafe(endpoint, allowedHosts)) throw new Error('URL not allowed: potential SSRF risk');
     finalUrl = new URL(endpoint);
   } else {
@@ -408,6 +413,10 @@ const buildUrl = (endpoint: string, params?: QueryParams, allowedHosts?: string[
       ? new URL(endpoint, BASE_URL).toString()
       : new URL(endpoint, basePath).toString();
 
+    // SSRF prevention: required allowlist (for BASE_URL+relative as well)
+    if (!allowedHosts || allowedHosts.length === 0) {
+      throw new Error('SSRF protection: allowedHosts must be configured and non-empty for relative URLs');
+    }    
     if (!isUrlSafe(fullUrl, allowedHosts)) throw new Error('URL not allowed: potential SSRF risk');
     finalUrl = endpoint.startsWith('/') ? new URL(endpoint, BASE_URL) : new URL(endpoint, basePath);
   }
@@ -1263,13 +1272,21 @@ async function apiRequest<
     transform,
     onError,
     shouldRetry: customShouldRetry,
-    allowedHosts,
+    allowedHosts: userAllowedHosts,
     maxResponseSize = MAX_RESPONSE_SIZE_DEFAULT,
     maxRequestBodySize = MAX_REQUEST_BODY_SIZE_DEFAULT,
     stream = false,
     beforeRequest,
     afterResponse,
   } = options;
+
+  // Server-controlled host allowlist to prevent SSRF (edit this to list your legitimate API hosts)
+  const SAFE_ALLOWED_HOSTS = Array.isArray(CONFIG?.security?.allowedHosts)
+    ? CONFIG.security.allowedHosts
+    : ["api.example.com"]; // <-- Change to actual backend host(s)
+
+  // Use only SAFE_ALLOWED_HOSTS, never user input. If you want to allow user config, combine with SAFE_ALLOWED_HOSTS
+  const allowedHosts = SAFE_ALLOWED_HOSTS;
 
   const handleLogTypes = (endpoint: string, data: unknown, prefix = ''): void => {
     if (!logTypesOption) return;
