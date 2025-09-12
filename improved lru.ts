@@ -1,9 +1,9 @@
 /**
- * Optimized SafeFetch – High Performance HTTP Client for Next.js
+ * SafeFetch – Typed Fetch utility for Next.js
  * (c) 2025 Bharathi4real – BSD 3-Clause License
  * Supports Next.js 14.x.x & 15.x.x
  *
- * Improved: O(1) LRU, request coalescing, worker-pool priority queue, full-jitter backoff,
+ * Features: O(1) LRU, request coalescing, worker-pool priority queue, full-jitter backoff,
  * incremental stream decoding, failure decay, stable param serialization.
  */
 
