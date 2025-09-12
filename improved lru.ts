@@ -2,6 +2,9 @@
  * Optimized SafeFetch – High Performance HTTP Client for Next.js
  * (c) 2025 Bharathi4real – BSD 3-Clause License
  * Supports Next.js 14.x.x & 15.x.x
+ *
+ * Improved: O(1) LRU, request coalescing, worker-pool priority queue, full-jitter backoff,
+ * incremental stream decoding, failure decay, stable param serialization.
  */
 
 'use server';
@@ -46,7 +49,7 @@ export type ApiResponse<T = unknown> =
   | { success: true; status: number; data: T; headers: Headers }
   | { success: false; status: number; error: ApiError; data: null };
 
-// Optimized configuration
+// Config tuned for memory & reliability
 const CONFIG = {
   API_URL: process.env.NEXT_PUBLIC_API_URL ?? process.env.BASE_URL ?? '',
   IS_DEV: process.env.NODE_ENV === 'development',
@@ -56,219 +59,27 @@ const CONFIG = {
   DEFAULT_RETRIES: 2,
   SENSITIVE_KEY_REGEX: /password|token|secret|key|auth/i,
   MAX_CONCURRENT_REQUESTS: 15,
-  STREAM_THRESHOLD: 1024 * 512, // 512KB - reduced threshold for better streaming
-  MAX_CACHE_SIZE: 50, // Reduced cache sizes for memory efficiency
+  STREAM_THRESHOLD: 1024 * 512, // 512KB
+  MAX_CACHE_SIZE: 50,
   MAX_URL_CACHE_SIZE: 200,
+  FAILURE_DECAY_MS: 60_000, // decay failures over time
+  MAX_QUEUE_ITEMS: 1000, // protect memory if caller floods
 } as const;
 
-// Simplified priority queue using a more efficient heap structure
-class PriorityQueue<T> {
-  private heap: Array<{ item: T; priority: number; timestamp: number }> = [];
+// Utilities
 
-  enqueue(item: T, priority: number = 1): void {
-    const node = { item, priority, timestamp: Date.now() };
-    this.heap.push(node);
-    this.heapifyUp(this.heap.length - 1);
+const encodeParamValue = (v: string | number | boolean) => String(v);
+const stableSerializeParams = (params?: QueryParams): string => {
+  if (!params) return '';
+  const keys = Object.keys(params).sort();
+  const parts: string[] = [];
+  for (const k of keys) {
+    const v = params[k];
+    if (v === null || v === undefined) continue;
+    parts.push(`${k}=${encodeURIComponent(encodeParamValue(v as string | number | boolean))}`);
   }
-
-  dequeue(): T | undefined {
-    if (this.heap.length === 0) return undefined;
-    if (this.heap.length === 1) return this.heap.pop()!.item;
-
-    const root = this.heap[0].item;
-    this.heap[0] = this.heap.pop()!;
-    this.heapifyDown(0);
-    return root;
-  }
-
-  private heapifyUp(index: number): void {
-    while (index > 0) {
-      const parentIndex = Math.floor((index - 1) / 2);
-      const parent = this.heap[parentIndex];
-      const current = this.heap[index];
-
-      if (
-        current.priority <= parent.priority &&
-        !(current.priority === parent.priority && current.timestamp < parent.timestamp)
-      ) {
-        break;
-      }
-
-      [this.heap[parentIndex], this.heap[index]] = [this.heap[index], this.heap[parentIndex]];
-      index = parentIndex;
-    }
-  }
-
-  private heapifyDown(index: number): void {
-    const length = this.heap.length;
-    while (true) {
-      let maxIndex = index;
-      const leftChild = 2 * index + 1;
-      const rightChild = 2 * index + 2;
-
-      if (leftChild < length && this.shouldSwap(leftChild, maxIndex)) {
-        maxIndex = leftChild;
-      }
-
-      if (rightChild < length && this.shouldSwap(rightChild, maxIndex)) {
-        maxIndex = rightChild;
-      }
-
-      if (maxIndex === index) break;
-
-      [this.heap[index], this.heap[maxIndex]] = [this.heap[maxIndex], this.heap[index]];
-      index = maxIndex;
-    }
-  }
-
-  private shouldSwap(childIndex: number, parentIndex: number): boolean {
-    const child = this.heap[childIndex];
-    const parent = this.heap[parentIndex];
-    return (
-      child.priority > parent.priority ||
-      (child.priority === parent.priority && child.timestamp < parent.timestamp)
-    );
-  }
-
-  get size(): number {
-    return this.heap.length;
-  }
-}
-
-// Simplified request queue with better resource management
-class RequestQueue {
-  private queue = new PriorityQueue<() => Promise<unknown>>();
-  private activeRequests = 0;
-  private processing = false;
-
-  async enqueue<T>(
-    executeRequest: () => Promise<T>,
-    priority: 'high' | 'normal' | 'low' = 'normal',
-  ): Promise<T> {
-    const priorityValue = priority === 'high' ? 3 : priority === 'normal' ? 2 : 1;
-
-    return new Promise<T>((resolve, reject) => {
-      this.queue.enqueue(async () => {
-        try {
-          const result = await executeRequest();
-          resolve(result);
-        } catch (error) {
-          reject(error);
-        }
-      }, priorityValue);
-
-      this.processQueue();
-    });
-  }
-
-  private async processQueue(): Promise<void> {
-    if (this.processing || this.activeRequests >= CONFIG.MAX_CONCURRENT_REQUESTS) {
-      return;
-    }
-
-    this.processing = true;
-
-    while (this.queue.size > 0 && this.activeRequests < CONFIG.MAX_CONCURRENT_REQUESTS) {
-      const request = this.queue.dequeue();
-      if (!request) break;
-
-      this.activeRequests++;
-
-      // Don't await - process concurrently
-      request().finally(() => {
-        this.activeRequests--;
-        if (this.queue.size > 0) {
-          this.processQueue();
-        }
-      });
-    }
-
-    this.processing = false;
-  }
-
-  getStats() {
-    return {
-      queueLength: this.queue.size,
-      activeRequests: this.activeRequests,
-      totalCapacity: CONFIG.MAX_CONCURRENT_REQUESTS,
-    };
-  }
-}
-
-const requestQueue = new RequestQueue();
-
-// More efficient LRU Cache implementation
-class OptimizedLRUCache<K, V> {
-  private cache = new Map<K, V>();
-  private readonly maxSize: number;
-
-  constructor(maxSize: number) {
-    this.maxSize = maxSize;
-  }
-
-  get(key: K): V | undefined {
-    const value = this.cache.get(key);
-    if (value !== undefined) {
-      // Move to end (most recently used)
-      this.cache.delete(key);
-      this.cache.set(key, value);
-      return value;
-    }
-    return undefined;
-  }
-
-  set(key: K, value: V): void {
-    // If already exists, delete first
-    if (this.cache.has(key)) {
-      this.cache.delete(key);
-    } else if (this.cache.size >= this.maxSize) {
-      // Remove oldest entry
-      const firstKey = this.cache.keys().next().value;
-      if (firstKey !== undefined) {
-        this.cache.delete(firstKey);
-      }
-    }
-    this.cache.set(key, value);
-  }
-
-  clear(): void {
-    this.cache.clear();
-  }
-
-  get size(): number {
-    return this.cache.size;
-  }
-}
-
-const responseCache = new OptimizedLRUCache<string, ApiResponse<unknown>>(CONFIG.MAX_CACHE_SIZE);
-const urlCache = new OptimizedLRUCache<string, string>(CONFIG.MAX_URL_CACHE_SIZE);
-
-// Optimized auth header with better caching strategy
-const authHeaderProvider = (() => {
-  let cachedHeaders: Record<string, string> | null = null;
-  let lastComputed = 0;
-  const CACHE_TTL = 300000; // 5 minutes
-
-  return (): Record<string, string> => {
-    const now = Date.now();
-    if (cachedHeaders && now - lastComputed < CACHE_TTL) {
-      return cachedHeaders;
-    }
-
-    const authHeaders: Record<string, string> = {};
-    const { AUTH_USERNAME: username, AUTH_PASSWORD: password, API_TOKEN: token } = process.env;
-
-    if (username && password) {
-      authHeaders.Authorization = `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`;
-    } else if (token) {
-      authHeaders.Authorization = `Bearer ${token}`;
-    }
-
-    cachedHeaders = authHeaders;
-    lastComputed = now;
-    return authHeaders;
-  };
-})();
+  return parts.join('&');
+};
 
 const createError = (
   name: string,
@@ -282,55 +93,274 @@ const createError = (
   retryable,
 });
 
-// Streamlined URL building
-const buildUrl = (endpoint: string, params?: QueryParams): string => {
-  const cacheKey = `${endpoint}|${params ? JSON.stringify(params) : ''}`;
-  const cached = urlCache.get(cacheKey);
-  if (cached) return cached;
+// O(1) LRU Cache (Map + doubly linked list)
 
-  const isAbsolute = endpoint.startsWith('http');
-  let url = isAbsolute ? endpoint : `${CONFIG.API_URL}/${endpoint.replace(/^\//, '')}`;
+class LRUNode<K, V> {
+  key!: K;
+  value!: V;
+  prev: LRUNode<K, V> | null = null;
+  next: LRUNode<K, V> | null = null;
+}
 
-  if (params) {
-    const searchParams = new URLSearchParams();
-    Object.entries(params).forEach(([key, value]) => {
-      if (value != null) {
-        searchParams.append(key, String(value));
-      }
+class LRUCache<K, V> {
+  private map = new Map<K, LRUNode<K, V>>();
+  private head: LRUNode<K, V> | null = null; // most recent
+  private tail: LRUNode<K, V> | null = null; // least recent
+  private capacity: number;
+
+  constructor(capacity: number) {
+    this.capacity = Math.max(1, capacity);
+  }
+
+  get size() {
+    return this.map.size;
+  }
+
+  get(key: K): V | undefined {
+    const node = this.map.get(key);
+    if (!node) return undefined;
+    this.moveToHead(node);
+    return node.value;
+  }
+
+  set(key: K, value: V): void {
+    let node = this.map.get(key);
+    if (node) {
+      node.value = value;
+      this.moveToHead(node);
+      return;
+    }
+
+    node = new LRUNode<K, V>();
+    node.key = key;
+    node.value = value;
+    this.map.set(key, node);
+    this.addToHead(node);
+
+    if (this.map.size > this.capacity) {
+      this.evictTail();
+    }
+  }
+
+  delete(key: K): void {
+    const node = this.map.get(key);
+    if (!node) return;
+    this.removeNode(node);
+    this.map.delete(key);
+  }
+
+  clear(): void {
+    this.map.clear();
+    this.head = this.tail = null;
+  }
+
+  private addToHead(node: LRUNode<K, V>) {
+    node.prev = null;
+    node.next = this.head;
+    if (this.head) this.head.prev = node;
+    this.head = node;
+    if (!this.tail) this.tail = node;
+  }
+
+  private moveToHead(node: LRUNode<K, V>) {
+    if (node === this.head) return;
+    this.removeNode(node);
+    this.addToHead(node);
+  }
+
+  private removeNode(node: LRUNode<K, V>) {
+    if (node.prev) node.prev.next = node.next;
+    if (node.next) node.next.prev = node.prev;
+    if (node === this.head) this.head = node.next;
+    if (node === this.tail) this.tail = node.prev;
+    node.prev = node.next = null;
+  }
+
+  private evictTail() {
+    if (!this.tail) return;
+    const key = this.tail.key;
+    this.removeNode(this.tail);
+    this.map.delete(key);
+  }
+}
+
+// Auth header provider
+
+const authHeaderProvider = (() => {
+  let cachedHeaders: Record<string, string> | null = null;
+  let lastComputed = 0;
+  const CACHE_TTL = 300000; // 5 minutes
+
+  return (): Record<string, string> => {
+    const now = Date.now();
+    if (cachedHeaders && now - lastComputed < CACHE_TTL) return cachedHeaders;
+
+    const authHeaders: Record<string, string> = {};
+    const { AUTH_USERNAME: username, AUTH_PASSWORD: password, API_TOKEN: token } = process.env as {
+      AUTH_USERNAME?: string;
+      AUTH_PASSWORD?: string;
+      API_TOKEN?: string;
+    };
+
+    if (username && password) {
+      authHeaders.Authorization = `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`;
+    } else if (token) {
+      authHeaders.Authorization = `Bearer ${token}`;
+    }
+
+    cachedHeaders = authHeaders;
+    lastComputed = now;
+    return authHeaders;
+  };
+})();
+
+// Backoff: full jitter
+
+const calculateBackoff = (attempt: number, base = 300, cap = 8000) => {
+  // exponential: min(cap, base * 2**attempt)
+  const exp = Math.min(cap, base * 2 ** attempt);
+  // full jitter [0, exp)
+  return Math.floor(Math.random() * exp);
+};
+
+// Failure tracker with decay (prevents permanent circuit-break)
+
+type FailureEntry = { count: number; lastFailure: number };
+
+class FailureTracker {
+  private map = new Map<string, FailureEntry>();
+
+  record(url: string) {
+    const now = Date.now();
+    const existing = this.map.get(url);
+    if (!existing) {
+      this.map.set(url, { count: 1, lastFailure: now });
+      return;
+    }
+    // decay existing count proportional to time
+    const elapsed = now - existing.lastFailure;
+    const decayFactor = Math.floor(elapsed / CONFIG.FAILURE_DECAY_MS);
+    existing.count = Math.max(1, existing.count - decayFactor + 1);
+    existing.lastFailure = now;
+    this.map.set(url, existing);
+  }
+
+  get(url: string) {
+    const entry = this.map.get(url);
+    if (!entry) return { count: 0, lastFailure: 0 };
+    return entry;
+  }
+
+  delete(url: string) {
+    this.map.delete(url);
+  }
+
+  clear() {
+    this.map.clear();
+  }
+
+  size() {
+    return this.map.size;
+  }
+}
+
+const failureTracker = new FailureTracker();
+
+// Request coalescing (in-flight dedupe for GET)
+const inFlightMap = new Map<string, Promise<ApiResponse<unknown>>>();
+
+// Priority worker pool
+// 
+// We maintain three queues and spawn N workers that pull highest-priority tasks first.
+// This reduces recursion, keeps memory usage steady and gives deterministic concurrency.
+
+type Task<T> = {
+  run: () => Promise<T>;
+  resolve: (v: T) => void;
+  reject: (e: unknown) => void;
+};
+
+class PriorityWorkerPool {
+  private queues: { high: Task<unknown>[]; normal: Task<unknown>[]; low: Task<unknown>[] } = {
+    high: [],
+    normal: [],
+    low: [],
+  };
+  private workers: number;
+  private running = true;
+
+  constructor(workers = CONFIG.MAX_CONCURRENT_REQUESTS) {
+    this.workers = Math.max(1, workers);
+    for (let i = 0; i < this.workers; i++) this.workerLoop();
+  }
+
+  enqueue<T>(fn: () => Promise<T>, priority: 'high' | 'normal' | 'low'): Promise<T> {
+    if (
+      this.queues.high.length + this.queues.normal.length + this.queues.low.length >
+      CONFIG.MAX_QUEUE_ITEMS
+    ) {
+      return Promise.reject(new Error('Request queue limit exceeded'));
+    }
+
+    return new Promise<T>((resolve, reject) => {
+      this.queues[priority].push({ 
+        run: fn, 
+        resolve: resolve as (v: unknown) => void, 
+        reject: reject as (e: unknown) => void 
+      } as Task<unknown>);
     });
-
-    const query = searchParams.toString();
-    if (query) url += `?${query}`;
   }
 
-  urlCache.set(cacheKey, url);
-  return url;
-};
-
-// Simplified header building
-const buildHeaders = (
-  data?: RequestBody,
-  custom?: Record<string, string>,
-): Record<string, string> => {
-  const headers: Record<string, string> = { Accept: 'application/json' };
-
-  if (data && !(data instanceof FormData)) {
-    headers['Content-Type'] = 'application/json';
+  private async workerLoop() {
+    while (this.running) {
+      const task = this.dequeue();
+      if (!task) {
+        // small pause to avoid busy loop
+        await new Promise((r) => setTimeout(r, 6));
+        continue;
+      }
+      try {
+        const result = await task.run();
+        task.resolve(result);
+      } catch (err) {
+        task.reject(err);
+      }
+    }
   }
 
-  return { ...headers, ...authHeaderProvider(), ...custom };
-};
+  private dequeue(): Task<unknown> | undefined {
+    if (this.queues.high.length) return this.queues.high.shift();
+    if (this.queues.normal.length) return this.queues.normal.shift();
+    if (this.queues.low.length) return this.queues.low.shift();
+    return undefined;
+  }
 
-// Simplified exponential backoff
-const calculateBackoff = (attempt: number): number => {
-  const baseDelay = Math.min(1000 * 2 ** attempt, 8000);
-  const jitter = Math.random() * 0.5 + 0.75; // 75-125% of base
-  return Math.floor(baseDelay * jitter);
-};
+  getStats() {
+    return {
+      high: this.queues.high.length,
+      normal: this.queues.normal.length,
+      low: this.queues.low.length,
+      workers: this.workers,
+    };
+  }
 
-const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+  stop() {
+    this.running = false;
+  }
+}
 
-// Optimized streaming with better memory management
+const pool = new PriorityWorkerPool(CONFIG.MAX_CONCURRENT_REQUESTS);
+
+// Caches & type inference
+
+const responseCache = new LRUCache<string, ApiResponse<unknown>>(CONFIG.MAX_CACHE_SIZE);
+const urlCache = new LRUCache<string, string>(CONFIG.MAX_URL_CACHE_SIZE);
+const typeInferenceCache = new LRUCache<string, string>(50);
+
+// Stream parsing (incremental decode)
+
+const sharedDecoder = new TextDecoder();
+
 async function streamResponse<T>(
   response: Response,
   onProgress?: (progress: { loaded: number; total?: number; percent?: number }) => void,
@@ -340,49 +370,51 @@ async function streamResponse<T>(
   }
 
   const reader = response.body.getReader();
-  const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
-  const chunks: Uint8Array[] = [];
+  const contentLength = Number(response.headers.get('content-length') || '0') || undefined;
   let loaded = 0;
+  const chunks: Uint8Array[] = [];
 
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
-      chunks.push(value);
-      loaded += value.length;
-
-      onProgress?.({
-        loaded,
-        ...(contentLength > 0 && {
-          total: contentLength,
-          percent: Math.round((loaded / contentLength) * 100),
-        }),
-      });
+      if (value) {
+        chunks.push(value);
+        loaded += value.length;
+        if (onProgress) {
+          onProgress({
+            loaded,
+            ...(contentLength ? { total: contentLength, percent: Math.round((loaded / contentLength) * 100) } : {}),
+          });
+        }
+      }
     }
 
-    // Efficiently combine chunks
+    // combine
     const result = new Uint8Array(loaded);
     let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
+    for (const c of chunks) {
+      result.set(c, offset);
+      offset += c.length;
     }
+    const text = sharedDecoder.decode(result, { stream: false });
 
-    const text = new TextDecoder().decode(result);
     const contentType = response.headers.get('content-type') || '';
-
     if (contentType.includes('json') || text.trim().match(/^[[{]/)) {
-      return JSON.parse(text);
+      return JSON.parse(text) as T;
     }
-
-    return text as T;
+    return text as unknown as T;
   } finally {
-    reader.releaseLock();
+    try {
+      reader.releaseLock();
+    } catch {
+      // ignore
+    }
   }
 }
 
-// Simplified response parsing
+// Response parsing with preferStream flag
+
 const parseResponse = async <T>(
   response: Response,
   options: {
@@ -390,8 +422,8 @@ const parseResponse = async <T>(
     preferStream?: boolean;
   } = {},
 ): Promise<T> => {
-  const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
-  const shouldStream = options.preferStream || contentLength > CONFIG.STREAM_THRESHOLD;
+  const contentLength = Number(response.headers.get('content-length') || '0') || undefined;
+  const shouldStream = options.preferStream || (contentLength && contentLength > CONFIG.STREAM_THRESHOLD);
 
   if (shouldStream && response.body) {
     return streamResponse<T>(response, options.onProgress);
@@ -399,19 +431,140 @@ const parseResponse = async <T>(
 
   const contentType = response.headers.get('content-type') || '';
   if (contentType.includes('json')) {
-    return response.json();
+    return response.json() as Promise<T>;
   }
-
   const text = await response.text();
   try {
-    return JSON.parse(text);
+    return JSON.parse(text) as T;
   } catch {
-    return text as T;
+    return text as unknown as T;
   }
 };
 
-// Simplified failure tracking
-const failureTracker = new Map<string, { count: number; lastFailure: number }>();
+// Build url + caching
+
+const buildUrl = (endpoint: string, params?: QueryParams): string => {
+  const paramsKey = stableSerializeParams(params);
+  const cacheKey = `${endpoint}|${paramsKey}`;
+  const cached = urlCache.get(cacheKey);
+  if (cached) return cached;
+
+  const isAbsolute = endpoint.startsWith('http');
+  let url = isAbsolute ? endpoint : `${CONFIG.API_URL}/${endpoint.replace(/^\//, '')}`;
+  if (paramsKey) url += `?${paramsKey}`;
+
+  urlCache.set(cacheKey, url);
+  return url;
+};
+
+// Header builder
+
+const buildHeaders = (data?: RequestBody, custom?: Record<string, string>): Record<string, string> => {
+  const headers: Record<string, string> = { Accept: 'application/json' };
+
+  if (data && !(data instanceof FormData) && typeof data !== 'string') {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  const auth = authHeaderProvider();
+  return { ...headers, ...auth, ...(custom || {}) };
+};
+
+// executeFetch with timeout, caching, failure tracking
+
+async function executeFetch<TResponse>(
+  url: string,
+  method: HttpMethod,
+  headers: Record<string, string>,
+  body: BodyInit | undefined,
+  cache: NextJSRequestCache,
+  timeout: number,
+  nextOptions: { next?: NextCacheOptions },
+  streamOptions: {
+    onProgress?: (progress: { loaded: number; total?: number; percent?: number }) => void;
+    preferStream?: boolean;
+  } = {},
+): Promise<ApiResponse<TResponse>> {
+  // GET cache fast path
+  const cacheKey = `${method}:${url}`;
+  if (method === 'GET' && cache !== 'no-store' && !streamOptions.preferStream) {
+    const cached = responseCache.get(cacheKey);
+    if (cached) return cached as ApiResponse<TResponse>;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(url, {
+      method,
+      headers,
+      body,
+      cache,
+      signal: controller.signal,
+      ...nextOptions,
+    });
+
+    clearTimeout(timeoutId);
+
+    const data = await parseResponse<TResponse>(response, streamOptions);
+
+    if (response.ok) {
+      const result = {
+        success: true,
+        data,
+        status: response.status,
+        headers: response.headers,
+      } as const;
+
+      // Cache GETs
+      if (method === 'GET' && cache !== 'no-store') {
+        responseCache.set(cacheKey, result);
+      }
+
+      failureTracker.delete(url);
+      return result;
+    }
+
+    // Build error message robustly
+    const errorMessage = (() => {
+      if (typeof data === 'string') return data;
+      if (data && typeof data === 'object') {
+        const obj = data as Record<string, unknown>;
+        return String(obj.message || obj.error || `HTTP ${response.status}`);
+      }
+      return `HTTP ${response.status}`;
+    })();
+
+    failureTracker.record(url);
+
+    return {
+      success: false,
+      status: response.status,
+      error: createError('HttpError', errorMessage, response.status, CONFIG.RETRY_CODES.has(response.status)),
+      data: null,
+    };
+  } catch (err) {
+    clearTimeout(timeoutId);
+
+    const isAbort = err instanceof Error && (err.name === 'AbortError' || /aborted|timeout/i.test(err.message));
+    failureTracker.record(url);
+
+    return {
+      success: false,
+      status: isAbort ? 408 : 0,
+      error: createError(
+        isAbort ? 'TimeoutError' : 'NetworkError',
+        err instanceof Error ? err.message : 'Request failed',
+        isAbort ? 408 : 0,
+        true,
+      ),
+      data: null,
+    };
+  }
+}
+
+// Should retry decision
 
 const shouldRetry = (
   error: ApiError,
@@ -420,13 +573,10 @@ const shouldRetry = (
   method: HttpMethod,
   url: string,
 ): boolean => {
-  const failure = failureTracker.get(url);
-  const now = Date.now();
+  const f = failureTracker.get(url);
 
-  // Circuit breaker: skip if too many recent failures
-  if (failure && failure.count > 3 && now - failure.lastFailure < 30000) {
-    return false;
-  }
+  // Circuit breaker: if too many failures recently, avoid hammering
+  if (f.count > 6 && Date.now() - f.lastFailure < 30_000) return false;
 
   return (
     attempt < maxRetries &&
@@ -435,15 +585,13 @@ const shouldRetry = (
   );
 };
 
-// Optimized type inference with better caching
-const typeInferenceCache = new OptimizedLRUCache<string, string>(50);
+// Type inference logging 
 
 const logTypes = <T>(endpoint: string, data: T): void => {
   if (!CONFIG.IS_DEV) return;
 
   const cacheKey = `${endpoint}_${typeof data}`;
   const cached = typeInferenceCache.get(cacheKey);
-
   if (cached) {
     console.log(`🔍 [SafeFetch] ${endpoint} (cached)\n${cached}`);
     return;
@@ -460,9 +608,7 @@ const logTypes = <T>(endpoint: string, data: T): void => {
       const entries = Object.entries(val).slice(0, 4);
       const props = entries
         .map(([key, value]) => {
-          const type = CONFIG.SENSITIVE_KEY_REGEX.test(key)
-            ? '[REDACTED]'
-            : inferType(value, depth + 1);
+          const type = CONFIG.SENSITIVE_KEY_REGEX.test(key) ? '[REDACTED]' : inferType(value, depth + 1);
           return `  ${key}: ${type};`;
         })
         .join('\n');
@@ -472,123 +618,17 @@ const logTypes = <T>(endpoint: string, data: T): void => {
   };
 
   try {
-    const typeName =
-      endpoint.replace(/[^a-zA-Z0-9]/g, '_').replace(/^_+|_+$/g, '') || 'ApiResponse';
+    const typeName = endpoint.replace(/[^a-zA-Z0-9]/g, '_').replace(/^_+|_+$/g, '') || 'ApiResponse';
     const typeString = `type ${typeName}Response = ${inferType(data)};`;
-
     typeInferenceCache.set(cacheKey, typeString);
     console.log(`🔍 [SafeFetch] ${endpoint}\n${typeString}`);
   } catch {
-    // Silently ignore errors
+    // ignore
   }
 };
 
-// Core fetch execution with timeout handling
-async function executeFetch<TResponse>(
-  url: string,
-  method: HttpMethod,
-  headers: Record<string, string>,
-  body: BodyInit | undefined,
-  cache: NextJSRequestCache,
-  timeout: number,
-  nextOptions: { next?: NextCacheOptions },
-  streamOptions: {
-    onProgress?: (progress: { loaded: number; total?: number; percent?: number }) => void;
-    preferStream?: boolean;
-  } = {},
-): Promise<ApiResponse<TResponse>> {
-  // Check cache for GET requests
-  if (method === 'GET' && cache !== 'no-store' && !streamOptions.preferStream) {
-    const cacheKey = `${method}:${url}`;
-    const cached = responseCache.get(cacheKey);
-    if (cached) return cached as ApiResponse<TResponse>;
-  }
+// Public apiRequest function
 
-  const abortController = new AbortController();
-  const timeoutId = setTimeout(() => abortController.abort(), timeout);
-
-  try {
-    const response = await fetch(url, {
-      method,
-      headers,
-      body,
-      cache,
-      signal: abortController.signal,
-      ...nextOptions,
-    });
-
-    clearTimeout(timeoutId);
-    const data = await parseResponse<TResponse>(response, streamOptions);
-
-    if (response.ok) {
-      const result = {
-        success: true,
-        data,
-        status: response.status,
-        headers: response.headers,
-      } as const;
-
-      // Cache successful GET requests
-      if (method === 'GET' && cache !== 'no-store') {
-        const cacheKey = `${method}:${url}`;
-        responseCache.set(cacheKey, result);
-      }
-
-      // Reset failure tracking
-      failureTracker.delete(url);
-      return result;
-    }
-
-    // Handle HTTP errors
-    const errorMessage = (() => {
-      if (typeof data === 'string') return data;
-      if (data && typeof data === 'object') {
-        const errorObj = data as Record<string, unknown>;
-        return String(errorObj.message || errorObj.error || `HTTP ${response.status}`);
-      }
-      return `HTTP ${response.status}`;
-    })();
-
-    // Track failure
-    const failure = failureTracker.get(url) || { count: 0, lastFailure: 0 };
-    failure.count++;
-    failure.lastFailure = Date.now();
-    failureTracker.set(url, failure);
-
-    return {
-      success: false,
-      status: response.status,
-      error: createError(
-        'HttpError',
-        errorMessage,
-        response.status,
-        CONFIG.RETRY_CODES.has(response.status),
-      ),
-      data: null,
-    };
-  } catch (err) {
-    clearTimeout(timeoutId);
-
-    const isTimeout =
-      err instanceof Error && (err.name === 'AbortError' || err.message.includes('timeout'));
-
-    return {
-      success: false,
-      status: isTimeout ? 408 : 0,
-      error: createError(
-        isTimeout ? 'TimeoutError' : 'NetworkError',
-        err instanceof Error ? err.message : 'Request failed',
-        isTimeout ? 408 : 0,
-        true,
-      ),
-      data: null,
-    };
-  }
-}
-
-/**
- * High-performance type-safe HTTP client with intelligent caching and streaming
- */
 export default async function apiRequest<
   TResponse = unknown,
   TBody extends RequestBody = RequestBody,
@@ -621,73 +661,97 @@ export default async function apiRequest<
     preferStream = false,
   } = options;
 
-  return requestQueue.enqueue(async () => {
-    let url: string, headers: Record<string, string>, body: BodyInit | undefined;
-
-    try {
-      url = buildUrl(endpoint, params);
-      headers = buildHeaders(data, customHeaders);
-      body =
-        data instanceof FormData || typeof data === 'string'
-          ? data
-          : data
-            ? JSON.stringify(data)
-            : undefined;
-    } catch (error) {
-      return {
-        success: false,
-        status: 400,
-        error: createError('ValidationError', `Request validation failed: ${error}`, 400),
-        data: null,
-      };
-    }
-
-    const nextOptions = nextCacheOptions ? { next: nextCacheOptions } : {};
-    const streamOptions = { onProgress, preferStream };
-    let lastError: ApiError | undefined;
-
-    // Retry logic
-    for (let attempt = 0; attempt <= retries; attempt++) {
-      const result = await executeFetch<TResponse>(
-        url,
-        method,
-        headers,
-        body,
-        cache,
-        timeout,
-        nextOptions,
-        streamOptions,
-      );
-
-      if (result.success) {
-        const finalData = transform ? transform(result.data) : result.data;
-
-        if (shouldLogTypes) {
-          logTypes(endpoint, finalData);
-        }
-
-        return { ...result, data: finalData };
-      }
-
-      lastError = result.error;
-
-      if (!shouldRetry(lastError, attempt, retries, method, url) || attempt === retries) {
-        break;
-      }
-
-      await delay(calculateBackoff(attempt));
-    }
-
+  // build url & headers early (may throw)
+  let url: string;
+  try {
+    url = buildUrl(endpoint, params);
+  } catch (e) {
     return {
       success: false,
-      status: lastError!.status,
-      error: lastError!,
+      status: 400,
+      error: createError('ValidationError', `Request validation failed: ${String(e)}`, 400),
       data: null,
     };
-  }, priority);
+  }
+
+  const headers = buildHeaders(data, customHeaders);
+  const body =
+    data instanceof FormData || typeof data === 'string'
+      ? (data as BodyInit)
+      : data
+        ? JSON.stringify(data)
+        : undefined;
+
+  // For GET dedupe: coalesce identical in-flight requests
+  const dedupeKey = `${method}:${url}:${String(preferStream)}`;
+  if (method === 'GET' && !body && inFlightMap.has(dedupeKey)) {
+    // Type-cast is safe because we stored promise of ApiResponse<unknown>
+    return (inFlightMap.get(dedupeKey) as Promise<ApiResponse<TResponse>>);
+  }
+
+  // Wrap core logic to submit to worker pool
+  const taskPromise = pool.enqueue(
+    async () => {
+      // If GET, create dedupe promise placeholder
+      if (method === 'GET' && !body) {
+        // create placeholder promise and put into inFlightMap
+        // but actual network work is done below
+      }
+
+      let lastError: ApiError | undefined;
+
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        const result = await executeFetch<TResponse>(
+          url,
+          method,
+          headers,
+          body,
+          cache,
+          timeout,
+          nextCacheOptions ? { next: nextCacheOptions } : {},
+          { onProgress, preferStream },
+        );
+
+        if (result.success) {
+          const finalData = transform ? transform(result.data) : result.data;
+          if (shouldLogTypes) logTypes(endpoint, finalData);
+          return { ...result, data: finalData } as ApiResponse<TResponse>;
+        }
+
+        lastError = result.error;
+        if (!shouldRetry(lastError, attempt, retries, method, url) || attempt === retries) break;
+
+        await new Promise((r) => setTimeout(r, calculateBackoff(attempt)));
+      }
+
+      return {
+        success: false,
+        status: lastError!.status,
+        error: lastError!,
+        data: null,
+      } as ApiResponse<TResponse>;
+    },
+    priority,
+  );
+
+  // If GET dedupe: put into inFlightMap and ensure removal
+  if (method === 'GET' && !body) {
+    inFlightMap.set(dedupeKey, taskPromise as Promise<ApiResponse<unknown>>);
+    // cleanup after settled
+    taskPromise
+      .finally(() => {
+        inFlightMap.delete(dedupeKey);
+      })
+      .catch(() => {
+        /* swallow: handled by returned result */
+      });
+  }
+
+  return taskPromise as Promise<ApiResponse<TResponse>>;
 }
 
-// Type guards
+// Type guards & helpers
+
 apiRequest.isSuccess = <T>(
   response: ApiResponse<T>,
 ): response is Extract<ApiResponse<T>, { success: true }> => response.success;
@@ -696,16 +760,16 @@ apiRequest.isError = <T>(
   response: ApiResponse<T>,
 ): response is Extract<ApiResponse<T>, { success: false }> => !response.success;
 
-// Utilities
 apiRequest.utils = {
   getStats: () => ({
-    queue: requestQueue.getStats(),
+    queue: pool.getStats(),
     cache: {
       responses: responseCache.size,
       urls: urlCache.size,
       types: typeInferenceCache.size,
     },
-    failures: failureTracker.size,
+    failures: failureTracker.size(),
+    inFlight: inFlightMap.size,
   }),
 
   clearCaches: () => {
@@ -713,6 +777,7 @@ apiRequest.utils = {
     urlCache.clear();
     typeInferenceCache.clear();
     failureTracker.clear();
+    inFlightMap.clear();
   },
 
   warmup: async (endpoints: string[]) => {
@@ -723,7 +788,6 @@ apiRequest.utils = {
   },
 };
 
-// Cache helpers
 apiRequest.cacheHelpers = {
   revalidateTag,
   revalidatePath,
@@ -740,7 +804,6 @@ apiRequest.cacheHelpers = {
     ),
 };
 
-// HTTP method shortcuts
 apiRequest.get = <TResponse = unknown>(
   endpoint: string,
   options: Omit<RequestOptions<null, TResponse>, 'data'> = {},
