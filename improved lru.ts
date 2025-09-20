@@ -57,18 +57,26 @@ const CONFIG = {
 
 // -------------------- Unified Cache --------------------
 class Cache<K, V> {
-  private cache = new Map<K, { value: V; timestamp: number; hits: number }>();
+  private cache = new Map<K, { value: V; timestamp: number; hits: number; sensitive?: boolean }>();
   private lastCleanup = Date.now();
+  private cleanupTimer?: NodeJS.Timeout;
 
   constructor(
     private maxSize: number,
     private ttl = CONFIG.TTL_MS,
-  ) {}
+  ) {
+    // Schedule periodic cleanup to prevent memory leaks
+    this.cleanupTimer = setInterval(() => this.cleanup(), Math.min(this.ttl / 4, 60000));
+  }
 
   get(key: K): V | undefined {
     this.cleanup();
     const entry = this.cache.get(key);
     if (!entry || Date.now() - entry.timestamp > this.ttl) {
+      // Securely delete expired entries
+      if (entry?.sensitive) {
+        this.secureDelete(entry.value);
+      }
       this.cache.delete(key);
       return undefined;
     }
@@ -76,24 +84,99 @@ class Cache<K, V> {
     return entry.value;
   }
 
-  set(key: K, value: V): void {
+  set(key: K, value: V, sensitive = false): void {
+    // Clean up before adding to prevent unbounded growth
+    this.cleanup();
+
     while (this.cache.size >= this.maxSize) {
-      const [lruKey] = [...this.cache.entries()].sort(([, a], [, b]) => a.hits - b.hits)[0];
+      // Use LRU + age-based eviction for better memory management
+      const entries = [...this.cache.entries()];
+      const sorted = entries.sort(([, a], [, b]) => {
+        // Prioritize old, low-hit entries for eviction
+        const ageScore = (Date.now() - a.timestamp) / this.ttl;
+        const hitScore = 1 / (a.hits + 1);
+        const aScore = ageScore + hitScore;
+
+        const bAgeScore = (Date.now() - b.timestamp) / this.ttl;
+        const bHitScore = 1 / (b.hits + 1);
+        const bScore = bAgeScore + bHitScore;
+
+        return bScore - aScore;
+      });
+
+      const [lruKey, lruEntry] = sorted[0];
+      if (lruEntry.sensitive) {
+        this.secureDelete(lruEntry.value);
+      }
       this.cache.delete(lruKey);
     }
-    this.cache.set(key, { value, timestamp: Date.now(), hits: 1 });
+
+    this.cache.set(key, { value, timestamp: Date.now(), hits: 1, sensitive });
   }
 
-  clear = () => this.cache.clear();
-  size = () => this.cache.size;
+  // Mark cache entry as containing sensitive data
+  setSensitive(key: K, value: V): void {
+    this.set(key, value, true);
+  }
 
-  private cleanup(): void {
-    if (Date.now() - this.lastCleanup < 60000) return;
-    this.lastCleanup = Date.now();
-    const cutoff = Date.now() - this.ttl;
-    for (const [key, entry] of this.cache) {
-      if (entry.timestamp < cutoff) this.cache.delete(key);
+  clear = (): void => {
+    // Securely clear sensitive data
+    for (const [, entry] of this.cache) {
+      if (entry.sensitive) {
+        this.secureDelete(entry.value);
+      }
     }
+    this.cache.clear();
+  };
+
+  size = (): number => this.cache.size;
+
+  // cleanup with memory pressure handling
+  private cleanup(): void {
+    const now = Date.now();
+    if (now - this.lastCleanup < 30000 && this.cache.size < this.maxSize * 0.8) return;
+
+    this.lastCleanup = now;
+    const cutoff = now - this.ttl;
+    const toDelete: K[] = [];
+
+    for (const [key, entry] of this.cache) {
+      if (entry.timestamp < cutoff) {
+        toDelete.push(key);
+        if (entry.sensitive) {
+          this.secureDelete(entry.value);
+        }
+      }
+    }
+
+    toDelete.forEach(key => this.cache.delete(key));
+  }
+
+  // Secure deletion for sensitive data
+  private secureDelete(value: V): void {
+    if (typeof value === 'object' && value !== null) {
+      try {
+        // Overwrite object properties
+        Object.keys(value).forEach(key => {
+          if (typeof (value as any)[key] === 'string') {
+            (value as any)[key] = '';
+          } else if (typeof (value as any)[key] === 'object') {
+            (value as any)[key] = null;
+          }
+        });
+      } catch {
+        // Ignore errors for read-only objects
+      }
+    }
+  }
+
+  // Cleanup resources
+  destroy(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = undefined;
+    }
+    this.clear();
   }
 }
 
@@ -108,8 +191,15 @@ class Coalescer {
         reject: (reason?: unknown) => void;
       }>;
       timer?: NodeJS.Timeout;
+      timestamp: number; // Track creation time
     }
   >();
+  private cleanupTimer?: NodeJS.Timeout;
+
+  constructor() {
+    // Periodic cleanup of stale batches
+    this.cleanupTimer = setInterval(() => this.cleanupStale(), 60000);
+  }
 
   async coalesce<T>(
     key: string,
@@ -119,7 +209,16 @@ class Coalescer {
     if (!batch) {
       const existing = this.pending.get(key);
       if (existing) return existing as Promise<ApiResponse<T>>;
-      const promise = factory().finally(() => this.pending.delete(key));
+
+      const promise = factory()
+        .finally(() => {
+          this.pending.delete(key);
+          // Clean up any remaining references
+          if (this.pending.size === 0) {
+            this.pending.clear();
+          }
+        });
+
       this.pending.set(key, promise);
       return promise;
     }
@@ -127,9 +226,14 @@ class Coalescer {
     const batchKey = key.split(':')[0];
     return new Promise<ApiResponse<T>>((resolve, reject) => {
       let batch = this.batches.get(batchKey);
-      if (!batch) batch = { requests: [] };
+      if (!batch) {
+        batch = { requests: [], timestamp: Date.now() };
+      }
 
-      batch.requests.push({ resolve: resolve as (value: ApiResponse<unknown>) => void, reject });
+      batch.requests.push({
+        resolve: resolve as (value: ApiResponse<unknown>) => void,
+        reject
+      });
       this.batches.set(batchKey, batch);
 
       if (batch.requests.length >= CONFIG.BATCH_SIZE) {
@@ -141,26 +245,67 @@ class Coalescer {
   }
 
   private async executeBatch<T>(
-      batchKey: string,
-      factory: () => Promise<ApiResponse<T>>,
-    ): Promise<void> {
-      const batch = this.batches.get(batchKey);
-      if (!batch) return;
+    batchKey: string,
+    factory: () => Promise<ApiResponse<T>>,
+  ): Promise<void> {
+    const batch = this.batches.get(batchKey);
+    if (!batch) return;
 
-      this.batches.delete(batchKey);
-      if (batch.timer) clearTimeout(batch.timer);
+    this.batches.delete(batchKey);
+    if (batch.timer) {
+      clearTimeout(batch.timer);
+    }
 
-      try {
-        const result = await factory();
-        batch.requests.forEach((req) => {
-          req.resolve(result as ApiResponse<unknown>);
-        });
-      } catch (error) {
-        batch.requests.forEach((req) => {
-          req.reject(error);
+    try {
+      const result = await factory();
+      batch.requests.forEach((req) => {
+        req.resolve(result as ApiResponse<unknown>);
+      });
+    } catch (error) {
+      batch.requests.forEach((req) => {
+        req.reject(error);
+      });
+    } finally {
+      // Ensure cleanup
+      batch.requests.length = 0;
+    }
+  }
+
+  private cleanupStale(): void {
+    const cutoff = Date.now() - 300000; // 5 minutes
+    const staleKeys: string[] = [];
+
+    for (const [key, batch] of this.batches) {
+      if (batch.timestamp < cutoff) {
+        staleKeys.push(key);
+        if (batch.timer) {
+          clearTimeout(batch.timer);
+        }
+        // Reject stale requests
+        batch.requests.forEach(req => {
+          req.reject(new Error('Request timeout - batch expired'));
         });
       }
     }
+
+    staleKeys.forEach(key => this.batches.delete(key));
+  }
+
+  destroy(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = undefined;
+    }
+
+    // Clean up pending batches
+    for (const [, batch] of this.batches) {
+      if (batch.timer) {
+        clearTimeout(batch.timer);
+      }
+    }
+    this.batches.clear();
+    this.pending.clear();
+  }
 }
 
 // -------------------- Adaptive Pool --------------------
@@ -238,22 +383,52 @@ const buildUrl = (endpoint: string, params?: QueryParams): string => {
   return paramStr ? `${base}?${paramStr}` : base;
 };
 
+// -------------------- Auth Headers with TTL --------------------
 const getAuthHeaders = (() => {
   let cached: Record<string, string> | null = null;
   let lastCheck = 0;
+  let cleanupTimer: NodeJS.Timeout | null = null;
+
+  const clearCache = () => {
+    if (cached) {
+      // Clear sensitive auth data
+      Object.keys(cached).forEach(key => {
+        if (key.toLowerCase().includes('authorization')) {
+          cached![key] = '';
+        }
+      });
+      cached = null;
+    }
+  };
 
   return (): Record<string, string> => {
-    if (cached && Date.now() - lastCheck < CONFIG.TTL_MS) return cached;
+    const now = Date.now();
+
+    // Check if cache is still valid
+    if (cached && now - lastCheck < CONFIG.TTL_MS) {
+      return { ...cached }; // Return copy to prevent mutations
+    }
+
+    // Clear old cache
+    clearCache();
+
     const headers: Record<string, string> = {};
     const { AUTH_USERNAME: user, AUTH_PASSWORD: pass, API_TOKEN: token } = process.env;
 
-    if (user && pass)
+    if (user && pass) {
       headers.Authorization = `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;
-    else if (token) headers.Authorization = `Bearer ${token}`;
+    } else if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
 
-    cached = headers;
-    lastCheck = Date.now();
-    return headers;
+    cached = { ...headers };
+    lastCheck = now;
+
+    // Set up automatic cleanup
+    if (cleanupTimer) clearTimeout(cleanupTimer);
+    cleanupTimer = setTimeout(clearCache, CONFIG.TTL_MS);
+
+    return { ...headers };
   };
 })();
 
@@ -263,6 +438,28 @@ const createError = (
   status: number,
   retryable = false,
 ): ApiError => ({ name, message, status, retryable });
+
+// -------------------- Cache Key Generation --------------------
+const generateCacheKey = (method: HttpMethod, url: string, body?: BodyInit): string => {
+  // Avoid including sensitive data in cache keys
+  const sanitizedBody = body ? 'with-body' : 'no-body';
+
+  // Hash sensitive URLs to prevent cache key leaks
+  if (url.includes('password') || url.includes('token') || url.includes('secret')) {
+    // Simple hash function for Node.js environments
+    let hash = 0;
+    const str = url;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32bit integer
+    }
+    const hashStr = Math.abs(hash).toString(16).substring(0, 8);
+    return `${method}:${hashStr}:${sanitizedBody}`;
+  }
+
+  return `${method}:${url}:${sanitizedBody}`;
+};
 
 // -------------------- Type Logging --------------------
 const logTypes = <T>(
@@ -297,8 +494,8 @@ const logTypes = <T>(
   try {
     const typeName = endpoint.replace(/[^\w]/g, '_') || 'ApiResponse';
     const typeDefinition = `type ${typeName}Response = ${inferType(data)};`;
-    console.log(`🔍 [SafeFetch] "${endpoint}"\n${typeDefinition}`);
-    if (metadata?.duration) console.log(`⏱️ ${metadata.duration}ms`);
+    console.log(`[SafeFetch] "${endpoint}"\n${typeDefinition}`);
+    if (metadata?.duration) console.log(`${metadata.duration}ms`);
   } catch {
     // Silently fail
   }
@@ -434,13 +631,24 @@ export default async function apiRequest<
       : data
         ? JSON.stringify(data)
         : undefined;
-  const cacheKey = `${method}:${url}:${body ? 'with-body' : 'no-body'}`;
+
+  // Use cache key generation
+  const cacheKey = generateCacheKey(method, url, body);
+
+  // Determine if response contains sensitive data
+  const isSensitive = endpoint.includes('auth') ||
+                     endpoint.includes('login') ||
+                     endpoint.includes('token') ||
+                     endpoint.includes('password') ||
+                     headers.Authorization;
 
   // Check cache for GET requests
   if (method === 'GET' && cachePolicy !== 'no-store') {
     const cached = cache.get(cacheKey);
     if (cached) {
-      if (shouldLogTypes && cached.success) logTypes(endpoint, cached.data, { duration: 0 });
+      if (shouldLogTypes && cached.success && !isSensitive) {
+        logTypes(endpoint, cached.data, { duration: 0 });
+      }
       return cached as ApiResponse<TResponse>;
     }
   }
@@ -463,13 +671,22 @@ export default async function apiRequest<
         });
 
         if (result.success) {
-          if (method === 'GET' && cachePolicy !== 'no-store') cache.set(cacheKey, result);
+          // Cache with sensitivity awareness
+          if (method === 'GET' && cachePolicy !== 'no-store') {
+            if (isSensitive) {
+              cache.setSensitive(cacheKey, result);
+            } else {
+              cache.set(cacheKey, result);
+            }
+          }
+
           const finalResult = transform ? { ...result, data: transform(result.data) } : result;
-          if (shouldLogTypes)
+          if (shouldLogTypes && !isSensitive) { // Don't log sensitive data
             logTypes(endpoint, finalResult.data, {
               duration: Date.now() - startTime,
               attempt: attempt - 1,
             });
+          }
           return finalResult;
         }
 
@@ -496,10 +713,20 @@ apiRequest.isError = <T>(
 ): response is Extract<ApiResponse<T>, { success: false }> => !response.success;
 
 apiRequest.utils = {
-  getStats: () => ({ pool: pool.getStats(), cache: cache.size(), urls: urlCache.size() }),
+  getStats: () => ({
+    pool: pool.getStats(),
+    cache: cache.size(),
+    urls: urlCache.size()
+  }),
   clearCaches: () => {
     cache.clear();
     urlCache.clear();
+  },
+  // Secure cache cleanup
+  secureClearCaches: () => {
+    cache.destroy();
+    urlCache.destroy();
+    coalescer.destroy();
   },
   batch: <T>(requests: Array<() => Promise<ApiResponse<T>>>): Promise<Array<ApiResponse<T>>> =>
     Promise.all(requests.slice(0, CONFIG.BATCH_SIZE).map((req) => req())),
@@ -526,3 +753,19 @@ apiRequest.cacheHelpers = {
       { revalidate: revalidateSeconds, tags },
     ),
 };
+
+// -------------------- Process Exit Cleanup --------------------
+if (typeof process !== 'undefined') {
+  const cleanup = () => {
+    try {
+      apiRequest.utils.secureClearCaches();
+    } catch (error) {
+      console.error('Error during cleanup:', error);
+    }
+  };
+
+  process.on('exit', cleanup);
+  process.on('SIGINT', cleanup);
+  process.on('SIGTERM', cleanup);
+  process.on('uncaughtException', cleanup);
+}
