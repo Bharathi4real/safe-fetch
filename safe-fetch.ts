@@ -37,7 +37,7 @@ export interface ApiError {
 }
 
 export type ApiResponse<T = unknown> =
-  | { success: true; status: number; data: T; headers: Headers }
+  | { success: true; status: number; data: T; headers: Record<string, string> }
   | { success: false; status: number; error: ApiError; data: null };
 
 // -------------------- Configuration --------------------
@@ -270,8 +270,6 @@ const logTypes = <T>(
   data: T,
   metadata?: { duration?: number; attempt?: number },
 ): void => {
-  if (!CONFIG.IS_DEV) return;
-
   const dataStr = JSON.stringify(data);
   if (dataStr.length > 10000) return;
 
@@ -347,7 +345,12 @@ const executeRequest = async <T>(
     const data = isJson ? await response.json() : await response.text();
 
     if (response.ok) {
-      return { success: true, status: response.status, data: data as T, headers: response.headers };
+      return {
+        success: true,
+        status: response.status,
+        data: data as T,
+        headers: Object.fromEntries(response.headers.entries()),
+      };
     }
 
     const message =
@@ -415,7 +418,7 @@ export default async function apiRequest<
     priority = 'normal',
     signal,
     batch = false,
-    logTypes: shouldLogTypes = CONFIG.IS_DEV,
+    logTypes: shouldLogTypes = false,
   } = options;
 
   const url = buildUrl(endpoint, params);
@@ -440,7 +443,10 @@ export default async function apiRequest<
   if (method === 'GET' && cachePolicy !== 'no-store') {
     const cached = cache.get(cacheKey);
     if (cached) {
-      if (shouldLogTypes && cached.success) logTypes(endpoint, cached.data, { duration: 0 });
+      // Only log types if explicitly requested AND in development
+      if (shouldLogTypes === true && CONFIG.IS_DEV && cached.success) {
+        logTypes(endpoint, cached.data, { duration: 0 });
+      }
       return cached as ApiResponse<TResponse>;
     }
   }
@@ -465,11 +471,15 @@ export default async function apiRequest<
         if (result.success) {
           if (method === 'GET' && cachePolicy !== 'no-store') cache.set(cacheKey, result);
           const finalResult = transform ? { ...result, data: transform(result.data) } : result;
-          if (shouldLogTypes)
+
+          // Only log types if explicitly requested AND in development
+          if (shouldLogTypes === true && CONFIG.IS_DEV) {
             logTypes(endpoint, finalResult.data, {
               duration: Date.now() - startTime,
               attempt: attempt - 1,
             });
+          }
+
           return finalResult;
         }
 
