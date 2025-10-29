@@ -1,12 +1,10 @@
 /**
  * SafeFetch – Optimized Typed Fetch utility for Next.js 15
  * (c) 2025 Bharathi4real – BSD 3-Clause License
- * Memory-optimized with unified cache, coalescing & adaptive pooling
+ * Memory-optimized with unified retry, timeout & adaptive pooling
  */
 
 'use server';
-
-import { revalidatePath, revalidateTag, unstable_cache } from 'next/cache';
 
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const;
 
@@ -19,8 +17,6 @@ export interface RequestOptions<TBody extends RequestBody = RequestBody, TRespon
   params?: QueryParams;
   retries?: number;
   timeout?: number | ((attempt: number) => number);
-  cache?: RequestCache;
-  next?: { revalidate?: number | false; tags?: string[] };
   headers?: Record<string, string>;
   transform?<T = TResponse, R = TResponse>(data: T): R;
   priority?: 'high' | 'normal' | 'low';
@@ -51,180 +47,11 @@ const CONFIG = {
   IDEMPOTENT_METHODS: new Set<HttpMethod>(['GET', 'PUT', 'DELETE']),
   DEFAULT_TIMEOUT: 60000,
   DEFAULT_RETRIES: 2,
-  MAX_CONCURRENT: IS_BUN ? 20 : 10, // Bun handles concurrency better
-  CACHE_SIZE: 100,
-  TTL_MS: 300_000,
+  MAX_CONCURRENT: IS_BUN ? 20 : 10,
   BATCH_SIZE: IS_BUN ? 20 : 10,
   BATCH_DELAY: IS_BUN ? 25 : 50,
-  CLEANUP_INTERVAL: 60000,
-  EVICTION_RATIO: 0.15, // Remove 15% at once
   IS_DEV: process.env.NODE_ENV === 'development',
 } as const;
-
-// -------------------- Fast Hash Function --------------------
-const fastHash = (str: string): number => {
-  let hash = 0;
-  for (let i = 0, len = str.length; i < len; i++) {
-    hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
-  }
-  return hash >>> 0;
-};
-
-// -------------------- Unified Cache --------------------
-class Cache<K, V> {
-  private readonly cache = new Map<K, { value: V; timestamp: number; hits: number }>();
-  private lastCleanup = Date.now();
-  private evictionList: K[] = [];
-  private needsSort = false;
-
-  constructor(
-    private readonly maxSize: number,
-    private readonly ttl = CONFIG.TTL_MS,
-  ) {}
-
-  get(key: K): V | undefined {
-    if (this.needsCleanup()) this.cleanup();
-
-    const entry = this.cache.get(key);
-    if (!entry) return undefined;
-
-    const now = Date.now();
-    if (now - entry.timestamp > this.ttl) {
-      this.cache.delete(key);
-      return undefined;
-    }
-
-    entry.hits++;
-    return entry.value;
-  }
-
-  set(key: K, value: V): void {
-    const size = this.cache.size;
-
-    if (size >= this.maxSize) {
-      // Fast eviction without creating new arrays
-      if (!this.evictionList.length || this.needsSort) {
-        this.evictionList = Array.from(this.cache.keys());
-        this.evictionList.sort((a, b) => {
-          const entryA = this.cache.get(a)!;
-          const entryB = this.cache.get(b)!;
-          return entryA.hits - entryB.hits;
-        });
-        this.needsSort = false;
-      }
-
-      const toRemove = Math.ceil(this.maxSize * CONFIG.EVICTION_RATIO);
-      for (let i = 0; i < toRemove; i++) {
-        const key = this.evictionList[i];
-        if (key) this.cache.delete(key);
-      }
-      this.evictionList = [];
-      this.needsSort = true;
-    }
-
-    this.cache.set(key, { value, timestamp: Date.now(), hits: 1 });
-  }
-
-  clear(): void {
-    this.cache.clear();
-    this.evictionList = [];
-  }
-
-  size(): number {
-    return this.cache.size;
-  }
-
-  private needsCleanup(): boolean {
-    return Date.now() - this.lastCleanup >= CONFIG.CLEANUP_INTERVAL;
-  }
-
-  private cleanup(): void {
-    this.lastCleanup = Date.now();
-    const cutoff = this.lastCleanup - this.ttl;
-
-    for (const [key, entry] of this.cache) {
-      if (entry.timestamp < cutoff) this.cache.delete(key);
-    }
-  }
-}
-
-// -------------------- Request Coalescing --------------------
-class Coalescer {
-  private readonly pending = new Map<string, Promise<ApiResponse<unknown>>>();
-  private readonly batches = new Map<
-    string,
-    {
-      requests: Array<{
-        resolve: (value: ApiResponse<unknown>) => void;
-        reject: (reason?: unknown) => void;
-      }>;
-      timer?: NodeJS.Timeout;
-    }
-  >();
-
-  async coalesce<T>(
-    key: string,
-    factory: () => Promise<ApiResponse<T>>,
-    batch = false,
-  ): Promise<ApiResponse<T>> {
-    if (!batch) {
-      const existing = this.pending.get(key);
-      if (existing) return existing as Promise<ApiResponse<T>>;
-
-      const promise = factory().finally(() => this.pending.delete(key));
-      this.pending.set(key, promise);
-      return promise;
-    }
-
-    const batchKey = key.split(':')[0];
-    return new Promise<ApiResponse<T>>((resolve, reject) => {
-      let batchData = this.batches.get(batchKey);
-      if (!batchData) {
-        batchData = { requests: [] };
-        this.batches.set(batchKey, batchData);
-      }
-
-      batchData.requests.push({
-        resolve: resolve as (value: ApiResponse<unknown>) => void,
-        reject,
-      });
-
-      const requestCount = batchData.requests.length;
-      if (requestCount >= CONFIG.BATCH_SIZE) {
-        this.executeBatch(batchKey, factory);
-      } else if (!batchData.timer) {
-        batchData.timer = setTimeout(
-          () => this.executeBatch(batchKey, factory),
-          CONFIG.BATCH_DELAY,
-        );
-      }
-    });
-  }
-
-  private async executeBatch<T>(
-    batchKey: string,
-    factory: () => Promise<ApiResponse<T>>,
-  ): Promise<void> {
-    const batchData = this.batches.get(batchKey);
-    if (!batchData) return;
-
-    this.batches.delete(batchKey);
-    if (batchData.timer) clearTimeout(batchData.timer);
-
-    const { requests } = batchData;
-
-    try {
-      const result = await factory();
-      for (let i = 0, len = requests.length; i < len; i++) {
-        requests[i].resolve(result as ApiResponse<unknown>);
-      }
-    } catch (error) {
-      for (let i = 0, len = requests.length; i < len; i++) {
-        requests[i].reject(error);
-      }
-    }
-  }
-}
 
 // -------------------- Adaptive Pool --------------------
 class Pool {
@@ -253,7 +80,6 @@ class Pool {
         priority: priorityNum,
       };
 
-      // Binary insert for sorted queue
       const idx = this.findInsertIndex(priorityNum);
       this.queue.splice(idx, 0, task);
     });
@@ -265,11 +91,8 @@ class Pool {
 
     while (left < right) {
       const mid = (left + right) >>> 1;
-      if (this.queue[mid].priority >= priority) {
-        left = mid + 1;
-      } else {
-        right = mid;
-      }
+      if (this.queue[mid].priority >= priority) left = mid + 1;
+      else right = mid;
     }
 
     return left;
@@ -303,42 +126,28 @@ class Pool {
   }
 }
 
-// -------------------- Global Instances --------------------
-const cache = new Cache<string, ApiResponse<unknown>>(CONFIG.CACHE_SIZE);
-const urlCache = new Cache<number, string>(50);
-const coalescer = new Coalescer();
 const pool = new Pool();
 
 // -------------------- Utilities --------------------
 const buildUrl = (endpoint: string, params?: QueryParams): string => {
-  if (!params) {
-    const isAbsolute = endpoint.charCodeAt(0) === 104 && endpoint.startsWith('http');
-    return isAbsolute ? endpoint : `${CONFIG.API_URL}/${endpoint.replace(/^\//, '')}`;
-  }
-
-  // Fast cache key using hash
-  const paramStr = JSON.stringify(params);
-  const cacheKey = fastHash(endpoint + paramStr);
-  const cached = urlCache.get(cacheKey);
-  if (cached) return cached;
-
   const isAbsolute = endpoint.charCodeAt(0) === 104 && endpoint.startsWith('http');
-  const base = isAbsolute ? endpoint : `${CONFIG.API_URL}/${endpoint.replace(/^\//, '')}`;
+  if (!params) return isAbsolute ? endpoint : `${CONFIG.API_URL}/${endpoint.replace(/^\//, '')}`;
 
-  const searchParams = new URLSearchParams();
+  const parts: string[] = [];
   const entries = Object.entries(params);
+
   for (let i = 0, len = entries.length; i < len; i++) {
     const [key, value] = entries[i];
-    if (value != null) searchParams.append(key, String(value));
+    if (value != null)
+      parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
   }
 
-  const queryStr = searchParams.toString();
-  const url = queryStr ? `${base}?${queryStr}` : base;
-  urlCache.set(cacheKey, url);
-  return url;
+  const query = parts.length > 0 ? `?${parts.join('&')}` : '';
+  return isAbsolute
+    ? `${endpoint}${query}`
+    : `${CONFIG.API_URL}/${endpoint.replace(/^\//, '')}${query}`;
 };
 
-// -------------------- Fast Auth Headers --------------------
 const getAuthHeaders = (() => {
   let cached: Record<string, string> | null = null;
   let lastCheck = 0;
@@ -346,14 +155,13 @@ const getAuthHeaders = (() => {
 
   return (): Record<string, string> => {
     const now = Date.now();
-    if (cached && now - lastCheck < CONFIG.TTL_MS) return cached;
+    if (cached && now - lastCheck < 300000) return cached;
 
     const headers: Record<string, string> = {};
     const { AUTH_USERNAME: user, AUTH_PASSWORD: pass, API_TOKEN: token } = process.env;
 
     if (user && pass) {
-      // Cache the base64 encoding
-      if (!authString || now - lastCheck >= CONFIG.TTL_MS) {
+      if (!authString || now - lastCheck >= 300000) {
         authString = IS_BUN
           ? btoa(`${user}:${pass}`)
           : Buffer.from(`${user}:${pass}`).toString('base64');
@@ -385,19 +193,16 @@ const logTypes = <T>(
     const inferType = (val: unknown, depth = 0): string => {
       if (depth > 8) return '[Deep]';
       if (val == null) return val === null ? 'null' : 'undefined';
-
       if (Array.isArray(val)) {
         if (val.length === 0) return 'unknown[]';
         const types = [...new Set(val.slice(0, 3).map((item) => inferType(item, depth + 1)))];
         return types.length === 1 ? `${types[0]}[]` : `(${types.join(' | ')})[]`;
       }
-
       if (typeof val === 'object') {
         const entries = Object.entries(val).slice(0, 15);
         const props = entries.map(([k, v]) => `  ${k}: ${inferType(v, depth + 1)};`).join('\n');
         return `{\n${props}\n}`;
       }
-
       return typeof val;
     };
 
@@ -410,9 +215,7 @@ const logTypes = <T>(
         `⏱️ ${metadata.duration}ms${metadata.attempt ? ` (attempt ${metadata.attempt})` : ''}`,
       );
     }
-  } catch {
-    // Silently fail on logging errors
-  }
+  } catch {}
 };
 
 // -------------------- Core Request Logic --------------------
@@ -422,24 +225,19 @@ const executeRequest = async <T>(
   options: {
     body?: BodyInit;
     headers: Record<string, string>;
-    cache: RequestCache;
     timeout: number;
-    next?: { revalidate?: number | false; tags?: string[] };
     signal?: AbortSignal;
   },
 ): Promise<ApiResponse<T>> => {
   const controller = new AbortController();
-  let timeoutId: NodeJS.Timeout | undefined;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
-  // Optimized signal combination
   const signal = options.signal
     ? (() => {
         const combined = new AbortController();
         const abort = () => combined.abort();
-
         options.signal!.addEventListener('abort', abort, { once: true });
         controller.signal.addEventListener('abort', abort, { once: true });
-
         return combined.signal;
       })()
     : controller.signal;
@@ -450,34 +248,26 @@ const executeRequest = async <T>(
     const fetchOptions: RequestInit = {
       method,
       headers: options.headers,
-      cache: options.cache,
       signal,
     };
-
     if (options.body !== undefined) fetchOptions.body = options.body;
-    if (options.next) (fetchOptions as RequestInit & { next?: unknown }).next = options.next;
 
     const response = await fetch(url, fetchOptions);
     clearTimeout(timeoutId);
 
-    const contentType = response.headers.get('content-type');
-    const isJson = contentType?.includes('application/json') ?? false;
-
-    // Parallel header extraction while parsing body
-    const headersPromise = Object.fromEntries(response.headers.entries());
+    const isJson = response.headers.get('content-type')?.includes('application/json');
+    const headers: Record<string, string> = {};
+    response.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
     const data = isJson ? await response.json() : await response.text();
 
     if (response.ok) {
-      return {
-        success: true,
-        status: response.status,
-        data: data as T,
-        headers: headersPromise,
-      };
+      return { success: true, status: response.status, data: data as T, headers };
     }
 
     const message =
-      typeof data === 'object' && data && 'message' in data && typeof data.message === 'string'
+      typeof data === 'object' && data && 'message' in data
         ? data.message
         : typeof data === 'string'
           ? data
@@ -496,13 +286,11 @@ const executeRequest = async <T>(
     };
   } catch (err) {
     if (timeoutId) clearTimeout(timeoutId);
-
     const isAbortError =
       err instanceof Error && (err.name === 'AbortError' || /abort|timeout/i.test(err.message));
     const errorName = isAbortError ? 'TimeoutError' : 'NetworkError';
     const errorStatus = isAbortError ? 408 : 0;
     const errorMessage = err instanceof Error ? err.message : 'Request failed';
-
     return {
       success: false,
       status: errorStatus,
@@ -535,13 +323,10 @@ export default async function apiRequest<
     params,
     retries = CONFIG.DEFAULT_RETRIES,
     timeout = CONFIG.DEFAULT_TIMEOUT,
-    cache: cachePolicy = 'default',
-    next: nextOptions,
     headers: customHeaders,
     transform,
     priority = 'normal',
     signal,
-    batch = false,
     logTypes: shouldLogTypes = false,
   } = options;
 
@@ -554,80 +339,52 @@ export default async function apiRequest<
 
   let body: BodyInit | undefined;
   if (data) {
-    if (data instanceof FormData) {
-      body = data;
-    } else if (typeof data === 'string') {
-      body = data;
-    } else {
+    if (data instanceof FormData) body = data;
+    else if (typeof data === 'string') body = data;
+    else {
       headers['Content-Type'] = 'application/json';
       body = JSON.stringify(data);
     }
   }
 
-  const cacheKey = `${method}:${url}:${body ? 'with-body' : 'no-body'}`;
-
-  // Fast cache check for GET requests
-  if (method === 'GET' && cachePolicy !== 'no-store') {
-    const cached = cache.get(cacheKey);
-    if (cached) {
-      if (shouldLogTypes === true && CONFIG.IS_DEV && cached.success) {
-        logTypes(endpoint, cached.data, { duration: 0 });
-      }
-      return cached as ApiResponse<TResponse>;
-    }
-  }
-
   const startTime = Date.now();
 
-  const requestFactory = () =>
-    pool.execute(async () => {
-      let attempt = 0;
+  return pool.execute(async () => {
+    let attempt = 0;
 
-      while (true) {
-        attempt++;
-        const timeoutValue = typeof timeout === 'function' ? timeout(attempt) : timeout;
+    while (true) {
+      attempt++;
+      const timeoutValue = typeof timeout === 'function' ? timeout(attempt) : timeout;
+      const result = await executeRequest<TResponse>(method, url, {
+        body,
+        headers,
+        timeout: timeoutValue,
+        signal,
+      });
 
-        const result = await executeRequest<TResponse>(method, url, {
-          body,
-          headers,
-          cache: cachePolicy,
-          timeout: timeoutValue,
-          next: nextOptions,
-          signal,
-        });
-
-        if (result.success) {
-          if (method === 'GET' && cachePolicy !== 'no-store') cache.set(cacheKey, result);
-
-          const finalResult = transform ? { ...result, data: transform(result.data) } : result;
-
-          if (shouldLogTypes === true && CONFIG.IS_DEV) {
-            logTypes(endpoint, finalResult.data, {
-              duration: Date.now() - startTime,
-              attempt: attempt > 1 ? attempt : undefined,
-            });
-          }
-
-          return finalResult;
-        }
-
-        const canRetry =
-          attempt <= retries &&
-          CONFIG.IDEMPOTENT_METHODS.has(method) &&
-          (result.error.retryable || CONFIG.RETRY_CODES.has(result.status));
-
-        if (!canRetry) return result;
-
-        // Exponential backoff with jitter
-        const baseDelay = 100 * (1 << (attempt - 1)); // Bit shift for power of 2
-        const jitter = Math.random() * 100;
-        const delay = Math.min(1000, baseDelay + jitter);
-
-        await new Promise<void>((resolve) => setTimeout(resolve, delay));
+      if (result.success) {
+        const finalResult = transform ? { ...result, data: transform(result.data) } : result;
+        if (shouldLogTypes && CONFIG.IS_DEV)
+          logTypes(endpoint, finalResult.data, {
+            duration: Date.now() - startTime,
+            attempt: attempt > 1 ? attempt : undefined,
+          });
+        return finalResult;
       }
-    }, priority);
 
-  return coalescer.coalesce(cacheKey, requestFactory, batch);
+      const canRetry =
+        attempt <= retries &&
+        CONFIG.IDEMPOTENT_METHODS.has(method) &&
+        (result.error.retryable || CONFIG.RETRY_CODES.has(result.status));
+
+      if (!canRetry) return result;
+
+      const baseDelay = 100 * (1 << (attempt - 1));
+      const jitter = Math.random() * 100;
+      const delay = Math.min(1000, baseDelay + jitter);
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+    }
+  }, priority);
 }
 
 // -------------------- Utility Methods --------------------
@@ -642,38 +399,11 @@ apiRequest.isError = <T>(
 apiRequest.utils = {
   getStats: () => ({
     pool: pool.getStats(),
-    cache: cache.size(),
-    urls: urlCache.size(),
     runtime: IS_BUN ? 'bun' : IS_NODE ? 'node' : 'unknown',
   }),
-  clearCaches: () => {
-    cache.clear();
-    urlCache.clear();
-  },
-  batch: <T>(requests: Array<() => Promise<ApiResponse<T>>>): Promise<Array<ApiResponse<T>>> => {
-    const limitedRequests = requests.slice(0, CONFIG.BATCH_SIZE);
-    return Promise.all(limitedRequests.map((req) => req()));
-  },
   timeout: (ms: number): AbortSignal => {
     const controller = new AbortController();
     setTimeout(() => controller.abort(), ms);
     return controller.signal;
   },
-};
-
-// -------------------- Next.js 15 Cache Helpers --------------------
-apiRequest.cacheHelpers = {
-  revalidateTag,
-  revalidatePath,
-  cached: <TResponse = unknown, TBody extends RequestBody = RequestBody>(
-    key: string,
-    revalidateSeconds = 3600,
-    tags: string[] = [],
-  ) =>
-    unstable_cache(
-      (method: HttpMethod, endpoint: string, options: RequestOptions<TBody, TResponse> = {}) =>
-        apiRequest<TResponse, TBody>(method, endpoint, options),
-      [key],
-      { revalidate: revalidateSeconds, tags },
-    ),
 };
