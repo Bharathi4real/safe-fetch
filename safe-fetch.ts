@@ -51,6 +51,7 @@ const CONFIG = {
   BATCH_SIZE: IS_BUN ? 20 : 10,
   BATCH_DELAY: IS_BUN ? 25 : 50,
   IS_DEV: process.env.NODE_ENV === 'development',
+  LOG_SIZE_LIMIT: 50000,
 } as const;
 
 // -------------------- Adaptive Pool --------------------
@@ -187,8 +188,20 @@ const logTypes = <T>(
   metadata?: { duration?: number; attempt?: number },
 ): void => {
   try {
+    // Check if data is valid for stringification
+    if (!data || typeof data !== 'object') {
+      console.log(`🔍 [SafeFetch] "${endpoint}"`);
+      console.log(`type ${endpoint.replace(/[^\w]/g, '_')}Response = ${typeof data};`);
+      return;
+    }
+
     const dataStr = JSON.stringify(data);
-    if (dataStr.length > 10000) return;
+    if (dataStr.length > CONFIG.LOG_SIZE_LIMIT) {
+      console.log(
+        `🔍 [SafeFetch] "${endpoint}" - Response too large to log (${dataStr.length} chars, limit: ${CONFIG.LOG_SIZE_LIMIT})`,
+      );
+      return;
+    }
 
     const inferType = (val: unknown, depth = 0): string => {
       if (depth > 8) return '[Deep]';
@@ -215,7 +228,9 @@ const logTypes = <T>(
         `⏱️ ${metadata.duration}ms${metadata.attempt ? ` (attempt ${metadata.attempt})` : ''}`,
       );
     }
-  } catch {}
+  } catch (err) {
+    console.error('[SafeFetch] logTypes error:', err);
+  }
 };
 
 // -------------------- Core Request Logic --------------------
@@ -364,11 +379,15 @@ export default async function apiRequest<
 
       if (result.success) {
         const finalResult = transform ? { ...result, data: transform(result.data) } : result;
-        if (shouldLogTypes && CONFIG.IS_DEV)
+
+        // Log types when explicitly requested in development (data only, no headers)
+        if (shouldLogTypes && CONFIG.IS_DEV) {
           logTypes(endpoint, finalResult.data, {
             duration: Date.now() - startTime,
             attempt: attempt > 1 ? attempt : undefined,
           });
+        }
+
         return finalResult;
       }
 
