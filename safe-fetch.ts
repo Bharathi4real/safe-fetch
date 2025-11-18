@@ -70,7 +70,10 @@ class Pool {
   }> = [];
   private active = 0;
   private readonly maxConcurrent = CONFIG.MAX_CONCURRENT;
-  private readonly priorityMap = { high: 3, normal: 2, low: 1 };
+
+  private priorityValue(priority: "high" | "normal" | "low"): number {
+    return priority === "high" ? 3 : priority === "normal" ? 2 : 1;
+  }
 
   async execute<T>(
     fn: () => Promise<T>,
@@ -78,7 +81,7 @@ class Pool {
   ): Promise<T> {
     if (this.active < this.maxConcurrent) return this.run(fn);
 
-    const priorityNum = this.priorityMap[priority];
+    const priorityNum = this.priorityValue(priority);
     return new Promise<T>((resolve, reject) => {
       const task = {
         fn: fn as () => Promise<unknown>,
@@ -117,8 +120,8 @@ class Pool {
 
   private processQueue(): void {
     while (this.queue.length > 0 && this.active < this.maxConcurrent) {
-      // biome-ignore lint/style/noNonNullAssertion: <needed>
-      const task = this.queue.shift()!;
+      const task = this.queue.shift();
+      if (!task) break;
       this.run(task.fn as () => Promise<unknown>)
         .then(task.resolve)
         .catch(task.reject);
