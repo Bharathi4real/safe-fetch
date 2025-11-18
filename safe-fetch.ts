@@ -4,22 +4,28 @@
  * Memory-optimized with unified retry, timeout & adaptive pooling
  */
 
-'use server';
+"use server";
 
-const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const;
+const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH"] as const;
 
 export type HttpMethod = (typeof HTTP_METHODS)[number];
 export type RequestBody = Record<string, unknown> | FormData | string | null;
-export type QueryParams = Record<string, string | number | boolean | null | undefined>;
+export type QueryParams = Record<
+  string,
+  string | number | boolean | null | undefined
+>;
 
-export interface RequestOptions<TBody extends RequestBody = RequestBody, TResponse = unknown> {
+export interface RequestOptions<
+  TBody extends RequestBody = RequestBody,
+  TResponse = unknown,
+> {
   data?: TBody;
   params?: QueryParams;
   retries?: number;
   timeout?: number | ((attempt: number) => number);
   headers?: Record<string, string>;
   transform?<T = TResponse, R = TResponse>(data: T): R;
-  priority?: 'high' | 'normal' | 'low';
+  priority?: "high" | "normal" | "low";
   signal?: AbortSignal;
   batch?: boolean;
   logTypes?: boolean;
@@ -37,20 +43,20 @@ export type ApiResponse<T = unknown> =
   | { success: false; status: number; error: ApiError; data: null };
 
 // -------------------- Runtime Detection --------------------
-const IS_BUN = typeof globalThis !== 'undefined' && 'Bun' in globalThis;
-const IS_NODE = !IS_BUN && typeof process !== 'undefined';
+const IS_BUN = typeof globalThis !== "undefined" && "Bun" in globalThis;
+const IS_NODE = !IS_BUN && typeof process !== "undefined";
 
 // -------------------- Configuration --------------------
 const CONFIG = {
-  API_URL: process.env.NEXT_PUBLIC_API_URL ?? process.env.BASE_URL ?? '',
+  API_URL: process.env.NEXT_PUBLIC_API_URL ?? process.env.BASE_URL ?? "",
   RETRY_CODES: new Set([408, 429, 500, 502, 503, 504]),
-  IDEMPOTENT_METHODS: new Set<HttpMethod>(['GET', 'PUT', 'DELETE']),
+  IDEMPOTENT_METHODS: new Set<HttpMethod>(["GET", "PUT", "DELETE"]),
   DEFAULT_TIMEOUT: 60000,
   DEFAULT_RETRIES: 2,
   MAX_CONCURRENT: IS_BUN ? 20 : 10,
   BATCH_SIZE: IS_BUN ? 20 : 10,
   BATCH_DELAY: IS_BUN ? 25 : 50,
-  IS_DEV: process.env.NODE_ENV === 'development',
+  IS_DEV: process.env.NODE_ENV === "development",
   LOG_SIZE_LIMIT: 50000,
 } as const;
 
@@ -68,7 +74,7 @@ class Pool {
 
   async execute<T>(
     fn: () => Promise<T>,
-    priority: 'high' | 'normal' | 'low' = 'normal',
+    priority: "high" | "normal" | "low" = "normal",
   ): Promise<T> {
     if (this.active < this.maxConcurrent) return this.run(fn);
 
@@ -111,6 +117,7 @@ class Pool {
 
   private processQueue(): void {
     while (this.queue.length > 0 && this.active < this.maxConcurrent) {
+      // biome-ignore lint/style/noNonNullAssertion: <needed>
       const task = this.queue.shift()!;
       this.run(task.fn as () => Promise<unknown>)
         .then(task.resolve)
@@ -131,8 +138,12 @@ const pool = new Pool();
 
 // -------------------- Utilities --------------------
 const buildUrl = (endpoint: string, params?: QueryParams): string => {
-  const isAbsolute = endpoint.charCodeAt(0) === 104 && endpoint.startsWith('http');
-  if (!params) return isAbsolute ? endpoint : `${CONFIG.API_URL}/${endpoint.replace(/^\//, '')}`;
+  const isAbsolute =
+    endpoint.charCodeAt(0) === 104 && endpoint.startsWith("http");
+  if (!params)
+    return isAbsolute
+      ? endpoint
+      : `${CONFIG.API_URL}/${endpoint.replace(/^\//, "")}`;
 
   const parts: string[] = [];
   const entries = Object.entries(params);
@@ -140,32 +151,38 @@ const buildUrl = (endpoint: string, params?: QueryParams): string => {
   for (let i = 0, len = entries.length; i < len; i++) {
     const [key, value] = entries[i];
     if (value != null)
-      parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+      parts.push(
+        `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`,
+      );
   }
 
-  const query = parts.length > 0 ? `?${parts.join('&')}` : '';
+  const query = parts.length > 0 ? `?${parts.join("&")}` : "";
   return isAbsolute
     ? `${endpoint}${query}`
-    : `${CONFIG.API_URL}/${endpoint.replace(/^\//, '')}${query}`;
+    : `${CONFIG.API_URL}/${endpoint.replace(/^\//, "")}${query}`;
 };
 
 const getAuthHeaders = (() => {
   let cached: Record<string, string> | null = null;
   let lastCheck = 0;
-  let authString = '';
+  let authString = "";
 
   return (): Record<string, string> => {
     const now = Date.now();
     if (cached && now - lastCheck < 300000) return cached;
 
     const headers: Record<string, string> = {};
-    const { AUTH_USERNAME: user, AUTH_PASSWORD: pass, API_TOKEN: token } = process.env;
+    const {
+      AUTH_USERNAME: user,
+      AUTH_PASSWORD: pass,
+      API_TOKEN: token,
+    } = process.env;
 
     if (user && pass) {
       if (!authString || now - lastCheck >= 300000) {
         authString = IS_BUN
           ? btoa(`${user}:${pass}`)
-          : Buffer.from(`${user}:${pass}`).toString('base64');
+          : Buffer.from(`${user}:${pass}`).toString("base64");
       }
       headers.Authorization = `Basic ${authString}`;
     } else if (token) {
@@ -178,8 +195,12 @@ const getAuthHeaders = (() => {
   };
 })();
 
-const createError = (name: string, message: string, status: number, retryable = false): ApiError =>
-  Object.freeze({ name, message, status, retryable });
+const createError = (
+  name: string,
+  message: string,
+  status: number,
+  retryable = false,
+): ApiError => Object.freeze({ name, message, status, retryable });
 
 // -------------------- Type Logging --------------------
 const logTypes = <T>(
@@ -188,14 +209,45 @@ const logTypes = <T>(
   metadata?: { duration?: number; attempt?: number },
 ): void => {
   try {
-    // Check if data is valid for stringification
-    if (!data || typeof data !== 'object') {
+    let payload: unknown = data;
+
+    const isApiWrapper = (
+      obj: unknown,
+    ): obj is {
+      success: boolean;
+      data?: unknown;
+      headers?: Record<string, string>;
+      status?: number;
+    } =>
+      typeof obj === "object" &&
+      obj !== null &&
+      "success" in (obj as Record<string, unknown>) &&
+      ("headers" in (obj as Record<string, unknown>) ||
+        "status" in (obj as Record<string, unknown>));
+
+    if (isApiWrapper(payload)) {
+      payload = (payload as { data?: unknown }).data;
+    }
+
+    if (payload == null || typeof payload !== "object") {
+      const simpleType = payload === null ? "null" : typeof payload;
       console.log(`🔍 [SafeFetch] "${endpoint}"`);
-      console.log(`type ${endpoint.replace(/[^\w]/g, '_')}Response = ${typeof data};`);
+      console.log(
+        `type ${endpoint.replace(/[^\w]/g, "_")}Response = ${simpleType};`,
+      );
       return;
     }
 
-    const dataStr = JSON.stringify(data);
+    let dataStr: string;
+    try {
+      dataStr = JSON.stringify(payload);
+    } catch (_error) {
+      console.log(
+        `🔍 [SafeFetch] "${endpoint}" - Response cannot be stringified for logging`,
+      );
+      return;
+    }
+
     if (dataStr.length > CONFIG.LOG_SIZE_LIMIT) {
       console.log(
         `🔍 [SafeFetch] "${endpoint}" - Response too large to log (${dataStr.length} chars, limit: ${CONFIG.LOG_SIZE_LIMIT})`,
@@ -204,32 +256,38 @@ const logTypes = <T>(
     }
 
     const inferType = (val: unknown, depth = 0): string => {
-      if (depth > 8) return '[Deep]';
-      if (val == null) return val === null ? 'null' : 'undefined';
+      if (depth > 8) return "[Deep]";
+      if (val == null) return val === null ? "null" : "undefined";
       if (Array.isArray(val)) {
-        if (val.length === 0) return 'unknown[]';
-        const types = [...new Set(val.slice(0, 3).map((item) => inferType(item, depth + 1)))];
-        return types.length === 1 ? `${types[0]}[]` : `(${types.join(' | ')})[]`;
+        if (val.length === 0) return "unknown[]";
+        const types = [
+          ...new Set(val.slice(0, 3).map((item) => inferType(item, depth + 1))),
+        ];
+        return types.length === 1
+          ? `${types[0]}[]`
+          : `(${types.join(" | ")})[]`;
       }
-      if (typeof val === 'object') {
+      if (typeof val === "object") {
         const entries = Object.entries(val).slice(0, 15);
-        const props = entries.map(([k, v]) => `  ${k}: ${inferType(v, depth + 1)};`).join('\n');
+        const props = entries
+          .map(([k, v]) => `  ${k}: ${inferType(v, depth + 1)};`)
+          .join("\n");
         return `{\n${props}\n}`;
       }
       return typeof val;
     };
 
-    const typeName = endpoint.replace(/[^\w]/g, '_') || 'ApiResponse';
-    const typeDefinition = `type ${typeName}Response = ${inferType(data)};`;
+    const typeName = endpoint.replace(/[^\w]/g, "_") || "ApiResponse";
+    const typeDefinition = `type ${typeName}Response = ${inferType(payload)};`;
 
-    console.log(`🔍 [SafeFetch] "${endpoint}"\n${typeDefinition}`);
+    console.log(`[SafeFetch] "${endpoint}"\n${typeDefinition}`);
     if (metadata?.duration !== undefined) {
       console.log(
-        `⏱️ ${metadata.duration}ms${metadata.attempt ? ` (attempt ${metadata.attempt})` : ''}`,
+        `⏱️ ${metadata.duration}ms${metadata.attempt ? ` (attempt ${metadata.attempt})` : ""}`,
       );
     }
   } catch (err) {
-    console.error('[SafeFetch] logTypes error:', err);
+    console.error("[SafeFetch] logTypes error:", err);
   }
 };
 
@@ -251,8 +309,8 @@ const executeRequest = async <T>(
     ? (() => {
         const combined = new AbortController();
         const abort = () => combined.abort();
-        options.signal!.addEventListener('abort', abort, { once: true });
-        controller.signal.addEventListener('abort', abort, { once: true });
+        options.signal.addEventListener("abort", abort, { once: true });
+        controller.signal.addEventListener("abort", abort, { once: true });
         return combined.signal;
       })()
     : controller.signal;
@@ -270,7 +328,9 @@ const executeRequest = async <T>(
     const response = await fetch(url, fetchOptions);
     clearTimeout(timeoutId);
 
-    const isJson = response.headers.get('content-type')?.includes('application/json');
+    const isJson = response.headers
+      .get("content-type")
+      ?.includes("application/json");
     const headers: Record<string, string> = {};
     response.headers.forEach((value, key) => {
       headers[key] = value;
@@ -278,13 +338,18 @@ const executeRequest = async <T>(
     const data = isJson ? await response.json() : await response.text();
 
     if (response.ok) {
-      return { success: true, status: response.status, data: data as T, headers };
+      return {
+        success: true,
+        status: response.status,
+        data: data as T,
+        headers,
+      };
     }
 
     const message =
-      typeof data === 'object' && data && 'message' in data
+      typeof data === "object" && data && "message" in data
         ? data.message
-        : typeof data === 'string'
+        : typeof data === "string"
           ? data
           : `HTTP ${response.status}`;
 
@@ -292,7 +357,7 @@ const executeRequest = async <T>(
       success: false,
       status: response.status,
       error: createError(
-        'HttpError',
+        "HttpError",
         message,
         response.status,
         CONFIG.RETRY_CODES.has(response.status),
@@ -302,10 +367,11 @@ const executeRequest = async <T>(
   } catch (err) {
     if (timeoutId) clearTimeout(timeoutId);
     const isAbortError =
-      err instanceof Error && (err.name === 'AbortError' || /abort|timeout/i.test(err.message));
-    const errorName = isAbortError ? 'TimeoutError' : 'NetworkError';
+      err instanceof Error &&
+      (err.name === "AbortError" || /abort|timeout/i.test(err.message));
+    const errorName = isAbortError ? "TimeoutError" : "NetworkError";
     const errorStatus = isAbortError ? 408 : 0;
-    const errorMessage = err instanceof Error ? err.message : 'Request failed';
+    const errorMessage = err instanceof Error ? err.message : "Request failed";
     return {
       success: false,
       status: errorStatus,
@@ -328,7 +394,7 @@ export default async function apiRequest<
     return {
       success: false,
       status: 400,
-      error: createError('ValidationError', `Invalid method: ${method}`, 400),
+      error: createError("ValidationError", `Invalid method: ${method}`, 400),
       data: null,
     };
   }
@@ -340,14 +406,14 @@ export default async function apiRequest<
     timeout = CONFIG.DEFAULT_TIMEOUT,
     headers: customHeaders,
     transform,
-    priority = 'normal',
+    priority = "normal",
     signal,
     logTypes: shouldLogTypes = false,
   } = options;
 
   const url = buildUrl(endpoint, params);
   const headers: Record<string, string> = {
-    Accept: 'application/json',
+    Accept: "application/json",
     ...getAuthHeaders(),
     ...customHeaders,
   };
@@ -355,9 +421,9 @@ export default async function apiRequest<
   let body: BodyInit | undefined;
   if (data) {
     if (data instanceof FormData) body = data;
-    else if (typeof data === 'string') body = data;
+    else if (typeof data === "string") body = data;
     else {
-      headers['Content-Type'] = 'application/json';
+      headers["Content-Type"] = "application/json";
       body = JSON.stringify(data);
     }
   }
@@ -369,7 +435,8 @@ export default async function apiRequest<
 
     while (true) {
       attempt++;
-      const timeoutValue = typeof timeout === 'function' ? timeout(attempt) : timeout;
+      const timeoutValue =
+        typeof timeout === "function" ? timeout(attempt) : timeout;
       const result = await executeRequest<TResponse>(method, url, {
         body,
         headers,
@@ -378,9 +445,11 @@ export default async function apiRequest<
       });
 
       if (result.success) {
-        const finalResult = transform ? { ...result, data: transform(result.data) } : result;
+        const finalResult = transform
+          ? { ...result, data: transform(result.data) }
+          : result;
 
-        // Log types when explicitly requested in development (data only, no headers)
+        // Only log the *data*, never headers or wrapper response
         if (shouldLogTypes && CONFIG.IS_DEV) {
           logTypes(endpoint, finalResult.data, {
             duration: Date.now() - startTime,
@@ -418,7 +487,7 @@ apiRequest.isError = <T>(
 apiRequest.utils = {
   getStats: () => ({
     pool: pool.getStats(),
-    runtime: IS_BUN ? 'bun' : IS_NODE ? 'node' : 'unknown',
+    runtime: IS_BUN ? "bun" : IS_NODE ? "node" : "unknown",
   }),
   timeout: (ms: number): AbortSignal => {
     const controller = new AbortController();
