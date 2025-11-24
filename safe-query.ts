@@ -1,7 +1,7 @@
 /**
- * SafeFetch + TanStack Query Integration
+ * SafeFetch + TanStack Query Integration (Server Action Compatible)
  * (c) 2025 Bharathi4real – BSD 3-Clause License
- * Drop-in query/mutation wrappers with SafeFetch DX
+ * Handles serialization boundaries for 'use server' SafeFetch
  */
 
 'use client';
@@ -19,30 +19,64 @@ import apiRequest, {
   type RequestOptions,
   type ApiResponse,
   type RequestBody,
+  type ApiError,
 } from './safefetch';
+
+// -------------------- Custom Error Wrapper --------------------
+
+export class SafeFetchError extends Error {
+  readonly name: string;
+  readonly status: number;
+  readonly retryable: boolean;
+  readonly originalError: ApiError;
+
+  constructor(error: ApiError) {
+    super(error.message);
+    this.name = error.name;
+    this.status = error.status;
+    this.retryable = !!error.retryable;
+    this.originalError = error;
+    Object.setPrototypeOf(this, SafeFetchError.prototype);
+  }
+}
+
+// -------------------- Serialization Utility --------------------
+
+/**
+ * Strips non-serializable properties (functions, signals) before sending to Server Action.
+ * Server Actions cannot accept functions or complex objects like AbortSignal.
+ */
+function prepareServerOptions<TBody extends RequestBody>(
+  options: RequestOptions<TBody>
+): RequestOptions<TBody> {
+  const {
+    // Non-serializable properties to STRIP
+    signal, 
+    transform, 
+    timeout, 
+    // Serializable properties to KEEP
+    ...serializableOptions 
+  } = options;
+
+  // We can pass numeric timeouts, but not functions
+  if (typeof timeout === 'number') {
+    return { ...serializableOptions, timeout };
+  }
+
+  return serializableOptions;
+}
 
 // -------------------- Core Query Function --------------------
 
-interface QueryOptions<TResponse = unknown> extends RequestOptions {
+interface QueryOptions<TResponse = unknown>
+  extends Omit<RequestOptions, 'data'>,
+    Omit<
+      UseQueryOptions<TResponse, SafeFetchError, TResponse, QueryKey>,
+      'queryKey' | 'queryFn'
+    > {
   queryKey: QueryKey;
-  enabled?: boolean;
-  staleTime?: number;
-  gcTime?: number;
-  refetchOnWindowFocus?: boolean;
-  refetchOnMount?: boolean;
-  refetchInterval?: number | false;
-  retry?: number | boolean;
-  retryDelay?: number | ((attempt: number) => number);
-  placeholderData?: TResponse;
 }
 
-/**
- * Main query function - similar DX to apiRequest
- * @example
- * const result = query(['users', id], 'GET', `/users/${id}`, {
- *   staleTime: 5 * 60 * 1000
- * });
- */
 export function query<TResponse = unknown>(
   queryKey: QueryKey,
   method: 'GET',
@@ -59,19 +93,28 @@ export function query<TResponse = unknown>(
     retry,
     retryDelay,
     placeholderData,
+    transform, // Extract transform to run on CLIENT
     ...requestOpts
   } = options ?? {};
 
-  return useQuery({
+  return useQuery<TResponse, SafeFetchError, TResponse, QueryKey>({
     queryKey,
-    queryFn: async ({ signal }) => {
-      const response = await apiRequest<TResponse>(method, endpoint, {
-        ...requestOpts,
-        signal,
-      });
+    queryFn: async () => {
+      // 1. Prepare options (strip functions/signals)
+      const serverOpts = prepareServerOptions(requestOpts);
 
+      // 2. Call Server Action
+      // Note: We cannot pass the Client's 'signal' to the Server Action easily
+      const response = await apiRequest<TResponse>(method, endpoint, serverOpts);
+
+      // 3. Handle Errors
       if (!response.success) {
-        throw new Error(response.error.message, { cause: response.error });
+        throw new SafeFetchError(response.error);
+      }
+
+      // 4. Run Transform on Client (since we couldn't pass it to server)
+      if (transform) {
+        return transform(response.data) as TResponse;
       }
 
       return response.data;
@@ -90,74 +133,68 @@ export function query<TResponse = unknown>(
 
 // -------------------- Mutation Function --------------------
 
-interface MutationOptions<TResponse = unknown, TBody extends RequestBody = RequestBody>
-  extends Omit<RequestOptions<TBody, TResponse>, 'data'> {
+interface MutationOptions<TResponse = unknown, TBody extends RequestBody | void = RequestBody>
+  extends Omit<RequestOptions<TBody extends RequestBody ? TBody : RequestBody, TResponse>, 'data'>,
+    Omit<
+      UseMutationOptions<TResponse, SafeFetchError, TBody, unknown>,
+      'mutationFn'
+    > {
   invalidate?: QueryKey[];
-  onSuccess?: (data: TResponse, variables: TBody | void) => void | Promise<void>;
-  onError?: (error: Error, variables: TBody | void) => void | Promise<void>;
-  onSettled?: (
-    data: TResponse | undefined,
-    error: Error | null,
-    variables: TBody | void
-  ) => void | Promise<void>;
 }
 
-/**
- * Main mutation function - similar DX to apiRequest
- * @example
- * const createUser = mutate('POST', '/users', {
- *   invalidate: [['users']],
- *   onSuccess: (data) => console.log('Created:', data)
- * });
- * createUser.mutate({ name: 'John' });
- */
-export function mutate<TResponse = unknown, TBody extends RequestBody = RequestBody>(
+export function mutate<TResponse = unknown, TBody extends RequestBody | void = RequestBody>(
   method: Exclude<HttpMethod, 'GET'>,
   endpoint: string,
   options?: MutationOptions<TResponse, TBody>
 ) {
   const queryClient = useQueryClient();
-  const { invalidate, onSuccess, onError, onSettled, ...requestOpts } = options ?? {};
+  const { 
+    invalidate, 
+    onSuccess, 
+    onError, 
+    onSettled, 
+    transform, // Extract transform
+    ...requestOpts 
+  } = options ?? {};
 
-  return useMutation({
-    mutationFn: async (data?: TBody) => {
-      const response = await apiRequest<TResponse, TBody>(method, endpoint, {
+  return useMutation<TResponse, SafeFetchError, TBody, unknown>({
+    mutationFn: async (variables) => {
+      const dataPayload = (variables ?? null) as RequestBody;
+      
+      // 1. Prepare options
+      const serverOpts = prepareServerOptions({
         ...requestOpts,
-        data: data ?? null,
+        data: dataPayload,
       });
 
+      // 2. Call Server Action
+      const response = await apiRequest<TResponse>(method, endpoint, serverOpts);
+
+      // 3. Handle Errors
       if (!response.success) {
-        throw new Error(response.error.message, { cause: response.error });
+        throw new SafeFetchError(response.error);
+      }
+
+      // 4. Client-side Transform
+      if (transform) {
+        return transform(response.data) as TResponse;
       }
 
       return response.data;
     },
-    onSuccess: async (data, variables) => {
+    onSuccess: async (data, variables, context) => {
       if (invalidate && invalidate.length > 0) {
         await Promise.all(
-          invalidate.map((key) => queryClient.invalidateQueries({ queryKey: key }))
+          invalidate.map((key) =>
+            queryClient.invalidateQueries({ queryKey: key })
+          )
         );
       }
-      await onSuccess?.(data, variables);
+      if (onSuccess) await onSuccess(data, variables, context);
     },
     onError,
     onSettled,
   });
-}
-
-// -------------------- Convenience Exports --------------------
-
-/**
- * Simpler query hook when you don't need all options
- * @example
- * const { data, isLoading } = useQuery(['users'], '/users');
- */
-export function useQuery_<TResponse = unknown>(
-  queryKey: QueryKey,
-  endpoint: string,
-  options?: Omit<QueryOptions<TResponse>, 'queryKey'>
-) {
-  return query<TResponse>(queryKey, 'GET', endpoint, options);
 }
 
 // -------------------- Direct Method Exports --------------------
@@ -187,16 +224,15 @@ export function PATCH<TResponse = unknown, TBody extends RequestBody = RequestBo
 
 export function DELETE<TResponse = unknown>(
   endpoint: string,
-  options?: MutationOptions<TResponse, never>
+  options?: MutationOptions<TResponse, void>
 ) {
-  return mutate<TResponse, never>('DELETE', endpoint, options);
+  return mutate<TResponse, void>('DELETE', endpoint, options);
 }
 
 // -------------------- Utilities --------------------
 
-/**
- * Prefetch data before navigation
- */
+// Note: prefetch runs on the server (usually), so direct calls are fine, 
+// but we keep the wrapper consistent.
 export async function prefetch<TResponse = unknown>(
   queryClient: ReturnType<typeof useQueryClient>,
   queryKey: QueryKey,
@@ -206,18 +242,22 @@ export async function prefetch<TResponse = unknown>(
   await queryClient.prefetchQuery({
     queryKey,
     queryFn: async () => {
-      const response = await apiRequest<TResponse>('GET', endpoint, options);
+      // Direct call is safe here if prefetch is running on server component, 
+      // but if running on client, we must sanitize.
+      const serverOpts = prepareServerOptions(options || {});
+      const response = await apiRequest<TResponse>('GET', endpoint, serverOpts);
+      
       if (!response.success) {
-        throw new Error(response.error.message, { cause: response.error });
+        throw new SafeFetchError(response.error);
       }
+      
+      // We don't transform prefetch data usually, but if needed, 
+      // logic would go here.
       return response.data;
     },
   });
 }
 
-/**
- * Query key factory
- */
 export function keys<T extends string>(prefix: T) {
   return {
     all: [prefix] as const,
@@ -227,20 +267,4 @@ export function keys<T extends string>(prefix: T) {
     details: () => [prefix, 'detail'] as const,
     detail: (id: string | number) => [prefix, 'detail', id] as const,
   };
-}
-
-/**
- * Optimistic update helper
- */
-export async function optimistic<TData>(
-  queryClient: ReturnType<typeof useQueryClient>,
-  queryKey: QueryKey,
-  updater: (old: TData) => TData
-) {
-  await queryClient.cancelQueries({ queryKey });
-  const previousData = queryClient.getQueryData<TData>(queryKey);
-  if (previousData) {
-    queryClient.setQueryData<TData>(queryKey, updater(previousData));
-  }
-  return { previousData };
 }
