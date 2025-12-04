@@ -1,7 +1,10 @@
 /**
- * SafeFetch – Optimized Typed Fetch utility for React + Bun + Vite
+ * SafeFetch – Client-side Typed Fetch utility for React + Vite
  * (c) 2025 Bharathi4real – BSD 3-Clause License
  * Memory-optimized with unified retry, timeout & adaptive pooling
+ * 
+ * Note: This is the CLIENT-SIDE version. No credentials are stored here.
+ * Use with a backend proxy that handles authentication.
  */
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH"] as const;
@@ -27,6 +30,8 @@ export interface RequestOptions<
   batch?: boolean;
   logTypes?: boolean;
   cache?: RequestCache;
+  // Optional token for authenticated requests (e.g., from login)
+  token?: string;
 }
 
 export interface ApiError {
@@ -45,7 +50,8 @@ const IS_BUN = typeof globalThis !== "undefined" && "Bun" in globalThis;
 
 // -------------------- Configuration --------------------
 const CONFIG = {
-  API_URL: import.meta.env.VITE_API_URL ?? import.meta.env.VITE_BASE_URL ?? "",
+  // Points to your backend proxy (where credentials are stored)
+  API_URL: import.meta.env.VITE_API_URL ?? "",
   RETRY_CODES: new Set([408, 429, 500, 502, 503, 504]),
   IDEMPOTENT_METHODS: new Set(["GET", "PUT", "DELETE"]),
   DEFAULT_TIMEOUT: 60000,
@@ -156,35 +162,6 @@ const buildUrl = (endpoint: string, params?: QueryParams): string => {
     ? `${endpoint}${query}`
     : `${CONFIG.API_URL}/${endpoint.replace(/^\//, "")}${query}`;
 };
-
-const getAuthHeaders = (() => {
-  let cached: Record<string, string> | null = null;
-  let lastCheck = 0;
-  let authString = "";
-
-  return (): Record<string, string> => {
-    const now = Date.now();
-    if (cached && now - lastCheck < 300000) return cached;
-
-    const headers: Record<string, string> = {};
-    const user = import.meta.env.VITE_AUTH_USERNAME;
-    const pass = import.meta.env.VITE_AUTH_PASSWORD;
-    const token = import.meta.env.VITE_API_TOKEN;
-
-    if (user && pass) {
-      if (!authString || now - lastCheck >= 300000) {
-        authString = btoa(`${user}:${pass}`);
-      }
-      headers.Authorization = `Basic ${authString}`;
-    } else if (token) {
-      headers.Authorization = `Bearer ${token}`;
-    }
-
-    cached = headers;
-    lastCheck = now;
-    return headers;
-  };
-})();
 
 const createError = (
   name: string,
@@ -318,6 +295,7 @@ const executeRequest = async <T>(
       headers: options.headers,
       signal,
       cache: options.cache,
+      credentials: 'include', // Important: allows cookies from backend proxy
     };
     if (options.body !== undefined) fetchOptions.body = options.body;
 
@@ -418,14 +396,19 @@ export default async function apiRequest<
     signal,
     logTypes: shouldLogTypes = false,
     cache,
+    token,
   } = options;
 
   const url = buildUrl(endpoint, params);
   const headers: Record<string, string> = {
     Accept: "application/json",
-    ...getAuthHeaders(),
     ...customHeaders,
   };
+
+  // Add token if provided (e.g., from user login)
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
 
   let body: BodyInit | undefined;
   if (data) {
