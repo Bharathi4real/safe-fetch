@@ -43,7 +43,7 @@ const IS_BUN = typeof globalThis !== 'undefined' && 'Bun' in globalThis;
 const IS_NODE = !IS_BUN && typeof process !== 'undefined';
 
 // -------------------- Configuration --------------------
-const CONFIG = {
+const CONFIG = Object.freeze({
   API_URL: process.env.NEXT_PUBLIC_API_URL ?? process.env.BASE_URL ?? '',
   RETRY_CODES: new Set([408, 429, 500, 502, 503, 504]),
   IDEMPOTENT_METHODS: new Set<HttpMethod>(['GET', 'PUT', 'DELETE']),
@@ -54,10 +54,10 @@ const CONFIG = {
   BATCH_DELAY: IS_BUN ? 25 : 50,
   IS_DEV: process.env.NODE_ENV === 'development',
   LOG_SIZE_LIMIT: 50000,
-} as const;
+});
 
 // -------------------- Adaptive Pool --------------------
-class Pool {
+class RequestPool {
   private readonly queue: Array<{
     fn: () => Promise<unknown>;
     resolve: (value: unknown) => void;
@@ -65,29 +65,33 @@ class Pool {
     priority: number;
   }> = [];
   private active = 0;
-  private readonly maxConcurrent = CONFIG.MAX_CONCURRENT;
+  private readonly maxConcurrent: number;
 
-  private priorityValue(priority: 'high' | 'normal' | 'low'): number {
-    return priority === 'high' ? 3 : priority === 'normal' ? 2 : 1;
+  constructor(maxConcurrent = CONFIG.MAX_CONCURRENT) {
+    this.maxConcurrent = maxConcurrent;
+  }
+
+  private static getPriorityValue(priority: 'high' | 'normal' | 'low'): number {
+    const priorityMap = { high: 3, normal: 2, low: 1 } as const;
+    return priorityMap[priority];
   }
 
   async execute<T>(
     fn: () => Promise<T>,
     priority: 'high' | 'normal' | 'low' = 'normal',
   ): Promise<T> {
-    if (this.active < this.maxConcurrent) return this.run(fn);
+    if (this.active < this.maxConcurrent) {
+      return this.run(fn);
+    }
 
-    const priorityNum = this.priorityValue(priority);
+    const priorityNum = RequestPool.getPriorityValue(priority);
     return new Promise<T>((resolve, reject) => {
-      const task = {
+      this.queue.splice(this.findInsertIndex(priorityNum), 0, {
         fn: fn as () => Promise<unknown>,
         resolve: resolve as (value: unknown) => void,
         reject,
         priority: priorityNum,
-      };
-
-      const idx = this.findInsertIndex(priorityNum);
-      this.queue.splice(idx, 0, task);
+      });
     });
   }
 
@@ -97,8 +101,11 @@ class Pool {
 
     while (left < right) {
       const mid = (left + right) >>> 1;
-      if (this.queue[mid].priority >= priority) left = mid + 1;
-      else right = mid;
+      if (this.queue[mid].priority >= priority) {
+        left = mid + 1;
+      } else {
+        right = mid;
+      }
     }
 
     return left;
@@ -118,7 +125,8 @@ class Pool {
     while (this.queue.length > 0 && this.active < this.maxConcurrent) {
       const task = this.queue.shift();
       if (!task) break;
-      this.run(task.fn as () => Promise<unknown>)
+      
+      this.run(task.fn)
         .then(task.resolve)
         .catch(task.reject);
     }
@@ -133,59 +141,105 @@ class Pool {
   }
 }
 
-const pool = new Pool();
+const pool = new RequestPool();
 
 // -------------------- Utilities --------------------
 const buildUrl = (endpoint: string, params?: QueryParams): string => {
-  const isAbsolute = endpoint.charCodeAt(0) === 104 && endpoint.startsWith('http');
-  if (!params) return isAbsolute ? endpoint : `${CONFIG.API_URL}/${endpoint.replace(/^\//, '')}`;
-
-  const parts: string[] = [];
-  const entries = Object.entries(params);
-
-  for (let i = 0, len = entries.length; i < len; i++) {
-    const [key, value] = entries[i];
-    if (value != null)
-      parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+  const isAbsolute = endpoint.startsWith('http');
+  
+  let baseUrl = endpoint;
+  if (!isAbsolute) {
+    const cleanedEndpoint = endpoint.replace(/^\//, '');
+    baseUrl = `${CONFIG.API_URL}/${cleanedEndpoint}`;
   }
 
-  const query = parts.length > 0 ? `?${parts.join('&')}` : '';
-  return isAbsolute
-    ? `${endpoint}${query}`
-    : `${CONFIG.API_URL}/${endpoint.replace(/^\//, '')}${query}`;
+  if (!params) return baseUrl;
+
+  const searchParams = new URLSearchParams();
+  
+  for (const [key, value] of Object.entries(params)) {
+    if (value != null) {
+      searchParams.append(key, String(value));
+    }
+  }
+
+  const queryString = searchParams.toString();
+  return queryString ? `${baseUrl}?${queryString}` : baseUrl;
 };
 
 const getAuthHeaders = (() => {
-  let cached: Record<string, string> | null = null;
+  let cache: Record<string, string> | null = null;
   let lastCheck = 0;
-  let authString = '';
+  const CACHE_TTL = 300000; // 5 minutes
 
   return (): Record<string, string> => {
     const now = Date.now();
-    if (cached && now - lastCheck < 300000) return cached;
+    if (cache && now - lastCheck < CACHE_TTL) {
+      return cache;
+    }
 
     const headers: Record<string, string> = {};
     const { AUTH_USERNAME: user, AUTH_PASSWORD: pass, API_TOKEN: token } = process.env;
 
     if (user && pass) {
-      if (!authString || now - lastCheck >= 300000) {
-        authString = IS_BUN
-          ? btoa(`${user}:${pass}`)
-          : Buffer.from(`${user}:${pass}`).toString('base64');
-      }
-      headers.Authorization = `Basic ${authString}`;
+      const credentials = `${user}:${pass}`;
+      const encoded = IS_BUN ? btoa(credentials) : Buffer.from(credentials).toString('base64');
+      headers.Authorization = `Basic ${encoded}`;
     } else if (token) {
       headers.Authorization = `Bearer ${token}`;
     }
 
-    cached = headers;
+    cache = headers;
     lastCheck = now;
     return headers;
   };
 })();
 
-const createError = (name: string, message: string, status: number, retryable = false): ApiError =>
-  Object.freeze({ name, message, status, retryable });
+const createError = (
+  name: string,
+  message: string,
+  status: number,
+  retryable = false,
+): ApiError => ({
+  name,
+  message,
+  status,
+  retryable,
+});
+
+// -------------------- Type Inference --------------------
+class TypeInferrer {
+  private static readonly MAX_DEPTH = 8;
+  private static readonly MAX_SAMPLE_SIZE = 3;
+  private static readonly MAX_PROPERTIES = 15;
+
+  static infer(val: unknown, depth = 0): string {
+    if (depth > this.MAX_DEPTH) return 'unknown';
+    
+    if (val === null) return 'null';
+    if (val === undefined) return 'undefined';
+    
+    if (Array.isArray(val)) {
+      if (val.length === 0) return 'unknown[]';
+      
+      const samples = val.slice(0, this.MAX_SAMPLE_SIZE);
+      const types = [...new Set(samples.map(item => this.infer(item, depth + 1)))];
+      return types.length === 1 ? `${types[0]}[]` : `(${types.join(' | ')})[]`;
+    }
+    
+    if (typeof val === 'object') {
+      const entries = Object.entries(val).slice(0, this.MAX_PROPERTIES);
+      if (entries.length === 0) return 'Record<string, unknown>';
+      
+      const props = entries
+        .map(([key, value]) => `  ${key}: ${this.infer(value, depth + 1)};`)
+        .join('\n');
+      return `{\n${props}\n}`;
+    }
+    
+    return typeof val;
+  }
+}
 
 // -------------------- Type Logging --------------------
 const logTypes = <T>(
@@ -193,77 +247,121 @@ const logTypes = <T>(
   data: T,
   metadata?: { duration?: number; attempt?: number },
 ): void => {
+  if (!CONFIG.IS_DEV) return;
+
   try {
     let payload: unknown = data;
 
-    const isApiWrapper = (
-      obj: unknown,
-    ): obj is {
-      success: boolean;
-      data?: unknown;
-      headers?: Record<string, string>;
-      status?: number;
-    } =>
-      typeof obj === 'object' &&
-      obj !== null &&
-      'success' in (obj as Record<string, unknown>) &&
-      ('headers' in (obj as Record<string, unknown>) ||
-        'status' in (obj as Record<string, unknown>));
-
-    if (isApiWrapper(payload)) {
+    // Check if it's our API response wrapper
+    if (
+      payload &&
+      typeof payload === 'object' &&
+      'success' in payload &&
+      (('headers' in payload && typeof payload.headers === 'object') ||
+       ('status' in payload && typeof payload.status === 'number'))
+    ) {
       payload = (payload as { data?: unknown }).data;
     }
 
-    if (payload == null || typeof payload !== 'object') {
-      const simpleType = payload === null ? 'null' : typeof payload;
+    if (payload === null || payload === undefined) {
+      const simpleType = payload === null ? 'null' : 'undefined';
       console.log(`🔍 [SafeFetch] "${endpoint}"`);
       console.log(`type ${endpoint.replace(/[^\w]/g, '_')}Response = ${simpleType};`);
       return;
     }
 
-    let dataStr: string;
-    try {
-      dataStr = JSON.stringify(payload);
-    } catch (_error) {
-      console.log(`🔍 [SafeFetch] "${endpoint}" - Response cannot be stringified for logging`);
+    if (typeof payload === 'string' || typeof payload === 'number' || typeof payload === 'boolean') {
+      console.log(`🔍 [SafeFetch] "${endpoint}"`);
+      console.log(`type ${endpoint.replace(/[^\w]/g, '_')}Response = ${typeof payload};`);
       return;
     }
 
-    if (dataStr.length > CONFIG.LOG_SIZE_LIMIT) {
+    // Serialize for size check
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(payload);
+    } catch {
+      console.log(`🔍 [SafeFetch] "${endpoint}" - Response cannot be serialized`);
+      return;
+    }
+
+    if (serialized.length > CONFIG.LOG_SIZE_LIMIT) {
       console.log(
-        `🔍 [SafeFetch] "${endpoint}" - Response too large to log (${dataStr.length} chars, limit: ${CONFIG.LOG_SIZE_LIMIT})`,
+        `🔍 [SafeFetch] "${endpoint}" - Response too large (${serialized.length} chars)`,
       );
       return;
     }
 
-    const inferType = (val: unknown, depth = 0): string => {
-      if (depth > 8) return '[Deep]';
-      if (val == null) return val === null ? 'null' : 'undefined';
-      if (Array.isArray(val)) {
-        if (val.length === 0) return 'unknown[]';
-        const types = [...new Set(val.slice(0, 3).map((item) => inferType(item, depth + 1)))];
-        return types.length === 1 ? `${types[0]}[]` : `(${types.join(' | ')})[]`;
-      }
-      if (typeof val === 'object') {
-        const entries = Object.entries(val).slice(0, 15);
-        const props = entries.map(([k, v]) => `  ${k}: ${inferType(v, depth + 1)};`).join('\n');
-        return `{\n${props}\n}`;
-      }
-      return typeof val;
-    };
-
     const typeName = endpoint.replace(/[^\w]/g, '_') || 'ApiResponse';
-    const typeDefinition = `type ${typeName}Response = ${inferType(payload)};`;
+    const typeDefinition = `type ${typeName}Response = ${TypeInferrer.infer(payload)};`;
 
     console.log(`[SafeFetch] "${endpoint}"\n${typeDefinition}`);
+    
     if (metadata?.duration !== undefined) {
       console.log(
         `⏱️ ${metadata.duration}ms${metadata.attempt ? ` (attempt ${metadata.attempt})` : ''}`,
       );
     }
-  } catch (err) {
-    console.error('[SafeFetch] logTypes error:', err);
+  } catch (error) {
+    console.error('[SafeFetch] logTypes error:', error);
   }
+};
+
+// -------------------- Response Handler --------------------
+const handleResponse = async <T>(response: Response): Promise<ApiResponse<T>> => {
+  const headers: Record<string, string> = {};
+  response.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+
+  const contentType = response.headers.get('content-type');
+  const isJson = contentType?.includes('application/json') ?? false;
+  
+  let data: unknown;
+  try {
+    data = isJson ? await response.json() : await response.text();
+  } catch {
+    data = null;
+  }
+
+  if (response.ok) {
+    return {
+      success: true,
+      status: response.status,
+      data: data as T,
+      headers,
+    };
+  }
+
+  let message = `HTTP ${response.status}`;
+  
+  if (typeof data === 'string') {
+    message = data;
+  } else if (data && typeof data === 'object') {
+    if ('message' in data && typeof data.message === 'string') {
+      message = data.message;
+    } else if ('error' in data && typeof data.error === 'string') {
+      message = data.error;
+    } else {
+      try {
+        message = JSON.stringify(data, null, 2);
+      } catch {
+        // Keep default message
+      }
+    }
+  }
+
+  return {
+    success: false,
+    status: response.status,
+    error: createError(
+      'HttpError',
+      message,
+      response.status,
+      CONFIG.RETRY_CODES.has(response.status),
+    ),
+    data: null,
+  };
 };
 
 // -------------------- Core Request Logic --------------------
@@ -280,19 +378,19 @@ const executeRequest = async <T>(
   },
 ): Promise<ApiResponse<T>> => {
   const controller = new AbortController();
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeoutId = setTimeout(() => controller.abort(), options.timeout);
 
-  const signal = options.signal
-    ? (() => {
-      const combined = new AbortController();
-      const abort = () => combined.abort();
-      options.signal.addEventListener('abort', abort, { once: true });
-      controller.signal.addEventListener('abort', abort, { once: true });
-      return combined.signal;
-    })()
-    : controller.signal;
-
-  timeoutId = setTimeout(() => controller.abort(), options.timeout);
+  // Combine signals if provided
+  let signal = controller.signal;
+  if (options.signal) {
+    const combinedController = new AbortController();
+    const abort = () => combinedController.abort();
+    
+    options.signal.addEventListener('abort', abort, { once: true });
+    controller.signal.addEventListener('abort', abort, { once: true });
+    
+    signal = combinedController.signal;
+  }
 
   try {
     const fetchOptions: RequestInit = {
@@ -302,67 +400,46 @@ const executeRequest = async <T>(
       cache: options.cache,
       next: options.next,
     };
-    if (options.body !== undefined) fetchOptions.body = options.body;
+
+    if (options.body !== undefined) {
+      fetchOptions.body = options.body;
+    }
 
     const response = await fetch(url, fetchOptions);
     clearTimeout(timeoutId);
-
-    const isJson = response.headers.get('content-type')?.includes('application/json');
-    const headers: Record<string, string> = {};
-    response.headers.forEach((value, key) => {
-      headers[key] = value;
-    });
-    const data = isJson ? await response.json() : await response.text();
-
-    if (response.ok) {
+    
+    return await handleResponse<T>(response);
+  } catch (error) {
+    clearTimeout(timeoutId);
+    
+    if (error instanceof Error && error.name === 'AbortError') {
       return {
-        success: true,
-        status: response.status,
-        data: data as T,
-        headers,
+        success: false,
+        status: 408,
+        error: createError('TimeoutError', 'Request timed out', 408, true),
+        data: null,
       };
     }
 
-    let message: string;
-    if (typeof data === 'object' && data && 'message' in data) {
-      message = (data as any).message;
-    } else if (typeof data === 'string') {
-      message = data;
-    } else if (typeof data === 'object' && data) {
-      try {
-        message = JSON.stringify(data);
-      } catch {
-        message = `HTTP ${response.status}`;
-      }
-    } else {
-      message = `HTTP ${response.status}`;
-    }
-
     return {
       success: false,
-      status: response.status,
+      status: 0,
       error: createError(
-        'HttpError',
-        message,
-        response.status,
-        CONFIG.RETRY_CODES.has(response.status),
+        'NetworkError',
+        error instanceof Error ? error.message : 'Request failed',
+        0,
+        true,
       ),
       data: null,
     };
-  } catch (err) {
-    if (timeoutId) clearTimeout(timeoutId);
-    const isAbortError =
-      err instanceof Error && (err.name === 'AbortError' || /abort|timeout/i.test(err.message));
-    const errorName = isAbortError ? 'TimeoutError' : 'NetworkError';
-    const errorStatus = isAbortError ? 408 : 0;
-    const errorMessage = err instanceof Error ? err.message : 'Request failed';
-    return {
-      success: false,
-      status: errorStatus,
-      error: createError(errorName, errorMessage, errorStatus, true),
-      data: null,
-    };
   }
+};
+
+// -------------------- Retry Logic --------------------
+const calculateRetryDelay = (attempt: number): number => {
+  const baseDelay = 100 * (2 ** (attempt - 1));
+  const jitter = Math.random() * 100;
+  return Math.min(1000, baseDelay + jitter);
 };
 
 // -------------------- Main API Function --------------------
@@ -374,6 +451,7 @@ export default async function apiRequest<
   endpoint: string,
   options: RequestOptions<TBody, TResponse> = {},
 ): Promise<ApiResponse<TResponse>> {
+  // Validate HTTP method
   if (!HTTP_METHODS.includes(method)) {
     return {
       success: false,
@@ -388,7 +466,7 @@ export default async function apiRequest<
     params,
     retries = CONFIG.DEFAULT_RETRIES,
     timeout = CONFIG.DEFAULT_TIMEOUT,
-    headers: customHeaders,
+    headers: customHeaders = {},
     transform,
     priority = 'normal',
     signal,
@@ -398,30 +476,35 @@ export default async function apiRequest<
   } = options;
 
   const url = buildUrl(endpoint, params);
+  
+  // Prepare headers
   const headers: Record<string, string> = {
     Accept: 'application/json',
     ...getAuthHeaders(),
     ...customHeaders,
   };
 
+  // Prepare request body
   let body: BodyInit | undefined;
-  if (data) {
-    if (data instanceof FormData) body = data;
-    else if (typeof data === 'string') body = data;
-    else {
-      headers['Content-Type'] = 'application/json';
-      body = JSON.stringify(data);
-    }
+  if (data instanceof FormData) {
+    body = data;
+  } else if (typeof data === 'string') {
+    body = data;
+  } else if (data !== null && data !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    body = JSON.stringify(data);
   }
 
-  const startTime = Date.now();
+  const startTime = performance.now();
 
-  return pool.execute(async () => {
+  return pool.execute(async (): Promise<ApiResponse<TResponse>> => {
     let attempt = 0;
 
     while (true) {
       attempt++;
+      
       const timeoutValue = typeof timeout === 'function' ? timeout(attempt) : timeout;
+      
       const result = await executeRequest<TResponse>(method, url, {
         body,
         headers,
@@ -431,13 +514,14 @@ export default async function apiRequest<
         next,
       });
 
+      // Success case
       if (result.success) {
-        const finalResult = transform ? { ...result, data: transform(result.data) } : result;
+        const finalData = transform ? transform(result.data) : result.data;
+        const finalResult = { ...result, data: finalData };
 
-        // Only log the *data*, never headers or wrapper response
-        if (shouldLogTypes && CONFIG.IS_DEV) {
+        if (shouldLogTypes) {
           logTypes(endpoint, finalResult.data, {
-            duration: Date.now() - startTime,
+            duration: Math.round(performance.now() - startTime),
             attempt: attempt > 1 ? attempt : undefined,
           });
         }
@@ -445,17 +529,20 @@ export default async function apiRequest<
         return finalResult;
       }
 
-      const canRetry =
+      // Check if we should retry
+      const canRetry = (
         attempt <= retries &&
         CONFIG.IDEMPOTENT_METHODS.has(method) &&
-        (result.error.retryable || CONFIG.RETRY_CODES.has(result.status));
+        (result.error.retryable || CONFIG.RETRY_CODES.has(result.status))
+      );
 
-      if (!canRetry) return result;
+      if (!canRetry) {
+        return result;
+      }
 
-      const baseDelay = 100 * (1 << (attempt - 1));
-      const jitter = Math.random() * 100;
-      const delay = Math.min(1000, baseDelay + jitter);
-      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+      // Exponential backoff with jitter
+      const delay = calculateRetryDelay(attempt);
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
   }, priority);
 }
@@ -479,4 +566,4 @@ apiRequest.utils = {
     setTimeout(() => controller.abort(), ms);
     return controller.signal;
   },
-};
+} as const;
