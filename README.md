@@ -2,7 +2,7 @@
 
 > A TypeScript-first Fetch API wrapper with built-in retry logic, timeout handling, and enterprise-grade security features designed for modern server-side environments.
 
-[![TypeScript](https://img.shields.io/badge/TypeScript-First-blue.svg)](https://www.typescriptlang.org/) [![Next.js](https://img.shields.io/badge/Next.js-Compatible-black.svg)](https://nextjs.org/) [![Security](https://img.shields.io/badge/Security-SSRF%20Protected-green.svg)](#security-features)
+[![TypeScript](https://img.shields.io/badge/TypeScript-First-blue.svg)](https://www.typescriptlang.org/) [![Next.js](https://img.shields.io/badge/Next.js-Compatible-black.svg)](https://nextjs.org/) [![License](https://img.shields.io/badge/License-BSD%203--Clause-orange.svg)](#license)
 
 **Optimized Typed Fetch utility for Next.js 16**
 
