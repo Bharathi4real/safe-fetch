@@ -2,6 +2,7 @@
  * SafeFetch – Optimized Typed Fetch utility for Next.js 16
  * (c) 2025 Bharathi4real – BSD 3-Clause License
  * Memory-optimized with unified retry, timeout & adaptive pooling
+ * https://github.com/Bharathi4real/safe-fetch/
  */
 
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const;
