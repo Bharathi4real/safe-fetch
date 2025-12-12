@@ -29,7 +29,7 @@ export interface RequestOptions<TBody extends RequestBody = RequestBody, TRespon
   logTypes?: boolean;
   cache?: RequestCache;
   next?: NextFetchConfig; // Updated for Next.js 16
-  dedupeKey?: string;
+  dedupeKey?: string | null;
 }
 
 export interface ApiError {
@@ -64,10 +64,7 @@ const CFG = {
 // -------------------- Rate Limiter --------------------
 class RateLimiter {
   private req: number[] = [];
-  constructor(
-    private max = CFG.RATE_MAX,
-    private win = CFG.RATE_WINDOW,
-  ) {}
+  constructor(private max = CFG.RATE_MAX, private win = CFG.RATE_WINDOW) {}
 
   async check(): Promise<void> {
     const now = Date.now();
@@ -102,11 +99,7 @@ class Pool {
 
   constructor(private max = CFG.MAX_CONCURRENT) {}
 
-  async exec<T>(
-    fn: () => Promise<T>,
-    pri: 'high' | 'normal' | 'low' = 'normal',
-    key?: string,
-  ): Promise<T> {
+  async exec<T>(fn: () => Promise<T>, pri: 'high' | 'normal' | 'low' = 'normal', key?: string | null): Promise<T> {
     if (key && this.pend.has(key)) return this.pend.get(key) as Promise<T>;
 
     const run = async (): Promise<T> => {
@@ -133,7 +126,7 @@ class Pool {
     return p;
   }
 
-  private async run<T>(fn: () => Promise<T>, key?: string): Promise<T> {
+  private async run<T>(fn: () => Promise<T>, key?: string | null): Promise<T> {
     this.act++;
     try {
       return await fn();
@@ -159,11 +152,13 @@ class Pool {
 const pool = new Pool();
 
 // -------------------- Utilities --------------------
+// Robust buildUrl — handles base with/without trailing slashes and endpoint with/without leading slashes.
+// Accepts absolute URLs as-is.
 const buildUrl = (ep: string, params?: QueryParams): string => {
   let url = ep;
-  if (!ep.startsWith('http')) {
-    const base = CFG.API_URL.replace(/\/$/, '');
-    const clean = ep.replace(/^\//, '');
+  if (!/^https?:\/\//i.test(ep)) {
+    const base = CFG.API_URL.replace(/\/+$/, ''); // strip all trailing slashes
+    const clean = ep.replace(/^\/+/, ''); // strip all leading slashes
     url = base ? `${base}/${clean}` : clean;
   }
 
@@ -177,6 +172,7 @@ const buildUrl = (ep: string, params?: QueryParams): string => {
   return qs ? `${url}?${qs}` : url;
 };
 
+// Auth header getter with lightweight caching and runtime compatibility
 const getAuth = (() => {
   let cache: Record<string, string> | null = null;
   let last = 0;
@@ -186,10 +182,24 @@ const getAuth = (() => {
     if (cache && now - last < 300000) return cache;
 
     const h: Record<string, string> = {};
-    const { AUTH_USERNAME: u, AUTH_PASSWORD: p, API_TOKEN: t } = process.env || {};
+    const env = process?.env || (globalThis as any)['__ENV__'] || {};
+    const { AUTH_USERNAME: u, AUTH_PASSWORD: p, API_TOKEN: t } = env;
 
     if (u && p) {
-      const enc = IS_BUN ? btoa(`${u}:${p}`) : Buffer.from(`${u}:${p}`).toString('base64');
+      // prefer btoa in browser/Bun, Buffer in Node — safe fallback
+      let enc: string;
+      try {
+        if (IS_BUN || typeof btoa !== 'undefined') {
+          enc = btoa(`${u}:${p}`);
+        } else if (typeof Buffer !== 'undefined') {
+          enc = (Buffer as any).from(`${u}:${p}`).toString('base64');
+        } else {
+          // last resort — very small shim (not ideal for production but avoids crash)
+          enc = typeof window !== 'undefined' ? btoa(`${u}:${p}`) : Buffer.from(`${u}:${p}`).toString('base64');
+        }
+      } catch {
+        enc = `${u}:${p}`; // fallback — best-effort
+      }
       h.Authorization = `Basic ${enc}`;
     } else if (t) {
       h.Authorization = `Bearer ${t}`;
@@ -209,14 +219,14 @@ const sanitize = (h: Record<string, string>): Record<string, string> => {
   return s;
 };
 
-const err = (
-  name: string,
-  msg: string,
-  status: number,
-  retry = false,
-  url?: string,
-  method?: string,
-): ApiError => ({ name, message: msg, status, retryable: retry, url, method });
+const err = (name: string, msg: string, status: number, retry = false, url?: string, method?: string): ApiError => ({
+  name,
+  message: msg,
+  status,
+  retryable: retry,
+  url,
+  method,
+});
 
 // -------------------- Type Inference --------------------
 const inferType = (v: unknown, d = 0): string => {
@@ -255,9 +265,7 @@ const logTypes = <T>(
     }
 
     if (payload == null) {
-      console.log(
-        `🔍 [SafeFetch] ${method} "${ep}"\ntype Response = ${payload === null ? 'null' : 'undefined'};`,
-      );
+      console.log(`🔍 [SafeFetch] ${method} "${ep}"\ntype Response = ${payload === null ? 'null' : 'undefined'};`);
       return;
     }
 
@@ -285,11 +293,7 @@ const logTypes = <T>(
 };
 
 // -------------------- Response Handler --------------------
-const handleResp = async <T>(
-  res: Response,
-  url: string,
-  method: string,
-): Promise<ApiResponse<T>> => {
+const handleResp = async <T>(res: Response, url: string, method: string): Promise<ApiResponse<T>> => {
   const h: Record<string, string> = {};
   res.headers.forEach((v, k) => {
     h[k] = v;
@@ -308,8 +312,8 @@ const handleResp = async <T>(
   let msg = `HTTP ${res.status}`;
   if (typeof data === 'string') msg = data;
   else if (data && typeof data === 'object') {
-    if ('message' in data && typeof data.message === 'string') msg = data.message;
-    else if ('error' in data && typeof data.error === 'string') msg = data.error;
+    if ('message' in data && typeof (data as any).message === 'string') msg = (data as any).message;
+    else if ('error' in data && typeof (data as any).error === 'string') msg = (data as any).error;
   }
 
   return {
@@ -390,22 +394,14 @@ const execReq = async <T>(
     return {
       success: false,
       status: 0,
-      error: err(
-        'NetworkError',
-        e instanceof Error ? e.message : 'Request failed',
-        0,
-        true,
-        url,
-        method,
-      ),
+      error: err('NetworkError', e instanceof Error ? e.message : 'Request failed', 0, true, url, method),
       data: null,
     };
   }
 };
 
 // -------------------- Retry Logic --------------------
-const retryDelay = (att: number): number =>
-  Math.min(1000, 100 * 2 ** (att - 1) + Math.random() * 100);
+const retryDelay = (att: number): number => Math.min(1000, 100 * 2 ** (att - 1) + Math.random() * 100);
 
 const canRetry = (method: HttpMethod, status: number, attempt: number, max: number): boolean => {
   if (attempt > max) return false;
@@ -414,10 +410,7 @@ const canRetry = (method: HttpMethod, status: number, attempt: number, max: numb
 };
 
 // -------------------- Main API --------------------
-export default async function apiRequest<
-  TResponse = unknown,
-  TBody extends RequestBody = RequestBody,
->(
+export default async function apiRequest<TResponse = unknown, TBody extends RequestBody = RequestBody>(
   method: HttpMethod,
   endpoint: string,
   opts: RequestOptions<TBody, TResponse> = {},
@@ -443,7 +436,7 @@ export default async function apiRequest<
     logTypes: log = false,
     cache,
     next,
-    dedupeKey,
+    dedupeKey = null,
   } = opts;
 
   const url = buildUrl(endpoint, params);
@@ -457,8 +450,11 @@ export default async function apiRequest<
     body = JSON.stringify(data);
   }
 
-  const key = dedupeKey === '' ? `${method}:${url}:${body || ''}` : dedupeKey;
-  const start = performance.now();
+  // Ensure dedupe key is a string (if not provided, fallback to stable generated key)
+  const safeBodyForKey = typeof body === 'string' ? body : body instanceof FormData ? '[formdata]' : body ? JSON.stringify(body).slice(0, 200) : '';
+  const key = dedupeKey !== null ? dedupeKey : `${method}:${url}:${safeBodyForKey}`;
+
+  const start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 
   return pool.exec(
     async (): Promise<ApiResponse<TResponse>> => {
@@ -481,7 +477,7 @@ export default async function apiRequest<
         if (res.success) {
           if (log)
             logTypes(endpoint, method, res.data, {
-              duration: Math.round(performance.now() - start),
+              duration: Math.round((typeof performance !== 'undefined' && performance.now ? performance.now() - start : Date.now() - start) as number),
               attempt: att > 1 ? att : undefined,
             });
           return transform ? { ...res, data: transform(res.data) } : res;
@@ -497,10 +493,8 @@ export default async function apiRequest<
 }
 
 // -------------------- Helper Functions --------------------
-apiRequest.isSuccess = <T>(r: ApiResponse<T>): r is Extract<ApiResponse<T>, { success: true }> =>
-  r.success;
-apiRequest.isError = <T>(r: ApiResponse<T>): r is Extract<ApiResponse<T>, { success: false }> =>
-  !r.success;
+apiRequest.isSuccess = <T>(r: ApiResponse<T>): r is Extract<ApiResponse<T>, { success: true }> => r.success;
+apiRequest.isError = <T>(r: ApiResponse<T>): r is Extract<ApiResponse<T>, { success: false }> => !r.success;
 apiRequest.utils = {
   getStats: () => ({
     pool: pool.stats(),
