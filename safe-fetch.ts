@@ -108,7 +108,7 @@ class Pool {
         } finally {
           this.active--;
           if (key) this.pend.delete(key);
-          if (this.q.length && this.active < this.max) this.q.shift()!.fn();
+          if (this.q.length && this.active < this.max) this.q.shift()?.fn();
         }
       };
 
