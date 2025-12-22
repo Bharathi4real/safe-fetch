@@ -5,24 +5,31 @@
  * https://github.com/Bharathi4real/safe-fetch/
  */
 
-const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const;
+const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH"] as const;
 export type HttpMethod = (typeof HTTP_METHODS)[number];
 export type RequestBody = Record<string, unknown> | FormData | string | null;
-export type QueryParams = Record<string, string | number | boolean | null | undefined>;
+export type QueryParams = Record<
+  string,
+  string | number | boolean | null | undefined
+>;
 
-export interface RequestOptions<TBody extends RequestBody = RequestBody, TResponse = unknown> {
+export interface RequestOptions<
+  TBody extends RequestBody = RequestBody,
+  TResponse = unknown,
+> {
   data?: TBody;
   params?: QueryParams;
   retries?: number;
   timeout?: number | ((attempt: number) => number);
   headers?: Record<string, string>;
   transform?(data: TResponse): TResponse;
-  priority?: 'high' | 'normal' | 'low';
+  priority?: "high" | "normal" | "low";
   signal?: AbortSignal;
   logTypes?: boolean;
   cache?: RequestCache;
   next?: { revalidate?: number | false; tags?: string[] };
   dedupeKey?: string | null;
+  skipAuth?: boolean;
 }
 
 export type ApiResponse<T = unknown> =
@@ -38,7 +45,7 @@ export interface ApiError {
   readonly method?: string;
 }
 
-const IS_BUN = typeof globalThis !== 'undefined' && 'Bun' in globalThis;
+const IS_BUN = typeof globalThis !== "undefined" && "Bun" in globalThis;
 const RETRY_CODES = new Set([408, 429, 500, 502, 503, 504]);
 
 interface GlobalEnv {
@@ -48,15 +55,19 @@ interface GlobalEnv {
 const getEnv = () => {
   const env = process.env || (globalThis as unknown as GlobalEnv).__ENV__ || {};
   const vals = {
-    API_URL: env.NEXT_PUBLIC_API_URL || env.BASE_URL || env.API_URL || '',
-    AUTH_USERNAME: env.AUTH_USERNAME || '',
-    AUTH_PASSWORD: env.AUTH_PASSWORD || '',
-    API_TOKEN: env.API_TOKEN || '',
-    NODE_ENV: env.NODE_ENV || 'development',
+    API_URL: env.NEXT_PUBLIC_API_URL || env.BASE_URL || env.API_URL || "",
+    AUTH_USERNAME: env.AUTH_USERNAME || "",
+    AUTH_PASSWORD: env.AUTH_PASSWORD || "",
+    API_TOKEN: env.API_TOKEN || "",
+    NODE_ENV: env.NODE_ENV || "development",
   };
-  if (!vals.API_URL) console.error('\x1b[31m%s\x1b[0m', '❌ [SafeFetch] Missing API_URL');
+  if (!vals.API_URL)
+    console.error("\x1b[31m%s\x1b[0m", "❌ [SafeFetch] Missing API_URL");
   if (!vals.AUTH_USERNAME && !vals.API_TOKEN)
-    console.error('\x1b[31m%s\x1b[0m', '❌ [SafeFetch] Missing Auth Credentials');
+    console.error(
+      "\x1b[31m%s\x1b[0m",
+      "❌ [SafeFetch] Missing Auth Credentials",
+    );
   return vals;
 };
 const ENV = getEnv();
@@ -93,7 +104,7 @@ class Pool {
 
   async exec<T>(
     fn: () => Promise<T>,
-    pri: 'high' | 'normal' | 'low' = 'normal',
+    pri: "high" | "normal" | "low" = "normal",
     key?: string | null,
   ): Promise<T> {
     if (key && this.pend.has(key)) return this.pend.get(key) as Promise<T>;
@@ -117,7 +128,10 @@ class Pool {
       } else {
         const pVal = { high: 3, normal: 2, low: 1 }[pri];
         const idx = this.q.findIndex((i) => i.pri < pVal);
-        this.q.splice(idx === -1 ? this.q.length : idx, 0, { fn: run, pri: pVal });
+        this.q.splice(idx === -1 ? this.q.length : idx, 0, {
+          fn: run,
+          pri: pVal,
+        });
       }
     });
 
@@ -137,7 +151,7 @@ const getAuth = (() => {
     const { AUTH_USERNAME: u, AUTH_PASSWORD: p, API_TOKEN: t } = ENV;
     const h: Record<string, string> = {};
     if (u && p)
-      h.Authorization = `Basic ${typeof btoa !== 'undefined' ? btoa(`${u}:${p}`) : Buffer.from(`${u}:${p}`).toString('base64')}`;
+      h.Authorization = `Basic ${typeof btoa !== "undefined" ? btoa(`${u}:${p}`) : Buffer.from(`${u}:${p}`).toString("base64")}`;
     else if (t) h.Authorization = `Bearer ${t}`;
     last = Date.now();
     cache = h;
@@ -148,8 +162,10 @@ const getAuth = (() => {
 const buildUrl = (ep: string, p?: QueryParams): string => {
   let url = ep;
   if (!/^https?:\/\//i.test(ep)) {
-    const base = (typeof window !== 'undefined' ? window.location.origin : '') || ENV.API_URL;
-    url = `${base.replace(/\/+$/, '')}/${ep.replace(/^\/+/, '')}`;
+    const base =
+      (typeof window !== "undefined" ? window.location.origin : "") ||
+      ENV.API_URL;
+    url = `${base.replace(/\/+$/, "")}/${ep.replace(/^\/+/, "")}`;
   }
   if (p) {
     const qs = new URLSearchParams(
@@ -163,14 +179,15 @@ const buildUrl = (ep: string, p?: QueryParams): string => {
 };
 
 const inferType = (v: unknown, d = 0): string => {
-  if (d > 8) return 'unknown';
-  if (v === null) return 'null';
-  if (Array.isArray(v)) return v.length ? `(${inferType(v[0], d + 1)})[]` : 'unknown[]';
-  if (typeof v === 'object' && v)
+  if (d > 8) return "unknown";
+  if (v === null) return "null";
+  if (Array.isArray(v))
+    return v.length ? `(${inferType(v[0], d + 1)})[]` : "unknown[]";
+  if (typeof v === "object" && v)
     return `{\n${Object.entries(v)
       .slice(0, 10)
       .map(([k, val]) => `  ${k}: ${inferType(val, d + 1)}`)
-      .join(',\n')}\n}`;
+      .join(",\n")}\n}`;
   return typeof v;
 };
 
@@ -180,12 +197,14 @@ const logTypes = (
   data: unknown,
   meta?: { time: number; att?: number },
 ) => {
-  if (ENV.NODE_ENV !== 'development') return;
+  if (ENV.NODE_ENV !== "development") return;
   let payload = data;
-  if (typeof data === 'object' && data !== null && 'data' in data) {
+  if (typeof data === "object" && data !== null && "data" in data) {
     payload = (data as { data: unknown }).data;
   }
-  console.log(`🔍 [SafeFetch] ${method} ${ep} (${meta?.time}ms) \nType: ${inferType(payload)}`);
+  console.log(
+    `🔍 [SafeFetch] ${method} ${ep} (${meta?.time}ms) \nType: ${inferType(payload)}`,
+  );
 };
 
 export default async function apiRequest<T = unknown>(
@@ -197,12 +216,23 @@ export default async function apiRequest<T = unknown>(
     return {
       success: false,
       status: 400,
-      error: { name: 'ValidationError', message: 'Invalid method', status: 400 },
+      error: {
+        name: "ValidationError",
+        message: "Invalid method",
+        status: 400,
+      },
       data: null,
     };
-  const { retries = CFG.RETRIES, timeout = CFG.TIMEOUT, priority = 'normal', dedupeKey } = opts;
+  const {
+    retries = CFG.RETRIES,
+    timeout = CFG.TIMEOUT,
+    priority = "normal",
+    dedupeKey,
+  } = opts;
   const url = buildUrl(endpoint, opts.params);
-  const key = dedupeKey ?? `${method}:${url}:${JSON.stringify(opts.data || '').slice(0, 50)}`;
+  const key =
+    dedupeKey ??
+    `${method}:${url}:${JSON.stringify(opts.data || "").slice(0, 50)}`;
   const start = performance.now();
 
   return pool.exec(
@@ -214,16 +244,16 @@ export default async function apiRequest<T = unknown>(
         const ctrl = new AbortController();
         const tid = setTimeout(
           () => ctrl.abort(),
-          typeof timeout === 'function' ? timeout(attempt) : timeout,
+          typeof timeout === "function" ? timeout(attempt) : timeout,
         );
         try {
           const res = await fetch(url, {
             method,
             headers: {
-              Accept: 'application/json',
-              ...getAuth(),
+              Accept: "application/json",
+              ...(opts.skipAuth ? {} : getAuth()),
               ...opts.headers,
-              ...(opts.data ? { 'Content-Type': 'application/json' } : {}),
+              ...(opts.data ? { "Content-Type": "application/json" } : {}),
             },
             body: opts.data
               ? opts.data instanceof FormData
@@ -236,18 +266,20 @@ export default async function apiRequest<T = unknown>(
           });
           clearTimeout(tid);
 
-          const isJson = res.headers.get('content-type')?.includes('json');
+          const isJson = res.headers.get("content-type")?.includes("json");
           const data: unknown = await (isJson ? res.json() : res.text());
 
           if (!res.ok) {
             const d =
-              typeof data === 'object' && data !== null ? (data as Record<string, unknown>) : {};
+              typeof data === "object" && data !== null
+                ? (data as Record<string, unknown>)
+                : {};
             const msg =
-              typeof data === 'string'
+              typeof data === "string"
                 ? data
-                : typeof d.message === 'string'
+                : typeof d.message === "string"
                   ? d.message
-                  : typeof d.error === 'string'
+                  : typeof d.error === "string"
                     ? d.error
                     : res.statusText;
             throw { status: res.status, msg };
@@ -279,18 +311,23 @@ export default async function apiRequest<T = unknown>(
             message?: string;
           }
           const rErr =
-            typeof e === 'object' && e !== null ? (e as ErrorWithStatus) : { message: String(e) };
-          const status = rErr.status || (rErr.name === 'AbortError' ? 408 : 0);
+            typeof e === "object" && e !== null
+              ? (e as ErrorWithStatus)
+              : { message: String(e) };
+          const status = rErr.status || (rErr.name === "AbortError" ? 408 : 0);
 
           if (
-            !(attempt <= retries && (status === 408 || status >= 500 || RETRY_CODES.has(status)))
+            !(
+              attempt <= retries &&
+              (status === 408 || status >= 500 || RETRY_CODES.has(status))
+            )
           ) {
             return {
               success: false,
               status,
               error: {
-                name: rErr.name || 'Error',
-                message: rErr.msg || rErr.message || 'Unknown',
+                name: rErr.name || "Error",
+                message: rErr.msg || rErr.message || "Unknown",
                 status,
                 retryable: false,
                 url,
@@ -299,7 +336,9 @@ export default async function apiRequest<T = unknown>(
               data: null,
             };
           }
-          await new Promise((r) => setTimeout(r, Math.min(1000, 100 * 2 ** (attempt - 1))));
+          await new Promise((r) =>
+            setTimeout(r, Math.min(1000, 100 * 2 ** (attempt - 1))),
+          );
         }
       }
     },
@@ -309,20 +348,22 @@ export default async function apiRequest<T = unknown>(
 }
 
 // Helpers
-apiRequest.isSuccess = <T>(r: ApiResponse<T>): r is Extract<ApiResponse<T>, { success: true }> =>
-  r.success;
-apiRequest.isError = <T>(r: ApiResponse<T>): r is Extract<ApiResponse<T>, { success: false }> =>
-  !r.success;
+apiRequest.isSuccess = <T>(
+  r: ApiResponse<T>,
+): r is Extract<ApiResponse<T>, { success: true }> => r.success;
+apiRequest.isError = <T>(
+  r: ApiResponse<T>,
+): r is Extract<ApiResponse<T>, { success: false }> => !r.success;
 apiRequest.utils = {
   getStats: () => ({
     pool: pool.stats(),
     rateLimit: limiter.stats(),
-    runtime: IS_BUN ? 'bun' : 'node',
+    runtime: IS_BUN ? "bun" : "node",
   }),
   sanitizeHeaders: (h: Record<string, string>) => {
     const s = { ...h };
-    ['Authorization', 'X-API-Key', 'Cookie'].forEach((k) => {
-      if (s[k]) s[k] = '[REDACTED]';
+    ["Authorization", "X-API-Key", "Cookie"].forEach((k) => {
+      if (s[k]) s[k] = "[REDACTED]";
     });
     return s;
   },
