@@ -1,561 +1,225 @@
 # 🛡️ SafeFetch
 
-> A TypeScript-first Fetch API wrapper with built-in retry logic, timeout handling, and enterprise-grade security features designed for modern server-side environments.
+> **Optimized Typed Fetch utility for Next.js 16 & Bun.**
+> A memory-optimized HTTP client featuring priority-based pooling, adaptive rate limiting, and recursive type inference.
+---
 
-[![TypeScript](https://img.shields.io/badge/TypeScript-First-blue.svg)](https://www.typescriptlang.org/) [![Next.js](https://img.shields.io/badge/Next.js-Compatible-black.svg)](https://nextjs.org/) [![License](https://img.shields.io/badge/License-BSD%203--Clause-orange.svg)](#license)
+## Key Features
 
-**Optimized Typed Fetch utility for Next.js 16**
+* **Priority-Based Pooling**: Internal queue handles concurrent requests based on importance (`high`, `normal`, `low`).
+* **Bun-Optimized**: Automatically detects the **Bun** runtime to scale concurrency (20 tasks vs 10 in Node).
+* **Smart Retries**: Automatic exponential backoff for specific status codes (`408`, `429`, `500-504`).
+* **Adaptive Rate Limiting**: Built-in sliding window limiter (default: 100 req/min) with intelligent queuing.
+* **Request Deduplication**: Identical concurrent requests are merged into one network call to prevent over-fetching.
+* **Live Type Inference**: (Dev Only) Recursively inspects API responses and logs ready-to-use TypeScript interfaces.
+* **Unified Auth**: Automated Bearer and Basic Auth injection with 5-minute credential caching.
 
-SafeFetch is a production-ready, memory-optimized HTTP client with built-in retry logic, request pooling, rate limiting, and full Next.js 16 cache integration.
-
-## Installation
-
-Copy the `safefetch.ts` file into your project (e.g., `lib/safefetch.ts`).
+---
 
 ## Quick Start
 
 ```typescript
-import apiRequest from '@/lib/safefetch';
-
-// Simple GET request
-const response = await apiRequest('GET', '/api/users');
-
-if (apiRequest.isSuccess(response)) {
-  console.log(response.data);
-} else {
-  console.error(response.error.message);
-}
-
-// POST with data
-const result = await apiRequest('POST', '/api/users', {
-  data: { name: 'John Doe', email: 'john@example.com' }
-});
-```
-
-## Core Features
-
-- **TypeScript-first**: Full type safety with generic support
-- **Smart Retries**: Automatic retry with exponential backoff for failed requests
-- **Request Pooling**: Concurrent request management with priority queuing
-- **Rate Limiting**: Built-in rate limiter (100 requests/60s by default)
-- **Request Deduplication**: Prevents duplicate simultaneous requests
-- **Next.js 16 Integration**: Full support for cache tags and revalidation
-- **Timeout Management**: Configurable per-request or adaptive timeouts
-- **Development Tools**: Automatic TypeScript type inference logging
-
-## API Reference
-
-### Main Function
-
-```typescript
-apiRequest<TResponse, TBody>(
-  method: HttpMethod,
-  endpoint: string,
-  options?: RequestOptions<TBody, TResponse>
-): Promise<ApiResponse<TResponse>>
-```
-
-#### Parameters
-
-**method**: `'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH'`
-
-**endpoint**: URL endpoint (absolute or relative)
-
-**options**: Configuration object (optional)
-
-### Request Options
-
-```typescript
-interface RequestOptions<TBody, TResponse> {
-  // Request body (JSON, FormData, or string)
-  data?: TBody;
-  
-  // Query parameters
-  params?: Record<string, string | number | boolean | null | undefined>;
-  
-  // Number of retry attempts (default: 2)
-  retries?: number;
-  
-  // Timeout in milliseconds or adaptive function (default: 60000)
-  timeout?: number | ((attempt: number) => number);
-  
-  // Custom headers
-  headers?: Record<string, string>;
-  
-  // Transform response data
-  transform?(data: TResponse): TResponse;
-  
-  // Request priority in queue
-  priority?: 'high' | 'normal' | 'low';
-  
-  // AbortSignal for manual cancellation
-  signal?: AbortSignal;
-  
-  // Log inferred TypeScript types in development
-  logTypes?: boolean;
-  
-  // Fetch cache option
-  cache?: RequestCache;
-  
-  // Next.js 16 cache configuration
-  next?: {
-    revalidate?: number | false;
-    tags?: string[];
-  };
-  
-  // Deduplication key (empty string for auto-generated)
-  dedupeKey?: string;
-}
-```
-
-### Response Types
-
-```typescript
-type ApiResponse<T> =
-  | {
-      success: true;
-      status: number;
-      data: T;
-      headers: Record<string, string>;
-    }
-  | {
-      success: false;
-      status: number;
-      error: ApiError;
-      data: null;
-    };
-
-interface ApiError {
-  readonly name: string;
-  readonly message: string;
-  readonly status: number;
-  readonly retryable?: boolean;
-  readonly url?: string;
-  readonly method?: string;
-}
-```
-
-## Usage Examples
-
-### Basic Requests
-
-```typescript
-// GET with query parameters
-const users = await apiRequest('GET', '/api/users', {
-  params: { page: 1, limit: 10 }
-});
-
-// POST with JSON data
-const newUser = await apiRequest('POST', '/api/users', {
-  data: { name: 'Jane', email: 'jane@example.com' }
-});
-
-// PUT to update
-const updated = await apiRequest('PUT', '/api/users/123', {
-  data: { name: 'Jane Smith' }
-});
-
-// DELETE
-const deleted = await apiRequest('DELETE', '/api/users/123');
-```
-
-### Advanced Features
-
-#### Custom Retry and Timeout
-
-```typescript
-const response = await apiRequest('GET', '/api/slow-endpoint', {
-  retries: 5,
-  timeout: 30000 // 30 seconds
-});
-
-// Adaptive timeout based on attempt number
-const adaptive = await apiRequest('GET', '/api/endpoint', {
-  timeout: (attempt) => 5000 * attempt // Increases each retry
-});
-```
-
-#### Request Priority
-
-```typescript
-// High priority request (processed first)
-const critical = await apiRequest('GET', '/api/critical', {
-  priority: 'high'
-});
-
-// Low priority background task
-const background = await apiRequest('GET', '/api/analytics', {
-  priority: 'low'
-});
-```
-
-#### Request Deduplication
-
-```typescript
-// Automatically deduplicate identical concurrent requests
-const [result1, result2] = await Promise.all([
-  apiRequest('GET', '/api/users', { dedupeKey: '' }),
-  apiRequest('GET', '/api/users', { dedupeKey: '' })
-]);
-// Only one network request is made
-
-// Custom deduplication key
-const data = await apiRequest('GET', '/api/users', {
-  params: { id: 123 },
-  dedupeKey: 'user-123'
-});
-```
-
-#### Response Transformation
-
-```typescript
-interface RawUser {
-  id: number;
-  full_name: string;
-}
+import apiRequest from '@/lib/safe-fetch';
 
 interface User {
-  id: number;
+  id: string;
   name: string;
 }
 
-const response = await apiRequest<RawUser>('GET', '/api/user/1', {
-  transform: (data) => ({
-    id: data.id,
-    name: data.full_name
-  } as User)
-});
-```
+const response = await apiRequest<User>('GET', '/api/user/1');
 
-#### Manual Cancellation
-
-```typescript
-const controller = new AbortController();
-
-const request = apiRequest('GET', '/api/large-file', {
-  signal: controller.signal
-});
-
-// Cancel after 5 seconds
-setTimeout(() => controller.abort(), 5000);
-
-const result = await request;
-if (!apiRequest.isSuccess(result)) {
-  console.log(result.error.name); // 'AbortError'
+if (apiRequest.isSuccess(response)) {
+  console.log(response.data.name); 
 }
+
 ```
 
-### Next.js 16 Integration
+---
 
-#### Server-Side Caching
+## RequestOptions: Complete Usage Guide
+
+The `RequestOptions` object allows you to fine-tune every aspect of the network request. Below are examples for every property available in the 2025 implementation.
+
+### 1. `data` (The Payload)
+
+Supports JSON objects, `FormData` (for file uploads), or raw strings.
 
 ```typescript
-// Cache for 1 hour
-const users = await apiRequest('GET', '/api/users', {
-  next: { revalidate: 3600 }
+// JSON Data
+await apiRequest('POST', '/users', { data: { name: 'John Doe' } });
+
+// FormData (File Upload)
+const form = new FormData();
+form.append('avatar', fileBlob);
+await apiRequest('POST', '/upload', { data: form });
+
+```
+
+### 2. `params` (Query Parameters)
+
+Automatically serializes objects into URL search strings, filtering out `null` or `undefined` values.
+
+```typescript
+await apiRequest('GET', '/posts', { 
+  params: { page: 1, limit: 10, search: 'NextJS', archived: false } 
+});
+// Result: /posts?page=1&limit=10&search=NextJS&archived=false
+
+```
+
+### 3. `priority` (Pool Management)
+
+Determines the order of execution in the internal queue.
+
+```typescript
+// Jump to the front of the queue
+await apiRequest('GET', '/critical-config', { priority: 'high' });
+
+// Process only when the system is idle
+await apiRequest('POST', '/telemetry', { priority: 'low' });
+
+```
+
+### 4. `dedupeKey` (Request Merging)
+
+Prevents redundant calls. If a request with the same key is already in-flight, SafeFetch returns that existing promise instead of hitting the network again.
+
+```typescript
+// Multiple components can call this simultaneously safely
+await apiRequest('GET', '/settings', { dedupeKey: 'global-settings-key' });
+
+```
+
+### 5. `skipAuth` (Authentication Bypass)
+
+Ignores global environment credentials (Bearer/Basic) for this specific call. Useful for external public APIs.
+
+```typescript
+await apiRequest('GET', 'https://api.github.com/zen', { skipAuth: true });
+
+```
+
+### 6. `logTypes` (Development Tool)
+
+Recursively inspects the JSON response and logs a copy-pasteable TypeScript interface to the console.
+
+```typescript
+// Only works in process.env.NODE_ENV === 'development'
+await apiRequest('GET', '/api/user/profile', { logTypes: true });
+
+```
+
+### 7. `timeout` (Adaptive or Fixed)
+
+Accepts a number (ms) or a function that calculates timeout based on the retry attempt.
+
+```typescript
+await apiRequest('GET', '/unstable-api', { 
+  timeout: (attempt) => attempt * 5000 // 5s, then 10s, then 15s...
 });
 
-// Tag-based revalidation
-const posts = await apiRequest('GET', '/api/posts', {
+```
+
+### 8. `retries` (Retry Logic)
+
+Overrides the default (2) retries for idempotent operations.
+
+```typescript
+await apiRequest('GET', '/vital-resource', { retries: 5 });
+
+```
+
+### 9. `transform` (Data Post-Processing)
+
+Modify data after a successful fetch but before the application receives it.
+
+```typescript
+await apiRequest<User>('GET', '/user/1', {
+  transform: (data) => ({
+    ...data,
+    displayName: data.nickname || data.name
+  })
+});
+
+```
+
+### 10. `headers` (Custom Headers)
+
+Merge custom headers with SafeFetch's auto-generated headers (like Content-Type and Auth).
+
+```typescript
+await apiRequest('GET', '/data', { 
+  headers: { 'X-Project-ID': '99', 'Accept-Encoding': 'gzip' } 
+});
+
+```
+
+### 11. `cache` & `next` (Next.js 16 Integration)
+
+Full support for the Next.js extended fetch API for caching and revalidation tags.
+
+```typescript
+await apiRequest('GET', '/products', {
+  cache: 'force-cache',
   next: { 
-    tags: ['posts'],
-    revalidate: 60 
+    revalidate: 3600, 
+    tags: ['product-list', 'inventory'] 
   }
 });
 
-// Never cache
-const realtime = await apiRequest('GET', '/api/realtime', {
-  next: { revalidate: false }
-});
 ```
 
-#### Cache Revalidation
+### 12. `signal` (Manual Cancellation)
+
+Cancel a request manually using an `AbortController`.
 
 ```typescript
-import apiRequest from '@/lib/safefetch';
+const controller = new AbortController();
+const request = apiRequest('GET', '/huge-payload', { signal: controller.signal });
 
-// Revalidate by tag (Server Actions/Route Handlers)
-await apiRequest.utils.revalidateTag('posts');
+// Some logic triggers cancellation
+controller.abort();
 
-// With expiration profile
-await apiRequest.utils.revalidateTag('users', 'max');
-await apiRequest.utils.revalidateTag('products', { expire: 3600 });
-
-// Revalidate entire path
-await apiRequest.utils.revalidatePath('/blog');
-await apiRequest.utils.revalidatePath('/blog', 'layout');
 ```
 
-### Type Safety and Development
+---
 
-#### Type Inference Logging
+## Response Handling & Utilities
 
-```typescript
-// Enable in development to see TypeScript types
-const response = await apiRequest('GET', '/api/complex-data', {
-  logTypes: true
-});
-
-// Console output:
-// 🔍 [SafeFetch] GET "/api/complex-data"
-// type complex_dataResponse = {
-//   id: number;
-//   name: string;
-//   items: {
-//     title: string;
-//     count: number;
-//   }[];
-// };
-// ⏱️ 234ms
-```
-
-#### Type Guards
+SafeFetch returns a discriminated union, making it impossible to access data without checking for success first.
 
 ```typescript
-const response = await apiRequest<User[]>('GET', '/api/users');
+const res = await apiRequest<User>('GET', '/me');
 
-if (apiRequest.isSuccess(response)) {
-  // TypeScript knows response.data is User[]
-  response.data.forEach(user => console.log(user.name));
+if (apiRequest.isSuccess(res)) {
+  // res.data is typed as User
+  console.log(res.status, res.headers);
 } else {
-  // TypeScript knows response.error is ApiError
-  console.error(response.error.message);
+  // res.error contains name, message, status, and retryable flag
+  console.error(res.error.message);
 }
+
 ```
 
-### Error Handling
-
-```typescript
-const response = await apiRequest('POST', '/api/users', {
-  data: { email: 'invalid' }
-});
-
-if (apiRequest.isError(response)) {
-  const { error } = response;
-  
-  console.log(error.name);      // 'HttpError', 'TimeoutError', etc.
-  console.log(error.message);   // Human-readable error
-  console.log(error.status);    // HTTP status code
-  console.log(error.retryable); // Whether automatic retry occurred
-  console.log(error.url);       // Full request URL
-  console.log(error.method);    // HTTP method
-}
-```
-
-## Utility Functions
-
-### Get System Stats
+### System Monitoring
 
 ```typescript
 const stats = apiRequest.utils.getStats();
 
-console.log(stats);
-// {
-//   pool: { active: 3, queued: 5, max: 10, pending: 2 },
-//   rateLimit: { current: 45, limit: 100, windowMs: 60000 },
-//   runtime: 'node' // or 'bun'
-// }
+console.log(stats.pool);      // { active: number, queued: number }
+console.log(stats.rateLimit); // { current: number }
+console.log(stats.runtime);   // "bun" | "node"
+
 ```
 
-### Create Timeout Signal
+---
 
-```typescript
-// Create an AbortSignal that fires after 5 seconds
-const timeoutSignal = apiRequest.utils.timeout(5000);
+## Environment Variables
 
-const response = await apiRequest('GET', '/api/endpoint', {
-  signal: timeoutSignal
-});
-```
+SafeFetch reads these keys for its internal `getEnv` utility:
 
-### Sanitize Headers for Logging
-
-```typescript
-const headers = {
-  'Content-Type': 'application/json',
-  'Authorization': 'Bearer secret-token',
-  'X-API-Key': 'api-key-123'
-};
-
-const safe = apiRequest.utils.sanitizeHeaders(headers);
-// {
-//   'Content-Type': 'application/json',
-//   'Authorization': '[REDACTED]',
-//   'X-API-Key': '[REDACTED]'
-// }
-```
-
-## Configuration
-
-### Environment Variables
-
-```bash
-# API base URL
-NEXT_PUBLIC_API_URL=https://api.example.com
-# or
-BASE_URL=https://api.example.com
-
-# Basic Authentication
-AUTH_USERNAME=your-username
-AUTH_PASSWORD=your-password
-
-# Bearer Token Authentication
-API_TOKEN=your-api-token
-
-# Environment
-NODE_ENV=development
-```
-
-### Default Configuration
-
-```typescript
-const CFG = {
-  API_URL: '',              // Base URL from env
-  TIMEOUT: 60000,           // 60 seconds
-  RETRIES: 2,               // 2 retry attempts
-  MAX_CONCURRENT: 10,       // 10 concurrent requests (20 on Bun)
-  LOG_LIMIT: 50000,         // Max chars for type inference logs
-  RATE_MAX: 100,            // 100 requests
-  RATE_WINDOW: 60000,       // per 60 seconds
-};
-```
-
-## How It Works
-
-### Retry Logic
-
-- Automatic retry for network errors, timeouts, and specific HTTP status codes (408, 429, 500, 502, 503, 504)
-- Only idempotent methods (GET, PUT, DELETE) retry on HTTP errors
-- POST and PATCH only retry on network/timeout errors
-- Exponential backoff with jitter: `min(1000ms, 100ms * 2^(attempt-1) + random(0-100ms))`
-
-### Request Pooling
-
-- Limits concurrent requests to prevent overwhelming servers
-- Priority queue system (high > normal > low)
-- Request deduplication to avoid redundant network calls
-- Automatic queue processing as requests complete
-
-### Rate Limiting
-
-- Sliding window rate limiter
-- Default: 100 requests per 60 seconds
-- Automatically delays requests when limit reached
-- Per-instance limiting (not shared across processes)
-
-### Authentication
-
-- Automatic header injection from environment variables
-- Supports Basic Auth and Bearer tokens
-- Headers cached for 5 minutes to avoid repeated processing
-- Sensitive headers automatically redacted in logs
-
-## Best Practices
-
-### Use Type Parameters
-
-```typescript
-interface User {
-  id: number;
-  name: string;
-  email: string;
-}
-
-const response = await apiRequest<User>('GET', '/api/user/1');
-// response.data is strongly typed as User
-```
-
-### Handle Errors Gracefully
-
-```typescript
-const response = await apiRequest('GET', '/api/data');
-
-if (!apiRequest.isSuccess(response)) {
-  // Log error details
-  console.error('Request failed:', response.error);
-  
-  // Show user-friendly message
-  if (response.error.status === 404) {
-    return 'Resource not found';
-  }
-  
-  return 'An error occurred. Please try again.';
-}
-
-return response.data;
-```
-
-### Use Deduplication for Repeated Calls
-
-```typescript
-// In a React component that might re-render
-const fetchUser = (id: number) =>
-  apiRequest('GET', `/api/users/${id}`, {
-    dedupeKey: `user-${id}`
-  });
-```
-
-### Leverage Next.js Caching
-
-```typescript
-// Static data that rarely changes
-const countries = await apiRequest('GET', '/api/countries', {
-  next: { revalidate: 86400 } // Cache for 24 hours
-});
-
-// User-specific data
-const profile = await apiRequest('GET', '/api/profile', {
-  cache: 'no-store' // Never cache
-});
-```
-
-### Monitor Performance in Development
-
-```typescript
-// Enable type logging to understand response shapes
-const response = await apiRequest('GET', '/api/complex', {
-  logTypes: true
-});
-
-// Check system stats
-console.log(apiRequest.utils.getStats());
-```
-
-## License
-
-BSD 3-Clause License © 2025 Bharathi4real
-
-## Troubleshooting
-
-### Requests Timing Out
-
-Increase the timeout or use adaptive timeouts:
-
-```typescript
-const response = await apiRequest('GET', '/api/slow', {
-  timeout: 120000, // 2 minutes
-  retries: 3
-});
-```
-
-### Rate Limit Errors
-
-Adjust the rate limiter configuration or implement backoff in your application logic.
-
-### Type Inference Not Working
-
-Explicitly provide type parameters:
-
-```typescript
-const response = await apiRequest<MyType>('GET', '/api/data');
-```
-
-### Deduplication Not Working
-
-Ensure you're using the same deduplication key for identical requests:
-
-```typescript
-const key = `user-${userId}`;
-const r1 = await apiRequest('GET', '/api/user', { dedupeKey: key });
-const r2 = await apiRequest('GET', '/api/user', { dedupeKey: key });
-```
+| Variable | Description |
+| --- | --- |
+| `NEXT_PUBLIC_API_URL` | Base API URL for relative paths. |
+| `API_TOKEN` | Injected as `Authorization: Bearer <token>`. |
+| `AUTH_USERNAME` / `AUTH_PASSWORD` | Injected as `Authorization: Basic <base64>`. |
