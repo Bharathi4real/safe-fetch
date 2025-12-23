@@ -253,7 +253,9 @@ export default async function apiRequest<T = unknown>(
               Accept: "application/json",
               ...(opts.skipAuth ? {} : getAuth()),
               ...opts.headers,
-              ...(opts.data ? { "Content-Type": "application/json" } : {}),
+              ...(opts.data && !(opts.data instanceof FormData)
+                ? { "Content-Type": "application/json" }
+                : {}),
             },
             body: opts.data
               ? opts.data instanceof FormData
