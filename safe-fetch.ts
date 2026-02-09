@@ -51,7 +51,7 @@ interface GlobalEnv {
 // Optimize: Cache env values and avoid repeated lookups
 const getEnv = (() => {
   let cachedEnv: ReturnType<typeof createEnv> | null = null;
-  
+
   function createEnv() {
     const env = process.env || (globalThis as unknown as GlobalEnv).__ENV__ || {};
     return {
@@ -181,11 +181,11 @@ class Pool {
   // Optimize: Binary search for insertion point
   private enqueue(fn: () => void, pri: 'high' | 'normal' | 'low'): void {
     const priVal = PRIORITY_VALUES[pri];
-    
+
     // Binary search for insertion point
     let left = 0;
     let right = this.queue.length;
-    
+
     while (left < right) {
       const mid = (left + right) >>> 1; // Use unsigned right shift for division by 2
       if (this.queue[mid].pri >= priVal) {
@@ -194,7 +194,7 @@ class Pool {
         right = mid;
       }
     }
-    
+
     this.queue.splice(left, 0, { fn, pri: priVal });
   }
 
@@ -248,8 +248,7 @@ const buildUrl = (() => {
 
     let url = ep;
     if (!/^https?:\/\//i.test(ep)) {
-      const base =
-        ENV.API_URL || (typeof window !== 'undefined' ? window.location.origin : '');
+      const base = ENV.API_URL || (typeof window !== 'undefined' ? window.location.origin : '');
       url = `${base.replace(/\/+$/, '')}/${ep.replace(/^\/+/, '')}`;
     }
 
@@ -267,7 +266,7 @@ const buildUrl = (() => {
     // LRU-style cache management
     if (cache.size >= maxCacheSize) {
       const firstKey = cache.keys().next().value;
-      cache.delete(firstKey);
+      if (firstKey) cache.delete(firstKey);
     }
     cache.set(cacheKey, url);
 
@@ -292,10 +291,8 @@ const inferType = (v: unknown, d = 0): string => {
   const entries = Object.entries(v as Record<string, unknown>).slice(0, 10);
   if (entries.length === 0) return '{}';
 
-  const props = entries
-    .map(([k, val]) => `  ${k}: ${inferType(val, d + 1)}`)
-    .join(',\n');
-  
+  const props = entries.map(([k, val]) => `  ${k}: ${inferType(val, d + 1)}`).join(',\n');
+
   return `{\n${props}\n}`;
 };
 
@@ -314,7 +311,7 @@ const logTypes = (
 
   const attemptInfo = meta?.att ? ` [attempt ${meta.att}]` : '';
   console.log(
-    `🔍 [SafeFetch] ${method} ${ep} (${meta?.time}ms)${attemptInfo}\nType: ${inferType(payload)}`
+    `🔍 [SafeFetch] ${method} ${ep} (${meta?.time}ms)${attemptInfo}\nType: ${inferType(payload)}`,
   );
 };
 
@@ -325,11 +322,7 @@ const calculateBackoff = (attempt: number): number => {
 };
 
 // Optimize: Extract error handling logic
-const createErrorResponse = (
-  error: unknown,
-  url: string,
-  method: string,
-): ApiResponse<never> => {
+const createErrorResponse = (error: unknown, url: string, method: string): ApiResponse<never> => {
   interface ErrorWithStatus {
     status?: number;
     name?: string;
@@ -368,13 +361,13 @@ const parseResponse = async (res: Response): Promise<unknown> => {
 // Optimize: Extract error message parsing
 const extractErrorMessage = (data: unknown, statusText: string): string => {
   if (typeof data === 'string') return data;
-  
+
   if (typeof data === 'object' && data !== null) {
     const obj = data as Record<string, unknown>;
     if (typeof obj.message === 'string') return obj.message;
     if (typeof obj.error === 'string') return obj.error;
   }
-  
+
   return statusText;
 };
 
@@ -402,15 +395,10 @@ export default async function apiRequest<T = unknown>(
     };
   }
 
-  const {
-    retries = CFG.RETRIES,
-    timeout = CFG.TIMEOUT,
-    priority = 'normal',
-    dedupeKey,
-  } = opts;
+  const { retries = CFG.RETRIES, timeout = CFG.TIMEOUT, priority = 'normal', dedupeKey } = opts;
 
   const url = buildUrl(endpoint, opts.params);
-  
+
   // Optimize: More efficient dedupe key generation
   const key =
     dedupeKey ??
@@ -497,12 +485,12 @@ export default async function apiRequest<T = unknown>(
           interface ErrorWithStatus {
             status?: number;
             name?: string;
+            message?: string;
           }
 
-          const err =
-            typeof e === 'object' && e !== null
-              ? (e as ErrorWithStatus)
-              : { message: String(e) };
+          const err = (
+            typeof e === 'object' && e !== null ? e : { message: String(e) }
+          ) as ErrorWithStatus;
 
           const status = err.status || (err.name === 'AbortError' ? 408 : 0);
 
@@ -537,13 +525,13 @@ apiRequest.utils = {
   sanitizeHeaders: (h: Record<string, string>): Record<string, string> => {
     const sanitized = { ...h };
     const sensitiveHeaders = ['Authorization', 'X-API-Key', 'Cookie'];
-    
+
     for (const key of sensitiveHeaders) {
       if (sanitized[key]) {
         sanitized[key] = '[REDACTED]';
       }
     }
-    
+
     return sanitized;
   },
 };
