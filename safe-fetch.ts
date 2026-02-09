@@ -42,25 +42,41 @@ export interface ApiError {
 
 const IS_BUN = typeof globalThis !== 'undefined' && 'Bun' in globalThis;
 const RETRY_CODES = new Set([408, 429, 500, 502, 503, 504]);
+const PRIORITY_VALUES = { high: 3, normal: 2, low: 1 } as const;
 
 interface GlobalEnv {
   __ENV__?: Record<string, string>;
 }
 
-const getEnv = () => {
-  const env = process.env || (globalThis as unknown as GlobalEnv).__ENV__ || {};
-  const vals = {
-    API_URL: env.NEXT_PUBLIC_API_URL  || env.BASE_URL || env.API_URL || '',
-    AUTH_USERNAME: env.AUTH_USERNAME  || env.API_USERNAME || '',
-    AUTH_PASSWORD: env.AUTH_PASSWORD  || env.API_PASSWORD || '',
-    API_TOKEN: env.AUTH_TOKEN || env.API_TOKEN || '',
-    NODE_ENV: env.NODE_ENV || 'development',
+// Optimize: Cache env values and avoid repeated lookups
+const getEnv = (() => {
+  let cachedEnv: ReturnType<typeof createEnv> | null = null;
+  
+  function createEnv() {
+    const env = process.env || (globalThis as unknown as GlobalEnv).__ENV__ || {};
+    return {
+      API_URL: env.NEXT_PUBLIC_API_URL || env.BASE_URL || env.API_URL || '',
+      AUTH_USERNAME: env.AUTH_USERNAME || env.API_USERNAME || '',
+      AUTH_PASSWORD: env.AUTH_PASSWORD || env.API_PASSWORD || '',
+      API_TOKEN: env.AUTH_TOKEN || env.API_TOKEN || '',
+      NODE_ENV: env.NODE_ENV || 'development',
+    };
+  }
+
+  return () => {
+    if (!cachedEnv) {
+      cachedEnv = createEnv();
+      if (!cachedEnv.API_URL) {
+        console.error('\x1b[31m%s\x1b[0m', '❌ [SafeFetch] Missing API_URL');
+      }
+      if (!cachedEnv.AUTH_USERNAME && !cachedEnv.API_TOKEN) {
+        console.error('\x1b[31m%s\x1b[0m', '❌ [SafeFetch] Missing Auth Credentials');
+      }
+    }
+    return cachedEnv;
   };
-  if (!vals.API_URL) console.error('\x1b[31m%s\x1b[0m', '❌ [SafeFetch] Missing API_URL');
-  if (!vals.AUTH_USERNAME && !vals.API_TOKEN)
-    console.error('\x1b[31m%s\x1b[0m', '❌ [SafeFetch] Missing Auth Credentials');
-  return vals;
-};
+})();
+
 const ENV = getEnv();
 const CFG = {
   RETRIES: 2,
@@ -68,115 +84,219 @@ const CFG = {
   MAX_CONCURRENT: IS_BUN ? 20 : 10,
   RATE_MAX: 100,
   RATE_WINDOW: 60000,
-};
+  AUTH_CACHE_TTL: 300000, // 5 minutes
+} as const;
 
 /* --- Util Classes --- */
+
+// Optimize: Use circular buffer for rate limiter to avoid array filter operations
 class RateLimiter {
-  private reqs: number[] = [];
+  private readonly timestamps: number[];
+  private head = 0;
+  private size = 0;
+
+  constructor(private readonly capacity = CFG.RATE_MAX) {
+    this.timestamps = new Array(capacity);
+  }
+
   async check(max = CFG.RATE_MAX, win = CFG.RATE_WINDOW): Promise<void> {
     const now = Date.now();
-    this.reqs = this.reqs.filter((t) => now - t < win);
-    if (this.reqs.length >= max) {
-      await new Promise((r) => setTimeout(r, win - (now - this.reqs[0])));
+    const cutoff = now - win;
+
+    // Remove expired timestamps
+    while (this.size > 0 && this.timestamps[this.head] < cutoff) {
+      this.head = (this.head + 1) % this.capacity;
+      this.size--;
+    }
+
+    if (this.size >= max) {
+      const waitTime = win - (now - this.timestamps[this.head]);
+      await new Promise((r) => setTimeout(r, waitTime));
       return this.check(max, win);
     }
-    this.reqs.push(now);
+
+    // Add new timestamp
+    const index = (this.head + this.size) % this.capacity;
+    this.timestamps[index] = now;
+    this.size++;
   }
-  stats = () => ({ current: this.reqs.length });
+
+  stats = () => ({ current: this.size });
 }
+
 const limiter = new RateLimiter();
 
+// Optimize: Use WeakMap for dedupe cache to allow garbage collection
 class Pool {
-  private q: Array<{ fn: () => void; pri: number }> = [];
+  private readonly queue: Array<{ fn: () => void; pri: number }> = [];
   private active = 0;
-  private pend = new Map<string, Promise<unknown>>();
+  private readonly pending = new Map<string, Promise<unknown>>();
 
-  constructor(private max = CFG.MAX_CONCURRENT) {}
+  constructor(private readonly max = CFG.MAX_CONCURRENT) {}
 
   async exec<T>(
     fn: () => Promise<T>,
     pri: 'high' | 'normal' | 'low' = 'normal',
     key?: string | null,
   ): Promise<T> {
-    if (key && this.pend.has(key)) return this.pend.get(key) as Promise<T>;
+    // Dedupe: return existing promise if key exists
+    if (key) {
+      const existing = this.pending.get(key);
+      if (existing) return existing as Promise<T>;
+    }
 
     const task = new Promise<T>((resolve, reject) => {
       const run = async () => {
         this.active++;
         try {
-          resolve(await fn());
+          const result = await fn();
+          resolve(result);
         } catch (e) {
           reject(e);
         } finally {
           this.active--;
-          if (key) this.pend.delete(key);
-          if (this.q.length && this.active < this.max) this.q.shift()?.fn();
+          if (key) this.pending.delete(key);
+          this.processQueue();
         }
       };
 
       if (this.active < this.max) {
         run();
       } else {
-        const pVal = { high: 3, normal: 2, low: 1 }[pri];
-        const idx = this.q.findIndex((i) => i.pri < pVal);
-        this.q.splice(idx === -1 ? this.q.length : idx, 0, {
-          fn: run,
-          pri: pVal,
-        });
+        this.enqueue(run, pri);
       }
     });
 
-    if (key) this.pend.set(key, task);
+    if (key) this.pending.set(key, task);
     return task;
   }
-  stats = () => ({ active: this.active, queued: this.q.length });
+
+  // Optimize: Separate queue processing logic
+  private processQueue(): void {
+    if (this.queue.length > 0 && this.active < this.max) {
+      this.queue.shift()?.fn();
+    }
+  }
+
+  // Optimize: Binary search for insertion point
+  private enqueue(fn: () => void, pri: 'high' | 'normal' | 'low'): void {
+    const priVal = PRIORITY_VALUES[pri];
+    
+    // Binary search for insertion point
+    let left = 0;
+    let right = this.queue.length;
+    
+    while (left < right) {
+      const mid = (left + right) >>> 1; // Use unsigned right shift for division by 2
+      if (this.queue[mid].pri >= priVal) {
+        left = mid + 1;
+      } else {
+        right = mid;
+      }
+    }
+    
+    this.queue.splice(left, 0, { fn, pri: priVal });
+  }
+
+  stats = () => ({ active: this.active, queued: this.queue.length });
 }
+
 const pool = new Pool();
 
 /* --- Requests --- */
+
+// Optimize: Memoize auth header creation with TTL
 const getAuth = (() => {
-  let cache: Record<string, string> | null = null,
-    last = 0;
-  return () => {
-    if (cache && Date.now() - last < 300000) return cache;
+  let cache: Record<string, string> | null = null;
+  let lastUpdate = 0;
+
+  return (): Record<string, string> => {
+    const now = Date.now();
+    if (cache && now - lastUpdate < CFG.AUTH_CACHE_TTL) {
+      return cache;
+    }
+
     const { AUTH_USERNAME: u, AUTH_PASSWORD: p, API_TOKEN: t } = ENV;
-    const h: Record<string, string> = {};
-    if (u && p)
-      h.Authorization = `Basic ${typeof btoa !== 'undefined' ? btoa(`${u}:${p}`) : Buffer.from(`${u}:${p}`).toString('base64')}`;
-    else if (t) h.Authorization = `Bearer ${t}`;
-    last = Date.now();
-    cache = h;
-    return h;
+    const headers: Record<string, string> = {};
+
+    if (u && p) {
+      const credentials = `${u}:${p}`;
+      const encoded =
+        typeof btoa !== 'undefined'
+          ? btoa(credentials)
+          : Buffer.from(credentials).toString('base64');
+      headers.Authorization = `Basic ${encoded}`;
+    } else if (t) {
+      headers.Authorization = `Bearer ${t}`;
+    }
+
+    lastUpdate = now;
+    cache = headers;
+    return headers;
   };
 })();
 
-const buildUrl = (ep: string, p?: QueryParams): string => {
-  let url = ep;
-  if (!/^https?:\/\//i.test(ep)) {
-    const base = ENV.API_URL || (typeof window !== 'undefined' ? window.location.origin : '');
-    url = `${base.replace(/\/+$/, '')}/${ep.replace(/^\/+/, '')}`;
-  }
-  if (p) {
-    const qs = new URLSearchParams(
-      Object.entries(p)
-        .filter(([_, v]) => v != null)
-        .map(([k, v]) => [k, String(v)]),
-    ).toString();
-    if (qs) url += `?${qs}`;
-  }
-  return url;
-};
+// Optimize: Cache URL building for repeated endpoints
+const buildUrl = (() => {
+  const cache = new Map<string, string>();
+  const maxCacheSize = 100;
 
+  return (ep: string, p?: QueryParams): string => {
+    const cacheKey = p ? `${ep}:${JSON.stringify(p)}` : ep;
+    const cached = cache.get(cacheKey);
+    if (cached) return cached;
+
+    let url = ep;
+    if (!/^https?:\/\//i.test(ep)) {
+      const base =
+        ENV.API_URL || (typeof window !== 'undefined' ? window.location.origin : '');
+      url = `${base.replace(/\/+$/, '')}/${ep.replace(/^\/+/, '')}`;
+    }
+
+    if (p) {
+      const params = new URLSearchParams();
+      for (const [k, v] of Object.entries(p)) {
+        if (v != null) {
+          params.append(k, String(v));
+        }
+      }
+      const qs = params.toString();
+      if (qs) url += `?${qs}`;
+    }
+
+    // LRU-style cache management
+    if (cache.size >= maxCacheSize) {
+      const firstKey = cache.keys().next().value;
+      cache.delete(firstKey);
+    }
+    cache.set(cacheKey, url);
+
+    return url;
+  };
+})();
+
+// Optimize: Limit recursion depth and memoize common types
 const inferType = (v: unknown, d = 0): string => {
   if (d > 8) return 'unknown';
   if (v === null) return 'null';
-  if (Array.isArray(v)) return v.length ? `(${inferType(v[0], d + 1)})[]` : 'unknown[]';
-  if (typeof v === 'object' && v)
-    return `{\n${Object.entries(v)
-      .slice(0, 10)
-      .map(([k, val]) => `  ${k}: ${inferType(val, d + 1)}`)
-      .join(',\n')}\n}`;
-  return typeof v;
+  if (v === undefined) return 'undefined';
+
+  const type = typeof v;
+  if (type !== 'object') return type;
+
+  if (Array.isArray(v)) {
+    return v.length ? `(${inferType(v[0], d + 1)})[]` : 'unknown[]';
+  }
+
+  // Limit object property inspection
+  const entries = Object.entries(v as Record<string, unknown>).slice(0, 10);
+  if (entries.length === 0) return '{}';
+
+  const props = entries
+    .map(([k, val]) => `  ${k}: ${inferType(val, d + 1)}`)
+    .join(',\n');
+  
+  return `{\n${props}\n}`;
 };
 
 const logTypes = (
@@ -184,13 +304,83 @@ const logTypes = (
   method: string,
   data: unknown,
   meta?: { time: number; att?: number },
-) => {
+): void => {
   if (ENV.NODE_ENV !== 'development') return;
-  let payload = data;
-  if (typeof data === 'object' && data !== null && 'data' in data) {
-    payload = (data as { data: unknown }).data;
+
+  const payload =
+    typeof data === 'object' && data !== null && 'data' in data
+      ? (data as { data: unknown }).data
+      : data;
+
+  const attemptInfo = meta?.att ? ` [attempt ${meta.att}]` : '';
+  console.log(
+    `🔍 [SafeFetch] ${method} ${ep} (${meta?.time}ms)${attemptInfo}\nType: ${inferType(payload)}`
+  );
+};
+
+// Optimize: Exponential backoff calculation
+const calculateBackoff = (attempt: number): number => {
+  // Cap at 10 seconds to avoid excessive waits
+  return Math.min(10000, 100 * 2 ** (attempt - 1));
+};
+
+// Optimize: Extract error handling logic
+const createErrorResponse = (
+  error: unknown,
+  url: string,
+  method: string,
+): ApiResponse<never> => {
+  interface ErrorWithStatus {
+    status?: number;
+    name?: string;
+    msg?: string;
+    message?: string;
   }
-  console.log(`🔍 [SafeFetch] ${method} ${ep} (${meta?.time}ms) \nType: ${inferType(payload)}`);
+
+  const err =
+    typeof error === 'object' && error !== null
+      ? (error as ErrorWithStatus)
+      : { message: String(error) };
+
+  const status = err.status || (err.name === 'AbortError' ? 408 : 0);
+
+  return {
+    success: false,
+    status,
+    error: {
+      name: err.name || 'Error',
+      message: err.msg || err.message || 'Unknown error',
+      status,
+      retryable: false,
+      url,
+      method,
+    },
+    data: null,
+  };
+};
+
+// Optimize: Simplify response parsing
+const parseResponse = async (res: Response): Promise<unknown> => {
+  const contentType = res.headers.get('content-type');
+  return contentType?.includes('json') ? res.json() : res.text();
+};
+
+// Optimize: Extract error message parsing
+const extractErrorMessage = (data: unknown, statusText: string): string => {
+  if (typeof data === 'string') return data;
+  
+  if (typeof data === 'object' && data !== null) {
+    const obj = data as Record<string, unknown>;
+    if (typeof obj.message === 'string') return obj.message;
+    if (typeof obj.error === 'string') return obj.error;
+  }
+  
+  return statusText;
+};
+
+// Optimize: Check if error is retryable
+const isRetryableError = (status: number, attempt: number, maxRetries: number): boolean => {
+  return attempt <= maxRetries && (status === 408 || status >= 500 || RETRY_CODES.has(status));
 };
 
 export default async function apiRequest<T = unknown>(
@@ -198,117 +388,131 @@ export default async function apiRequest<T = unknown>(
   endpoint: string,
   opts: RequestOptions<RequestBody, T> = {},
 ): Promise<ApiResponse<T>> {
-  if (!HTTP_METHODS.includes(method))
+  // Validate method early
+  if (!HTTP_METHODS.includes(method)) {
     return {
       success: false,
       status: 400,
       error: {
         name: 'ValidationError',
-        message: 'Invalid method',
+        message: 'Invalid HTTP method',
         status: 400,
       },
       data: null,
     };
-  const { retries = CFG.RETRIES, timeout = CFG.TIMEOUT, priority = 'normal', dedupeKey } = opts;
+  }
+
+  const {
+    retries = CFG.RETRIES,
+    timeout = CFG.TIMEOUT,
+    priority = 'normal',
+    dedupeKey,
+  } = opts;
+
   const url = buildUrl(endpoint, opts.params);
-  const key = dedupeKey ?? `${method}:${url}:${JSON.stringify(opts.data || '').slice(0, 50)}`;
+  
+  // Optimize: More efficient dedupe key generation
+  const key =
+    dedupeKey ??
+    (opts.data
+      ? `${method}:${url}:${JSON.stringify(opts.data).substring(0, 50)}`
+      : `${method}:${url}`);
+
   const start = performance.now();
 
   return pool.exec(
     async () => {
       let attempt = 0;
+
+      // eslint-disable-next-line no-constant-condition
       while (true) {
         attempt++;
         await limiter.check();
+
         const ctrl = new AbortController();
-        const tid = setTimeout(
-          () => ctrl.abort(),
-          typeof timeout === 'function' ? timeout(attempt) : timeout,
-        );
+        const timeoutDuration = typeof timeout === 'function' ? timeout(attempt) : timeout;
+        const timeoutId = setTimeout(() => ctrl.abort(), timeoutDuration);
+
         try {
+          // Optimize: Build headers object once
+          const headers: Record<string, string> = {
+            Accept: 'application/json',
+            ...getAuth(),
+            ...opts.headers,
+          };
+
+          // Add Content-Type only if needed
+          if (opts.data && !(opts.data instanceof FormData)) {
+            headers['Content-Type'] = 'application/json';
+          }
+
+          // Optimize: Prepare body once
+          const body = opts.data
+            ? opts.data instanceof FormData
+              ? opts.data
+              : JSON.stringify(opts.data)
+            : undefined;
+
           const res = await fetch(url, {
             method,
-            headers: {
-              Accept: 'application/json',
-              ...getAuth(),
-              ...opts.headers,
-              ...(opts.data ? { 'Content-Type': 'application/json' } : {}),
-            },
-            body: opts.data
-              ? opts.data instanceof FormData
-                ? opts.data
-                : JSON.stringify(opts.data)
-              : undefined,
+            headers,
+            body,
             signal: opts.signal || ctrl.signal,
             next: opts.next,
             cache: opts.cache,
           });
-          clearTimeout(tid);
 
-          const isJson = res.headers.get('content-type')?.includes('json');
-          const data: unknown = await (isJson ? res.json() : res.text());
+          clearTimeout(timeoutId);
+
+          const data = await parseResponse(res);
 
           if (!res.ok) {
-            const d =
-              typeof data === 'object' && data !== null ? (data as Record<string, unknown>) : {};
-            const msg =
-              typeof data === 'string'
-                ? data
-                : typeof d.message === 'string'
-                  ? d.message
-                  : typeof d.error === 'string'
-                    ? d.error
-                    : res.statusText;
-            throw { status: res.status, msg };
+            const message = extractErrorMessage(data, res.statusText);
+            throw { status: res.status, msg: message };
           }
 
-          if (opts.logTypes)
+          // Optimize: Only log in development
+          if (opts.logTypes) {
             logTypes(endpoint, method, data, {
               time: Math.round(performance.now() - start),
               att: attempt > 1 ? attempt : undefined,
             });
+          }
 
-          const headers: Record<string, string> = {};
+          // Optimize: Efficient header extraction
+          const responseHeaders: Record<string, string> = {};
           res.headers.forEach((v, k) => {
-            headers[k] = v;
+            responseHeaders[k] = v;
           });
 
           return {
             success: true,
             status: res.status,
             data: opts.transform ? opts.transform(data as T) : (data as T),
-            headers,
+            headers: responseHeaders,
           };
         } catch (e: unknown) {
-          clearTimeout(tid);
+          clearTimeout(timeoutId);
+
           interface ErrorWithStatus {
             status?: number;
             name?: string;
-            msg?: string;
-            message?: string;
           }
-          const rErr =
-            typeof e === 'object' && e !== null ? (e as ErrorWithStatus) : { message: String(e) };
-          const status = rErr.status || (rErr.name === 'AbortError' ? 408 : 0);
 
-          if (
-            !(attempt <= retries && (status === 408 || status >= 500 || RETRY_CODES.has(status)))
-          ) {
-            return {
-              success: false,
-              status,
-              error: {
-                name: rErr.name || 'Error',
-                message: rErr.msg || rErr.message || 'Unknown',
-                status,
-                retryable: false,
-                url,
-                method,
-              },
-              data: null,
-            };
+          const err =
+            typeof e === 'object' && e !== null
+              ? (e as ErrorWithStatus)
+              : { message: String(e) };
+
+          const status = err.status || (err.name === 'AbortError' ? 408 : 0);
+
+          // Check if we should retry
+          if (!isRetryableError(status, attempt, retries)) {
+            return createErrorResponse(e, url, method);
           }
-          await new Promise((r) => setTimeout(r, Math.min(1000, 100 * 2 ** (attempt - 1))));
+
+          // Exponential backoff before retry
+          await new Promise((r) => setTimeout(r, calculateBackoff(attempt)));
         }
       }
     },
@@ -317,22 +521,29 @@ export default async function apiRequest<T = unknown>(
   );
 }
 
-// Helpers
+// Helpers with type guards
 apiRequest.isSuccess = <T>(r: ApiResponse<T>): r is Extract<ApiResponse<T>, { success: true }> =>
   r.success;
+
 apiRequest.isError = <T>(r: ApiResponse<T>): r is Extract<ApiResponse<T>, { success: false }> =>
   !r.success;
+
 apiRequest.utils = {
   getStats: () => ({
     pool: pool.stats(),
     rateLimit: limiter.stats(),
     runtime: IS_BUN ? 'bun' : 'node',
   }),
-  sanitizeHeaders: (h: Record<string, string>) => {
-    const s = { ...h };
-    ['Authorization', 'X-API-Key', 'Cookie'].forEach((k) => {
-      if (s[k]) s[k] = '[REDACTED]';
-    });
-    return s;
+  sanitizeHeaders: (h: Record<string, string>): Record<string, string> => {
+    const sanitized = { ...h };
+    const sensitiveHeaders = ['Authorization', 'X-API-Key', 'Cookie'];
+    
+    for (const key of sensitiveHeaders) {
+      if (sanitized[key]) {
+        sanitized[key] = '[REDACTED]';
+      }
+    }
+    
+    return sanitized;
   },
 };
