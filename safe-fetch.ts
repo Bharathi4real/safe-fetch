@@ -1,35 +1,61 @@
 /**
- * SafeFetch – Optimized Typed Fetch utility for Next.js 16
- * (c) 2025 Bharathi4real – BSD 3-Clause License
- * Memory-optimized with unified retry, timeout & adaptive pooling
- * https://github.com/Bharathi4real/safe-fetch/
+ * SafeFetch – Typed Fetch Utility for Next.js 16
+ * (c) 2026 Bharathi4real – BSD 3-Clause License
+ *
+ * Architecture:
+ *  - Environment Resolver
+ *  - Auth Provider (TTL cached)
+ *  - URL Builder (LRU cache)
+ *  - Rate Limiter
+ *  - Concurrency Pool (Priority + Stable Dedupe)
+ *  - Retry Engine (Jittered Exponential Backoff)
+ *  - Typed Endpoint Factory
  */
 
-'use server';
+"use server";
 
-const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const;
+import { createHash } from "node:crypto";
+
+/* ======================================================
+ * SECTION: Public Types
+ * ====================================================== */
+
+const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH"] as const;
 export type HttpMethod = (typeof HTTP_METHODS)[number];
-export type RequestBody = Record<string, unknown> | FormData | string | null;
+
+export type RequestBody = Record<string, unknown> | FormData | string | Blob | ArrayBuffer | URLSearchParams | null;
+
 export type QueryParams = Record<string, string | number | boolean | null | undefined>;
 
-export interface RequestOptions<TBody extends RequestBody = RequestBody, TResponse = unknown> {
+export interface RequestOptions<TBody extends RequestBody = RequestBody, TRes = unknown> {
   data?: TBody;
   params?: QueryParams;
   retries?: number;
   timeout?: number | ((attempt: number) => number);
   headers?: Record<string, string>;
-  transform?(data: TResponse): TResponse;
-  priority?: 'high' | 'normal' | 'low';
+  transform?(data: TRes): TRes;
+  priority?: "high" | "normal" | "low";
   signal?: AbortSignal;
   logTypes?: boolean;
   cache?: RequestCache;
   next?: { revalidate?: number | false; tags?: string[] };
   dedupeKey?: string | null;
+  pathParams?: Record<string, string | number>;
 }
 
 export type ApiResponse<T = unknown> =
-  | { success: true; status: number; data: T; headers: Record<string, string> }
-  | { success: false; status: number; error: ApiError; data: null };
+  | {
+      success: true;
+      status: number;
+      data: T;
+      headers: Record<string, string>;
+    }
+  | {
+      success: false;
+      status: number;
+      error: ApiError;
+      data: null;
+    };
 
 export interface ApiError {
   readonly name: string;
@@ -40,498 +66,485 @@ export interface ApiError {
   readonly method?: string;
 }
 
-const IS_BUN = typeof globalThis !== 'undefined' && 'Bun' in globalThis;
-const RETRY_CODES = new Set([408, 429, 500, 502, 503, 504]);
-const PRIORITY_VALUES = { high: 3, normal: 2, low: 1 } as const;
+/* ======================================================
+ * SECTION: Runtime Configuration
+ * ====================================================== */
 
-interface GlobalEnv {
-  __ENV__?: Record<string, string>;
-}
+const IS_BUN = typeof globalThis !== "undefined" && "Bun" in globalThis;
 
-// Optimize: Cache env values and avoid repeated lookups
-const getEnv = (() => {
-  let cachedEnv: ReturnType<typeof createEnv> | null = null;
+const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
 
-  function createEnv() {
-    const env = process.env || (globalThis as unknown as GlobalEnv).__ENV__ || {};
-    return {
-      API_URL: env.NEXT_PUBLIC_API_URL || env.BASE_URL || env.API_URL || '',
-      AUTH_USERNAME: env.AUTH_USERNAME || env.API_USERNAME || '',
-      AUTH_PASSWORD: env.AUTH_PASSWORD || env.API_PASSWORD || '',
-      API_TOKEN: env.AUTH_TOKEN || env.API_TOKEN || '',
-      NODE_ENV: env.NODE_ENV || 'development',
-    };
-  }
-
-  return () => {
-    if (!cachedEnv) {
-      cachedEnv = createEnv();
-      if (!cachedEnv.API_URL) {
-        console.error('\x1b[31m%s\x1b[0m', '❌ [SafeFetch] Missing API_URL');
-      }
-      if (!cachedEnv.AUTH_USERNAME && !cachedEnv.API_TOKEN) {
-        console.error('\x1b[31m%s\x1b[0m', '❌ [SafeFetch] Missing Auth Credentials');
-      }
-    }
-    return cachedEnv;
-  };
-})();
-
-const ENV = getEnv();
-const CFG = {
-  RETRIES: 2,
-  TIMEOUT: 60000,
-  MAX_CONCURRENT: IS_BUN ? 20 : 10,
-  RATE_MAX: 100,
-  RATE_WINDOW: 60000,
-  AUTH_CACHE_TTL: 300000, // 5 minutes
+const PRIORITY_WEIGHT = {
+  high: 3,
+  normal: 2,
+  low: 1,
 } as const;
 
-/* --- Util Classes --- */
-
-// Optimize: Use circular buffer for rate limiter to avoid array filter operations
-class RateLimiter {
-  private readonly timestamps: number[];
-  private head = 0;
-  private size = 0;
-
-  constructor(private readonly capacity = CFG.RATE_MAX) {
-    this.timestamps = new Array(capacity);
-  }
-
-  async check(max = CFG.RATE_MAX, win = CFG.RATE_WINDOW): Promise<void> {
-    const now = Date.now();
-    const cutoff = now - win;
-
-    // Remove expired timestamps
-    while (this.size > 0 && this.timestamps[this.head] < cutoff) {
-      this.head = (this.head + 1) % this.capacity;
-      this.size--;
-    }
-
-    if (this.size >= max) {
-      const waitTime = win - (now - this.timestamps[this.head]);
-      await new Promise((r) => setTimeout(r, waitTime));
-      return this.check(max, win);
-    }
-
-    // Add new timestamp
-    const index = (this.head + this.size) % this.capacity;
-    this.timestamps[index] = now;
-    this.size++;
-  }
-
-  stats = () => ({ current: this.size });
-}
-
-const limiter = new RateLimiter();
-
-// Optimize: Use WeakMap for dedupe cache to allow garbage collection
-class Pool {
-  private readonly queue: Array<{ fn: () => void; pri: number }> = [];
-  private active = 0;
-  private readonly pending = new Map<string, Promise<unknown>>();
-
-  constructor(private readonly max = CFG.MAX_CONCURRENT) {}
-
-  async exec<T>(
-    fn: () => Promise<T>,
-    pri: 'high' | 'normal' | 'low' = 'normal',
-    key?: string | null,
-  ): Promise<T> {
-    // Dedupe: return existing promise if key exists
-    if (key) {
-      const existing = this.pending.get(key);
-      if (existing) return existing as Promise<T>;
-    }
-
-    const task = new Promise<T>((resolve, reject) => {
-      const run = async () => {
-        this.active++;
-        try {
-          const result = await fn();
-          resolve(result);
-        } catch (e) {
-          reject(e);
-        } finally {
-          this.active--;
-          if (key) this.pending.delete(key);
-          this.processQueue();
-        }
-      };
-
-      if (this.active < this.max) {
-        run();
-      } else {
-        this.enqueue(run, pri);
-      }
-    });
-
-    if (key) this.pending.set(key, task);
-    return task;
-  }
-
-  // Optimize: Separate queue processing logic
-  private processQueue(): void {
-    if (this.queue.length > 0 && this.active < this.max) {
-      this.queue.shift()?.fn();
-    }
-  }
-
-  // Optimize: Binary search for insertion point
-  private enqueue(fn: () => void, pri: 'high' | 'normal' | 'low'): void {
-    const priVal = PRIORITY_VALUES[pri];
-
-    // Binary search for insertion point
-    let left = 0;
-    let right = this.queue.length;
-
-    while (left < right) {
-      const mid = (left + right) >>> 1; // Use unsigned right shift for division by 2
-      if (this.queue[mid].pri >= priVal) {
-        left = mid + 1;
-      } else {
-        right = mid;
-      }
-    }
-
-    this.queue.splice(left, 0, { fn, pri: priVal });
-  }
-
-  stats = () => ({ active: this.active, queued: this.queue.length });
-}
-
-const pool = new Pool();
-
-/* --- Requests --- */
-
-// Optimize: Memoize auth header creation with TTL
-const getAuth = (() => {
-  let cache: Record<string, string> | null = null;
-  let lastUpdate = 0;
-
-  return (): Record<string, string> => {
-    const now = Date.now();
-    if (cache && now - lastUpdate < CFG.AUTH_CACHE_TTL) {
-      return cache;
-    }
-
-    const { AUTH_USERNAME: u, AUTH_PASSWORD: p, API_TOKEN: t } = ENV;
-    const headers: Record<string, string> = {};
-
-    if (u && p) {
-      const credentials = `${u}:${p}`;
-      const encoded =
-        typeof btoa !== 'undefined'
-          ? btoa(credentials)
-          : Buffer.from(credentials).toString('base64');
-      headers.Authorization = `Basic ${encoded}`;
-    } else if (t) {
-      headers.Authorization = `Bearer ${t}`;
-    }
-
-    lastUpdate = now;
-    cache = headers;
-    return headers;
+const RUNTIME_ENV = (() => {
+  const env = process.env ?? {};
+  return {
+    API_URL: env.NEXT_PUBLIC_API_URL || env.BASE_URL || env.API_URL || "",
+    AUTH_USERNAME: env.AUTH_USERNAME || env.API_USERNAME || "",
+    AUTH_PASSWORD: env.AUTH_PASSWORD || env.API_PASSWORD || "",
+    API_TOKEN: env.AUTH_TOKEN || env.API_TOKEN || "",
+    NODE_ENV: env.NODE_ENV || "development",
   };
 })();
 
-// Optimize: Cache URL building for repeated endpoints
-const buildUrl = (() => {
-  const cache = new Map<string, string>();
-  const maxCacheSize = 100;
+const DEFAULT_CONFIG = {
+  retries: 2,
+  timeout: 60_000,
+  maxConcurrent: IS_BUN ? 20 : 10,
+  rateMax: 100,
+  rateWindow: 60_000,
+  authCacheTTL: 300_000,
+} as const;
 
-  return (ep: string, p?: QueryParams): string => {
-    const cacheKey = p ? `${ep}:${JSON.stringify(p)}` : ep;
-    const cached = cache.get(cacheKey);
-    if (cached) return cached;
+/* ======================================================
+ * SECTION: Pure Utility Functions
+ * ====================================================== */
 
-    let url = ep;
-    if (!/^https?:\/\//i.test(ep)) {
-      const base = ENV.API_URL || (typeof window !== 'undefined' ? window.location.origin : '');
-      url = `${base.replace(/\/+$/, '')}/${ep.replace(/^\/+/, '')}`;
-    }
+function stableHash(input: unknown): string {
+  if (!input || typeof input !== "object") {
+    return createHash("sha1").update(String(input)).digest("hex");
+  }
 
-    if (p) {
-      const params = new URLSearchParams();
-      for (const [k, v] of Object.entries(p)) {
-        if (v != null) {
-          params.append(k, String(v));
-        }
+  const sorted = Object.keys(input as object)
+    .sort()
+    .reduce<Record<string, unknown>>((acc, key) => {
+      acc[key] = (input as Record<string, unknown>)[key];
+      return acc;
+    }, {});
+
+  return createHash("sha1").update(JSON.stringify(sorted)).digest("hex");
+}
+
+function interpolatePath(path: string, params?: Record<string, string | number>): string {
+  if (!params) return path;
+
+  return path.replace(/:([a-zA-Z0-9_]+)/g, (_, key) => encodeURIComponent(String(params[key])));
+}
+
+function exponentialBackoff(attempt: number): number {
+  const maxDelay = Math.min(10_000, 100 * 2 ** (attempt - 1));
+  return maxDelay / 2 + Math.random() * (maxDelay / 2);
+}
+
+function inferType(value: unknown, depth = 0): string {
+  if (depth > 5) return "unknown";
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (typeof value !== "object") return typeof value;
+
+  if (Array.isArray(value)) {
+    return value.length ? `(${inferType(value[0], depth + 1)})[]` : "unknown[]";
+  }
+
+  const entries = Object.entries(value).slice(0, 5);
+
+  if (!entries.length) return "{}";
+
+  return `{\n${entries.map(([key, val]) => `  ${key}: ${inferType(val, depth + 1)}`).join(",\n")}\n}`;
+}
+
+function devLogTypes(endpoint: string, method: string, data: unknown, duration: number, attempt?: number) {
+  if (RUNTIME_ENV.NODE_ENV !== "development") return;
+
+  console.log(
+    `🔍 [SafeFetch] ${method} ${endpoint} (${duration}ms)${
+      attempt ? ` [attempt ${attempt}]` : ""
+    }\nType: ${inferType(data)}`,
+  );
+}
+
+/* ======================================================
+ * SECTION: Infrastructure Layer
+ * ====================================================== */
+
+/* ---------- Auth Provider (TTL Cached) ---------- */
+
+const AuthProvider = (() => {
+  let cachedHeaders: Record<string, string> | null = null;
+  let lastResolved = 0;
+
+  return {
+    get(): Record<string, string> {
+      const now = Date.now();
+
+      if (cachedHeaders && now - lastResolved < DEFAULT_CONFIG.authCacheTTL) {
+        return cachedHeaders;
       }
-      const qs = params.toString();
-      if (qs) url += `?${qs}`;
-    }
 
-    // LRU-style cache management
-    if (cache.size >= maxCacheSize) {
+      const headers: Record<string, string> = {};
+
+      if (RUNTIME_ENV.AUTH_USERNAME && RUNTIME_ENV.AUTH_PASSWORD) {
+        headers.Authorization = `Basic ${Buffer.from(
+          `${RUNTIME_ENV.AUTH_USERNAME}:${RUNTIME_ENV.AUTH_PASSWORD}`,
+        ).toString("base64")}`;
+      } else if (RUNTIME_ENV.API_TOKEN) {
+        headers.Authorization = `Bearer ${RUNTIME_ENV.API_TOKEN}`;
+      }
+
+      cachedHeaders = headers;
+      lastResolved = now;
+
+      return headers;
+    },
+  };
+})();
+
+/* ---------- URL Builder (LRU Cache) ---------- */
+
+const UrlBuilder = (() => {
+  const cache = new Map<string, string>();
+  const MAX_CACHE_SIZE = 100;
+
+  function evictIfNeeded() {
+    if (cache.size >= MAX_CACHE_SIZE) {
       const firstKey = cache.keys().next().value;
       if (firstKey) cache.delete(firstKey);
     }
-    cache.set(cacheKey, url);
+  }
 
-    return url;
+  return {
+    build(endpoint: string, params?: QueryParams): string {
+      const key = endpoint + JSON.stringify(params ?? {});
+
+      const cached = cache.get(key);
+      if (cached) return cached;
+
+      const base = RUNTIME_ENV.API_URL || (typeof window !== "undefined" ? window.location.origin : "");
+
+      let url = /^https?:\/\//i.test(endpoint)
+        ? endpoint
+        : `${base.replace(/\/+$/, "")}/${endpoint.replace(/^\/+/, "")}`;
+
+      if (params) {
+        const qs = new URLSearchParams();
+
+        for (const [k, v] of Object.entries(params)) {
+          if (v != null) qs.append(k, String(v));
+        }
+
+        const queryString = qs.toString();
+        if (queryString) url += `?${queryString}`;
+      }
+
+      evictIfNeeded();
+      cache.set(key, url);
+
+      return url;
+    },
   };
 })();
 
-// Optimize: Limit recursion depth and memoize common types
-const inferType = (v: unknown, d = 0): string => {
-  if (d > 8) return 'unknown';
-  if (v === null) return 'null';
-  if (v === undefined) return 'undefined';
+/* ---------- Rate Limiter ---------- */
 
-  const type = typeof v;
-  if (type !== 'object') return type;
+class RateLimiter {
+  private timestamps: number[] = [];
 
-  if (Array.isArray(v)) {
-    return v.length ? `(${inferType(v[0], d + 1)})[]` : 'unknown[]';
+  async check(max = DEFAULT_CONFIG.rateMax, windowMs = DEFAULT_CONFIG.rateWindow) {
+    while (true) {
+      const now = Date.now();
+
+      this.timestamps = this.timestamps.filter((ts) => now - ts < windowMs);
+
+      if (this.timestamps.length < max) {
+        this.timestamps.push(now);
+        return;
+      }
+
+      const waitTime = windowMs - (now - this.timestamps[0]);
+
+      await new Promise((r) => setTimeout(r, waitTime));
+    }
   }
 
-  // Limit object property inspection
-  const entries = Object.entries(v as Record<string, unknown>).slice(0, 10);
-  if (entries.length === 0) return '{}';
+  stats() {
+    return { current: this.timestamps.length };
+  }
+}
 
-  const props = entries.map(([k, val]) => `  ${k}: ${inferType(val, d + 1)}`).join(',\n');
+/* ---------- Concurrency Pool ---------- */
 
-  return `{\n${props}\n}`;
-};
+class ConcurrencyPool {
+  private activeCount = 0;
+  private queue: {
+    run: () => void;
+    priority: number;
+  }[] = [];
+  private pendingMap = new Map<string, Promise<unknown>>();
 
-const logTypes = (
-  ep: string,
-  method: string,
-  data: unknown,
-  meta?: { time: number; att?: number },
-): void => {
-  if (ENV.NODE_ENV !== 'development') return;
+  constructor(private maxConcurrent = DEFAULT_CONFIG.maxConcurrent) {}
 
-  const payload =
-    typeof data === 'object' && data !== null && 'data' in data
-      ? (data as { data: unknown }).data
-      : data;
+  async execute<T>(fn: () => Promise<T>, priority: "high" | "normal" | "low", dedupeKey?: string | null): Promise<T> {
+    if (dedupeKey && this.pendingMap.has(dedupeKey)) {
+      return this.pendingMap.get(dedupeKey) as Promise<T>;
+    }
 
-  const attemptInfo = meta?.att ? ` [attempt ${meta.att}]` : '';
-  console.log(
-    `🔍 [SafeFetch] ${method} ${ep} (${meta?.time}ms)${attemptInfo}\nType: ${inferType(payload)}`,
-  );
-};
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
 
-// Optimize: Exponential backoff calculation
-const calculateBackoff = (attempt: number): number => {
-  // Cap at 10 seconds to avoid excessive waits
-  return Math.min(10000, 100 * 2 ** (attempt - 1));
-};
+    const task = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
 
-// Optimize: Extract error handling logic
-const createErrorResponse = (error: unknown, url: string, method: string): ApiResponse<never> => {
-  interface ErrorWithStatus {
-    status?: number;
-    name?: string;
-    msg?: string;
-    message?: string;
+    if (dedupeKey) {
+      this.pendingMap.set(dedupeKey, task);
+    }
+
+    const runTask = async () => {
+      this.activeCount++;
+      try {
+        resolve(await fn());
+      } catch (err) {
+        reject(err);
+      } finally {
+        this.activeCount--;
+        if (dedupeKey) this.pendingMap.delete(dedupeKey);
+        this.processNext();
+      }
+    };
+
+    if (this.activeCount < this.maxConcurrent) {
+      runTask();
+    } else {
+      this.queue.push({
+        run: runTask,
+        priority: PRIORITY_WEIGHT[priority],
+      });
+
+      this.queue.sort((a, b) => b.priority - a.priority);
+    }
+
+    return task;
   }
 
-  const err =
-    typeof error === 'object' && error !== null
-      ? (error as ErrorWithStatus)
-      : { message: String(error) };
+  private processNext() {
+    if (this.queue.length && this.activeCount < this.maxConcurrent) {
+      this.queue.shift()?.run();
+    }
+  }
 
-  const status = err.status || (err.name === 'AbortError' ? 408 : 0);
+  stats() {
+    return {
+      active: this.activeCount,
+      queued: this.queue.length,
+    };
+  }
+}
 
-  return {
-    success: false,
-    status,
-    error: {
-      name: err.name || 'Error',
-      message: err.msg || err.message || 'Unknown error',
-      status,
-      retryable: false,
-      url,
-      method,
-    },
-    data: null,
+const rateLimiter = new RateLimiter();
+const concurrencyPool = new ConcurrencyPool();
+
+/* ======================================================
+ * SECTION: Core Execution Engine
+ * ====================================================== */
+
+function buildHeaders(body: RequestBody, custom?: Record<string, string>) {
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    ...AuthProvider.get(),
+    ...custom,
   };
-};
 
-// Optimize: Simplify response parsing
-const parseResponse = async (res: Response): Promise<unknown> => {
-  const contentType = res.headers.get('content-type');
-  return contentType?.includes('json') ? res.json() : res.text();
-};
-
-// Optimize: Extract error message parsing
-const extractErrorMessage = (data: unknown, statusText: string): string => {
-  if (typeof data === 'string') return data;
-
-  if (typeof data === 'object' && data !== null) {
-    const obj = data as Record<string, unknown>;
-    if (typeof obj.message === 'string') return obj.message;
-    if (typeof obj.error === 'string') return obj.error;
+  if (
+    body &&
+    typeof body === "object" &&
+    !(
+      body instanceof FormData ||
+      body instanceof Blob ||
+      body instanceof ArrayBuffer ||
+      body instanceof URLSearchParams
+    )
+  ) {
+    headers["Content-Type"] = "application/json";
   }
 
-  return statusText;
-};
+  return headers;
+}
 
-// Optimize: Check if error is retryable
-const isRetryableError = (status: number, attempt: number, maxRetries: number): boolean => {
-  return attempt <= maxRetries && (status === 408 || status >= 500 || RETRY_CODES.has(status));
-};
+function serializeBody(body: RequestBody) {
+  if (!body) return undefined;
+
+  if (
+    body instanceof FormData ||
+    body instanceof Blob ||
+    body instanceof ArrayBuffer ||
+    body instanceof URLSearchParams
+  ) {
+    return body;
+  }
+
+  if (typeof body === "string") return body;
+
+  return JSON.stringify(body);
+}
+
+async function executeWithRetry<T>(
+  method: HttpMethod,
+  url: string,
+  options: RequestOptions<RequestBody, T>,
+): Promise<ApiResponse<T>> {
+  const maxAttempts = (options.retries ?? DEFAULT_CONFIG.retries) + 1;
+
+  const startTime = performance.now();
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await rateLimiter.check();
+
+    const controller = new AbortController();
+
+    const timeoutMs =
+      typeof options.timeout === "function" ? options.timeout(attempt) : (options.timeout ?? DEFAULT_CONFIG.timeout);
+
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    const combinedSignal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+
+    try {
+      const response = await fetch(url, {
+        method,
+        headers: buildHeaders(options.data ?? null, options.headers),
+        body: serializeBody(options.data ?? null),
+        signal: combinedSignal,
+        cache: options.cache,
+        next: options.next,
+      });
+
+      clearTimeout(timeoutId);
+
+      const data = response.headers.get("content-type")?.includes("json")
+        ? await response.json()
+        : await response.text();
+
+      if (!response.ok) {
+        throw {
+          status: response.status,
+          message: response.statusText,
+        };
+      }
+
+      let finalData = data as T;
+
+      if (options.transform) {
+        finalData = options.transform(finalData);
+      }
+
+      if (options.logTypes) {
+        devLogTypes(
+          url,
+          method,
+          finalData,
+          Math.round(performance.now() - startTime),
+          attempt > 1 ? attempt : undefined,
+        );
+      }
+
+      const headers: Record<string, string> = {};
+
+      response.headers.forEach((v, k) => {
+        headers[k] = v;
+      });
+
+      return {
+        success: true,
+        status: response.status,
+        data: finalData,
+        headers,
+      };
+    } catch (error: unknown) {
+      clearTimeout(timeoutId);
+
+      const status = (error as { status?: number })?.status ?? 0;
+
+      const retryable = RETRYABLE_STATUS_CODES.has(status);
+
+      if (attempt === maxAttempts || !retryable) {
+        return {
+          success: false,
+          status,
+          error: {
+            name: (error as { name?: string })?.name || "Error",
+            message: (error as { message?: string })?.message || "Request failed",
+            status,
+            retryable,
+            url,
+            method,
+          },
+          data: null,
+        };
+      }
+
+      await new Promise((r) => setTimeout(r, exponentialBackoff(attempt)));
+    }
+  }
+
+  throw new Error("Unreachable retry state");
+}
+
+/* ======================================================
+ * SECTION: Public API
+ * ====================================================== */
 
 export default async function apiRequest<T = unknown>(
   method: HttpMethod,
   endpoint: string,
-  opts: RequestOptions<RequestBody, T> = {},
+  options: RequestOptions<RequestBody, T> = {},
 ): Promise<ApiResponse<T>> {
-  // Validate method early
-  if (!HTTP_METHODS.includes(method)) {
-    return {
-      success: false,
-      status: 400,
-      error: {
-        name: 'ValidationError',
-        message: 'Invalid HTTP method',
-        status: 400,
-      },
-      data: null,
-    };
-  }
+  const resolvedPath = interpolatePath(endpoint, options.pathParams);
 
-  const { retries = CFG.RETRIES, timeout = CFG.TIMEOUT, priority = 'normal', dedupeKey } = opts;
+  const url = UrlBuilder.build(resolvedPath, options.params);
 
-  const url = buildUrl(endpoint, opts.params);
+  const dedupeKey = options.dedupeKey ?? `${method}:${url}:${options.data ? stableHash(options.data) : ""}`;
 
-  // Optimize: More efficient dedupe key generation
-  const key =
-    dedupeKey ??
-    (opts.data
-      ? `${method}:${url}:${JSON.stringify(opts.data).substring(0, 50)}`
-      : `${method}:${url}`);
-
-  const start = performance.now();
-
-  return pool.exec(
-    async () => {
-      let attempt = 0;
-
-      // eslint-disable-next-line no-constant-condition
-      while (true) {
-        attempt++;
-        await limiter.check();
-
-        const ctrl = new AbortController();
-        const timeoutDuration = typeof timeout === 'function' ? timeout(attempt) : timeout;
-        const timeoutId = setTimeout(() => ctrl.abort(), timeoutDuration);
-
-        try {
-          // Optimize: Build headers object once
-          const headers: Record<string, string> = {
-            Accept: 'application/json',
-            ...getAuth(),
-            ...opts.headers,
-          };
-
-          // Add Content-Type only if needed
-          if (opts.data && !(opts.data instanceof FormData)) {
-            headers['Content-Type'] = 'application/json';
-          }
-
-          // Optimize: Prepare body once
-          const body = opts.data
-            ? opts.data instanceof FormData
-              ? opts.data
-              : JSON.stringify(opts.data)
-            : undefined;
-
-          const res = await fetch(url, {
-            method,
-            headers,
-            body,
-            signal: opts.signal || ctrl.signal,
-            next: opts.next,
-            cache: opts.cache,
-          });
-
-          clearTimeout(timeoutId);
-
-          const data = await parseResponse(res);
-
-          if (!res.ok) {
-            const message = extractErrorMessage(data, res.statusText);
-            throw { status: res.status, msg: message };
-          }
-
-          // Optimize: Only log in development
-          if (opts.logTypes) {
-            logTypes(endpoint, method, data, {
-              time: Math.round(performance.now() - start),
-              att: attempt > 1 ? attempt : undefined,
-            });
-          }
-
-          // Optimize: Efficient header extraction
-          const responseHeaders: Record<string, string> = {};
-          res.headers.forEach((v, k) => {
-            responseHeaders[k] = v;
-          });
-
-          return {
-            success: true,
-            status: res.status,
-            data: opts.transform ? opts.transform(data as T) : (data as T),
-            headers: responseHeaders,
-          };
-        } catch (e: unknown) {
-          clearTimeout(timeoutId);
-
-          interface ErrorWithStatus {
-            status?: number;
-            name?: string;
-            message?: string;
-          }
-
-          const err = (
-            typeof e === 'object' && e !== null ? e : { message: String(e) }
-          ) as ErrorWithStatus;
-
-          const status = err.status || (err.name === 'AbortError' ? 408 : 0);
-
-          // Check if we should retry
-          if (!isRetryableError(status, attempt, retries)) {
-            return createErrorResponse(e, url, method);
-          }
-
-          // Exponential backoff before retry
-          await new Promise((r) => setTimeout(r, calculateBackoff(attempt)));
-        }
-      }
-    },
-    priority,
-    key,
+  return concurrencyPool.execute(
+    () => executeWithRetry<T>(method, url, options),
+    options.priority ?? "normal",
+    dedupeKey,
   );
 }
 
-// Helpers with type guards
-apiRequest.isSuccess = <T>(r: ApiResponse<T>): r is Extract<ApiResponse<T>, { success: true }> =>
-  r.success;
+/* ======================================================
+ * SECTION: Endpoint Factory
+ * ====================================================== */
 
-apiRequest.isError = <T>(r: ApiResponse<T>): r is Extract<ApiResponse<T>, { success: false }> =>
-  !r.success;
+export async function createEndpoint<
+  TMethod extends HttpMethod,
+  TPath extends string,
+  TBody extends RequestBody = null,
+  TRes = unknown,
+>(config: { method: TMethod; path: TPath; defaults?: Partial<RequestOptions<TBody, TRes>> }) {
+  return async (body?: TBody, options?: Omit<RequestOptions<TBody, TRes>, "data">): Promise<ApiResponse<TRes>> =>
+    apiRequest<TRes>(config.method, config.path, {
+      ...config.defaults,
+      ...options,
+      data: body ?? null,
+    });
+}
+
+/* ======================================================
+ * SECTION: Guards & Utilities
+ * ====================================================== */
+
+apiRequest.isSuccess = <T>(response: ApiResponse<T>): response is Extract<ApiResponse<T>, { success: true }> =>
+  response.success;
+
+apiRequest.isError = <T>(response: ApiResponse<T>): response is Extract<ApiResponse<T>, { success: false }> =>
+  !response.success;
 
 apiRequest.utils = {
   getStats: () => ({
-    pool: pool.stats(),
-    rateLimit: limiter.stats(),
-    runtime: IS_BUN ? 'bun' : 'node',
+    pool: concurrencyPool.stats(),
+    rateLimit: rateLimiter.stats(),
+    runtime: IS_BUN ? "bun" : "node",
   }),
-  sanitizeHeaders: (h: Record<string, string>): Record<string, string> => {
-    const sanitized = { ...h };
-    const sensitiveHeaders = ['Authorization', 'X-API-Key', 'Cookie'];
-
-    for (const key of sensitiveHeaders) {
-      if (sanitized[key]) {
-        sanitized[key] = '[REDACTED]';
-      }
-    }
-
-    return sanitized;
+  sanitizeHeaders: (headers: Record<string, string>) => {
+    const copy = { ...headers };
+    ["Authorization", "Cookie", "X-API-Key"].forEach((key) => {
+      if (copy[key]) copy[key] = "[REDACTED]";
+    });
+    return copy;
   },
 };
