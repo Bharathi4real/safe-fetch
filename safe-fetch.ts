@@ -1,6 +1,7 @@
 /**
  * SafeFetch – Typed Fetch Utility for Next.js 16
  * (c) 2026 Bharathi4real – BSD 3-Clause License
+ * github.com/Bharathi4real/safe-fetch
  *
  * Architecture:
  *  - Environment Resolver
