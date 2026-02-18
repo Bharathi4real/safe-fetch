@@ -9,7 +9,14 @@
 
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const;
 export type HttpMethod = (typeof HTTP_METHODS)[number];
-export type RequestBody = Record<string, unknown> | FormData | string | null;
+export type RequestBody =
+  | Record<string, unknown>
+  | FormData
+  | ArrayBuffer
+  | Buffer
+  | string
+  | null
+  | unknown[];
 export type QueryParams = Record<string, string | number | boolean | null | undefined>;
 
 export interface RequestOptions<TBody extends RequestBody = RequestBody, TResponse = unknown> {
@@ -25,6 +32,7 @@ export interface RequestOptions<TBody extends RequestBody = RequestBody, TRespon
   cache?: RequestCache;
   next?: { revalidate?: number | false; tags?: string[] };
   dedupeKey?: string | null;
+  skipAuth?: boolean;
 }
 
 export type ApiResponse<T = unknown> =
@@ -397,7 +405,13 @@ export default async function apiRequest<T = unknown>(
 
   const { retries = CFG.RETRIES, timeout = CFG.TIMEOUT, priority = 'normal', dedupeKey } = opts;
 
-  const url = buildUrl(endpoint, opts.params);
+  let url = buildUrl(endpoint, opts.params);
+
+  // Aggressive cache busting for GET requests
+  if (method === 'GET') {
+    const separator = url.includes('?') ? '&' : '?';
+    url = `${url}${separator}cb=${Date.now()}`;
+  }
 
   // Optimize: More efficient dedupe key generation
   const key =
@@ -425,7 +439,10 @@ export default async function apiRequest<T = unknown>(
           // Optimize: Build headers object once
           const headers: Record<string, string> = {
             Accept: 'application/json',
-            ...getAuth(),
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            Pragma: 'no-cache',
+            Expires: '0',
+            ...(!opts.skipAuth ? getAuth() : {}),
             ...opts.headers,
           };
 
@@ -436,8 +453,10 @@ export default async function apiRequest<T = unknown>(
 
           // Optimize: Prepare body once
           const body = opts.data
-            ? opts.data instanceof FormData
-              ? opts.data
+            ? opts.data instanceof FormData ||
+              opts.data instanceof ArrayBuffer ||
+              (typeof Buffer !== 'undefined' && opts.data instanceof Buffer)
+              ? (opts.data as BodyInit)
               : JSON.stringify(opts.data)
             : undefined;
 
