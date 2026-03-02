@@ -1,11 +1,9 @@
 /**
- * SafeFetch – Optimized Typed Fetch utility for Next.js 16
+ * SafeFetch – Optimized Typed Fetch utility for Next.js
  * (c) 2025 Bharathi4real – BSD 3-Clause License
  * Memory-optimized with unified retry, timeout & adaptive pooling
  * https://github.com/Bharathi4real/safe-fetch/
  */
-
-'use server';
 
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const;
 export type HttpMethod = (typeof HTTP_METHODS)[number];
@@ -56,14 +54,14 @@ interface GlobalEnv {
   __ENV__?: Record<string, string>;
 }
 
-// Optimize: Cache env values and avoid repeated lookups
+/* --- Environment --- */
 const getEnv = (() => {
   let cachedEnv: ReturnType<typeof createEnv> | null = null;
 
   function createEnv() {
     const env = process.env || (globalThis as unknown as GlobalEnv).__ENV__ || {};
     return {
-      API_URL: env.NEXT_PUBLIC_API_URL || env.BASE_URL || env.API_URL || '',
+      API_URL: env.API_URL || env.NEXT_PUBLIC_API_URL || '',
       AUTH_USERNAME: env.AUTH_USERNAME || env.API_USERNAME || '',
       AUTH_PASSWORD: env.AUTH_PASSWORD || env.API_PASSWORD || '',
       API_TOKEN: env.AUTH_TOKEN || env.API_TOKEN || '',
@@ -71,7 +69,7 @@ const getEnv = (() => {
     };
   }
 
-  return () => {
+  const get = () => {
     if (!cachedEnv) {
       cachedEnv = createEnv();
       if (!cachedEnv.API_URL) {
@@ -83,9 +81,23 @@ const getEnv = (() => {
     }
     return cachedEnv;
   };
+
+  if (process.env.NODE_ENV !== 'production') {
+    (get as { __resetCache?: () => void }).__resetCache = () => {
+      cachedEnv = null;
+    };
+  }
+
+  return get;
 })();
 
+export const __resetEnvCache =
+  process.env.NODE_ENV !== 'production'
+    ? () => (getEnv as { __resetCache?: () => void }).__resetCache?.()
+    : undefined;
+
 const ENV = getEnv();
+
 const CFG = {
   RETRIES: 2,
   TIMEOUT: 60000,
@@ -95,23 +107,20 @@ const CFG = {
   AUTH_CACHE_TTL: 300000, // 5 minutes
 } as const;
 
-/* --- Util Classes --- */
-
-// Optimize: Use circular buffer for rate limiter to avoid array filter operations
+/* --- Rate Limiter --- */
 class RateLimiter {
-  private readonly timestamps: number[];
+  private readonly timestamps: Float64Array;
   private head = 0;
   private size = 0;
 
   constructor(private readonly capacity = CFG.RATE_MAX) {
-    this.timestamps = new Array(capacity);
+    this.timestamps = new Float64Array(capacity);
   }
 
   async check(max = CFG.RATE_MAX, win = CFG.RATE_WINDOW): Promise<void> {
     const now = Date.now();
     const cutoff = now - win;
 
-    // Remove expired timestamps
     while (this.size > 0 && this.timestamps[this.head] < cutoff) {
       this.head = (this.head + 1) % this.capacity;
       this.size--;
@@ -123,7 +132,6 @@ class RateLimiter {
       return this.check(max, win);
     }
 
-    // Add new timestamp
     const index = (this.head + this.size) % this.capacity;
     this.timestamps[index] = now;
     this.size++;
@@ -134,7 +142,7 @@ class RateLimiter {
 
 const limiter = new RateLimiter();
 
-// Optimize: Use WeakMap for dedupe cache to allow garbage collection
+/* --- Connection Pool --- */
 class Pool {
   private readonly queue: Array<{ fn: () => void; pri: number }> = [];
   private active = 0;
@@ -147,7 +155,6 @@ class Pool {
     pri: 'high' | 'normal' | 'low' = 'normal',
     key?: string | null,
   ): Promise<T> {
-    // Dedupe: return existing promise if key exists
     if (key) {
       const existing = this.pending.get(key);
       if (existing) return existing as Promise<T>;
@@ -157,8 +164,7 @@ class Pool {
       const run = async () => {
         this.active++;
         try {
-          const result = await fn();
-          resolve(result);
+          resolve(await fn());
         } catch (e) {
           reject(e);
         } finally {
@@ -179,23 +185,20 @@ class Pool {
     return task;
   }
 
-  // Optimize: Separate queue processing logic
   private processQueue(): void {
     if (this.queue.length > 0 && this.active < this.max) {
       this.queue.shift()?.fn();
     }
   }
 
-  // Optimize: Binary search for insertion point
+  // Binary-search insertion — O(log n) find, O(n) splice (acceptable for ≤100 items)
   private enqueue(fn: () => void, pri: 'high' | 'normal' | 'low'): void {
     const priVal = PRIORITY_VALUES[pri];
-
-    // Binary search for insertion point
     let left = 0;
     let right = this.queue.length;
 
     while (left < right) {
-      const mid = (left + right) >>> 1; // Use unsigned right shift for division by 2
+      const mid = (left + right) >>> 1;
       if (this.queue[mid].pri >= priVal) {
         left = mid + 1;
       } else {
@@ -211,19 +214,13 @@ class Pool {
 
 const pool = new Pool();
 
-/* --- Requests --- */
-
-// Optimize: Memoize auth header creation with TTL
-const getAuth = (() => {
+/* --- Auth --- */
+const { getAuthHeaders, invalidateAuthCache } = (() => {
   let cache: Record<string, string> | null = null;
   let lastUpdate = 0;
+  let dirty = false;
 
-  return (): Record<string, string> => {
-    const now = Date.now();
-    if (cache && now - lastUpdate < CFG.AUTH_CACHE_TTL) {
-      return cache;
-    }
-
+  const build = (): Record<string, string> => {
     const { AUTH_USERNAME: u, AUTH_PASSWORD: p, API_TOKEN: t } = ENV;
     const headers: Record<string, string> = {};
 
@@ -238,16 +235,30 @@ const getAuth = (() => {
       headers.Authorization = `Bearer ${t}`;
     }
 
-    lastUpdate = now;
-    cache = headers;
     return headers;
+  };
+
+  return {
+    getAuthHeaders(): Record<string, string> {
+      const now = Date.now();
+      if (cache && !dirty && now - lastUpdate < CFG.AUTH_CACHE_TTL) return cache;
+      dirty = false;
+      lastUpdate = now;
+      cache = build();
+      return cache;
+    },
+    invalidateAuthCache(): void {
+      dirty = true;
+    },
   };
 })();
 
-// Optimize: Cache URL building for repeated endpoints
+export { invalidateAuthCache };
+
+/* --- URL Builder --- */
 const buildUrl = (() => {
   const cache = new Map<string, string>();
-  const maxCacheSize = 100;
+  const MAX_CACHE = 100;
 
   return (ep: string, p?: QueryParams): string => {
     const cacheKey = p ? `${ep}:${JSON.stringify(p)}` : ep;
@@ -263,26 +274,22 @@ const buildUrl = (() => {
     if (p) {
       const params = new URLSearchParams();
       for (const [k, v] of Object.entries(p)) {
-        if (v != null) {
-          params.append(k, String(v));
-        }
+        if (v != null) params.append(k, String(v));
       }
       const qs = params.toString();
       if (qs) url += `?${qs}`;
     }
 
-    // LRU-style cache management
-    if (cache.size >= maxCacheSize) {
+    if (cache.size >= MAX_CACHE) {
       const firstKey = cache.keys().next().value;
       if (firstKey) cache.delete(firstKey);
     }
     cache.set(cacheKey, url);
-
     return url;
   };
 })();
 
-// Optimize: Limit recursion depth and memoize common types
+/* --- Dev Utilities --- */
 const inferType = (v: unknown, d = 0): string => {
   if (d > 8) return 'unknown';
   if (v === null) return 'null';
@@ -295,12 +302,10 @@ const inferType = (v: unknown, d = 0): string => {
     return v.length ? `(${inferType(v[0], d + 1)})[]` : 'unknown[]';
   }
 
-  // Limit object property inspection
   const entries = Object.entries(v as Record<string, unknown>).slice(0, 10);
   if (entries.length === 0) return '{}';
 
   const props = entries.map(([k, val]) => `  ${k}: ${inferType(val, d + 1)}`).join(',\n');
-
   return `{\n${props}\n}`;
 };
 
@@ -310,8 +315,6 @@ const logTypes = (
   data: unknown,
   meta?: { time: number; att?: number },
 ): void => {
-  if (ENV.NODE_ENV !== 'development') return;
-
   const payload =
     typeof data === 'object' && data !== null && 'data' in data
       ? (data as { data: unknown }).data
@@ -323,15 +326,11 @@ const logTypes = (
   );
 };
 
-// Optimize: Exponential backoff calculation
-const calculateBackoff = (attempt: number): number => {
-  // Cap at 10 seconds to avoid excessive waits
-  return Math.min(10000, 100 * 2 ** (attempt - 1));
-};
+/* --- Helpers --- */
+const calculateBackoff = (attempt: number): number => Math.min(10000, 100 * 2 ** (attempt - 1));
 
-// Optimize: Extract error handling logic
 const createErrorResponse = (error: unknown, url: string, method: string): ApiResponse<never> => {
-  interface ErrorWithStatus {
+  interface ErrShape {
     status?: number;
     name?: string;
     msg?: string;
@@ -339,9 +338,7 @@ const createErrorResponse = (error: unknown, url: string, method: string): ApiRe
   }
 
   const err =
-    typeof error === 'object' && error !== null
-      ? (error as ErrorWithStatus)
-      : { message: String(error) };
+    typeof error === 'object' && error !== null ? (error as ErrShape) : { message: String(error) };
 
   const status = err.status || (err.name === 'AbortError' ? 408 : 0);
 
@@ -360,65 +357,62 @@ const createErrorResponse = (error: unknown, url: string, method: string): ApiRe
   };
 };
 
-// Optimize: Simplify response parsing
 const parseResponse = async (res: Response): Promise<unknown> => {
   const contentType = res.headers.get('content-type');
   return contentType?.includes('json') ? res.json() : res.text();
 };
 
-// Optimize: Extract error message parsing
 const extractErrorMessage = (data: unknown, statusText: string): string => {
   if (typeof data === 'string') return data;
-
   if (typeof data === 'object' && data !== null) {
     const obj = data as Record<string, unknown>;
     if (typeof obj.message === 'string') return obj.message;
     if (typeof obj.error === 'string') return obj.error;
   }
-
   return statusText;
 };
 
-// Optimize: Check if error is retryable
-const isRetryableError = (status: number, attempt: number, maxRetries: number): boolean => {
-  return attempt <= maxRetries && (status === 408 || status >= 500 || RETRY_CODES.has(status));
+const isRetryableError = (status: number, attempt: number, maxRetries: number): boolean =>
+  attempt <= maxRetries && (status === 408 || status >= 500 || RETRY_CODES.has(status));
+
+const buildDedupeKey = (method: HttpMethod, url: string, data?: RequestBody): string => {
+  if (!data) return `${method}:${url}`;
+
+  if (data instanceof FormData) return `${method}:${url}:formdata`;
+  if (data instanceof ArrayBuffer) return `${method}:${url}:arraybuffer`;
+  if (typeof Buffer !== 'undefined' && data instanceof Buffer) return `${method}:${url}:buffer`;
+  if (typeof data === 'string') return `${method}:${url}:${data.length}`;
+  if (Array.isArray(data)) return `${method}:${url}:array:${data.length}`;
+
+  // Plain object — use sorted top-level keys as a cheap structural fingerprint
+  const keys = Object.keys(data as Record<string, unknown>)
+    .sort()
+    .join(',');
+  return `${method}:${url}:${keys}`;
 };
 
+/* --- Core Request --- */
 export default async function apiRequest<T = unknown>(
   method: HttpMethod,
   endpoint: string,
   opts: RequestOptions<RequestBody, T> = {},
 ): Promise<ApiResponse<T>> {
-  // Validate method early
   if (!HTTP_METHODS.includes(method)) {
     return {
       success: false,
       status: 400,
-      error: {
-        name: 'ValidationError',
-        message: 'Invalid HTTP method',
-        status: 400,
-      },
+      error: { name: 'ValidationError', message: 'Invalid HTTP method', status: 400 },
       data: null,
     };
   }
 
-  const { retries = CFG.RETRIES, timeout = CFG.TIMEOUT, priority = 'normal', dedupeKey } = opts;
+  const { retries = CFG.RETRIES, timeout = CFG.TIMEOUT, priority = 'normal' } = opts;
 
-  let url = buildUrl(endpoint, opts.params);
+  // Callers control staleness via opts.cache / opts.next.
+  const url = buildUrl(endpoint, opts.params);
 
-  // Aggressive cache busting for GET requests
-  if (method === 'GET') {
-    const separator = url.includes('?') ? '&' : '?';
-    url = `${url}${separator}cb=${Date.now()}`;
-  }
-
-  // Optimize: More efficient dedupe key generation
   const key =
-    dedupeKey ??
-    (opts.data
-      ? `${method}:${url}:${JSON.stringify(opts.data).substring(0, 50)}`
-      : `${method}:${url}`);
+    opts.dedupeKey !== undefined ? opts.dedupeKey : buildDedupeKey(method, url, opts.data);
 
   const start = performance.now();
 
@@ -436,22 +430,16 @@ export default async function apiRequest<T = unknown>(
         const timeoutId = setTimeout(() => ctrl.abort(), timeoutDuration);
 
         try {
-          // Optimize: Build headers object once
           const headers: Record<string, string> = {
             Accept: 'application/json',
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            Pragma: 'no-cache',
-            Expires: '0',
-            ...(!opts.skipAuth ? getAuth() : {}),
+            ...(!opts.skipAuth ? getAuthHeaders() : {}),
             ...opts.headers,
           };
 
-          // Add Content-Type only if needed
           if (opts.data && !(opts.data instanceof FormData)) {
             headers['Content-Type'] = 'application/json';
           }
 
-          // Optimize: Prepare body once
           const body = opts.data
             ? opts.data instanceof FormData ||
               opts.data instanceof ArrayBuffer ||
@@ -465,8 +453,11 @@ export default async function apiRequest<T = unknown>(
             headers,
             body,
             signal: opts.signal || ctrl.signal,
-            next: opts.next,
-            cache: opts.cache,
+            // [F2] Let callers declare caching intent explicitly.
+            // Omitting cache/next passes undefined, which uses Next.js defaults
+            // (deduplication + static caching for GET in RSC, normal fetch elsewhere).
+            ...(opts.next !== undefined && { next: opts.next }),
+            ...(opts.cache !== undefined && { cache: opts.cache }),
           });
 
           clearTimeout(timeoutId);
@@ -474,26 +465,24 @@ export default async function apiRequest<T = unknown>(
           const data = await parseResponse(res);
 
           if (!res.ok) {
-            const message = extractErrorMessage(data, res.statusText);
-            throw { status: res.status, msg: message };
+            throw { status: res.status, msg: extractErrorMessage(data, res.statusText) };
           }
 
-          // Optimize: Only log in development
-          if (opts.logTypes) {
+          // [F5] Guard at call site — inferType never runs in production
+          if (opts.logTypes && ENV.NODE_ENV === 'development') {
             logTypes(endpoint, method, data, {
               time: Math.round(performance.now() - start),
               att: attempt > 1 ? attempt : undefined,
             });
           }
 
-          // Optimize: Efficient header extraction
           const responseHeaders: Record<string, string> = {};
           res.headers.forEach((v, k) => {
             responseHeaders[k] = v;
           });
 
           return {
-            success: true,
+            success: true as const,
             status: res.status,
             data: opts.transform ? opts.transform(data as T) : (data as T),
             headers: responseHeaders,
@@ -501,24 +490,21 @@ export default async function apiRequest<T = unknown>(
         } catch (e: unknown) {
           clearTimeout(timeoutId);
 
-          interface ErrorWithStatus {
+          interface ErrShape {
             status?: number;
             name?: string;
             message?: string;
           }
-
           const err = (
             typeof e === 'object' && e !== null ? e : { message: String(e) }
-          ) as ErrorWithStatus;
+          ) as ErrShape;
 
           const status = err.status || (err.name === 'AbortError' ? 408 : 0);
 
-          // Check if we should retry
           if (!isRetryableError(status, attempt, retries)) {
             return createErrorResponse(e, url, method);
           }
 
-          // Exponential backoff before retry
           await new Promise((r) => setTimeout(r, calculateBackoff(attempt)));
         }
       }
@@ -528,7 +514,7 @@ export default async function apiRequest<T = unknown>(
   );
 }
 
-// Helpers with type guards
+/* --- Type Guards & Utilities --- */
 apiRequest.isSuccess = <T>(r: ApiResponse<T>): r is Extract<ApiResponse<T>, { success: true }> =>
   r.success;
 
@@ -544,13 +530,9 @@ apiRequest.utils = {
   sanitizeHeaders: (h: Record<string, string>): Record<string, string> => {
     const sanitized = { ...h };
     const sensitiveHeaders = ['Authorization', 'X-API-Key', 'Cookie'];
-
     for (const key of sensitiveHeaders) {
-      if (sanitized[key]) {
-        sanitized[key] = '[REDACTED]';
-      }
+      if (sanitized[key]) sanitized[key] = '[REDACTED]';
     }
-
     return sanitized;
   },
 };
