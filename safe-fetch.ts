@@ -5,6 +5,8 @@
  * https://github.com/Bharathi4real/safe-fetch/
  */
 
+import { type ZodSchema } from 'zod';
+
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const;
 export type HttpMethod = (typeof HTTP_METHODS)[number];
 export type RequestBody =
@@ -17,6 +19,13 @@ export type RequestBody =
   | unknown[];
 export type QueryParams = Record<string, string | number | boolean | null | undefined>;
 
+interface ErrShape {
+  status?: number;
+  name?: string;
+  msg?: string;
+  message?: string;
+}
+
 export interface RequestOptions<TBody extends RequestBody = RequestBody, TResponse = unknown> {
   data?: TBody;
   params?: QueryParams;
@@ -24,6 +33,7 @@ export interface RequestOptions<TBody extends RequestBody = RequestBody, TRespon
   timeout?: number | ((attempt: number) => number);
   headers?: Record<string, string>;
   transform?(data: TResponse): TResponse;
+  schema?: ZodSchema<TResponse>;
   priority?: 'high' | 'normal' | 'low';
   signal?: AbortSignal;
   logTypes?: boolean;
@@ -55,6 +65,8 @@ interface GlobalEnv {
 }
 
 /* --- Environment --- */
+// getEnv() is called lazily at each use site so the cache
+// initialises on first actual request, not at import time.
 const getEnv = (() => {
   let cachedEnv: ReturnType<typeof createEnv> | null = null;
 
@@ -96,15 +108,13 @@ export const __resetEnvCache =
     ? () => (getEnv as { __resetCache?: () => void }).__resetCache?.()
     : undefined;
 
-const ENV = getEnv();
-
 const CFG = {
   RETRIES: 2,
   TIMEOUT: 60000,
   MAX_CONCURRENT: IS_BUN ? 20 : 10,
   RATE_MAX: 100,
   RATE_WINDOW: 60000,
-  AUTH_CACHE_TTL: 300000, // 5 minutes
+  AUTH_CACHE_TTL: 300000,
 } as const;
 
 /* --- Rate Limiter --- */
@@ -166,10 +176,12 @@ class Pool {
         try {
           resolve(await fn());
         } catch (e) {
+          // [F6] Ensure pending key is removed even when fn() rejects hard
+          if (key) this.pending.delete(key);
           reject(e);
         } finally {
           this.active--;
-          if (key) this.pending.delete(key);
+          if (key) this.pending.delete(key); // no-op if already deleted above
           this.processQueue();
         }
       };
@@ -191,7 +203,6 @@ class Pool {
     }
   }
 
-  // Binary-search insertion — O(log n) find, O(n) splice (acceptable for ≤100 items)
   private enqueue(fn: () => void, pri: 'high' | 'normal' | 'low'): void {
     const priVal = PRIORITY_VALUES[pri];
     let left = 0;
@@ -221,7 +232,7 @@ const { getAuthHeaders, invalidateAuthCache } = (() => {
   let dirty = false;
 
   const build = (): Record<string, string> => {
-    const { AUTH_USERNAME: u, AUTH_PASSWORD: p, API_TOKEN: t } = ENV;
+    const { AUTH_USERNAME: u, AUTH_PASSWORD: p, API_TOKEN: t } = getEnv();
     const headers: Record<string, string> = {};
 
     if (u && p) {
@@ -256,6 +267,8 @@ const { getAuthHeaders, invalidateAuthCache } = (() => {
 export { invalidateAuthCache };
 
 /* --- URL Builder --- */
+// LRU: on cache hit, delete + re-set moves entry to Map tail (MRU position).
+// Eviction always removes the Map head (LRU position) via .keys().next().
 const buildUrl = (() => {
   const cache = new Map<string, string>();
   const MAX_CACHE = 100;
@@ -263,11 +276,18 @@ const buildUrl = (() => {
   return (ep: string, p?: QueryParams): string => {
     const cacheKey = p ? `${ep}:${JSON.stringify(p)}` : ep;
     const cached = cache.get(cacheKey);
-    if (cached) return cached;
+
+    if (cached) {
+      // Move to MRU position
+      cache.delete(cacheKey);
+      cache.set(cacheKey, cached);
+      return cached;
+    }
 
     let url = ep;
     if (!/^https?:\/\//i.test(ep)) {
-      const base = ENV.API_URL || (typeof window !== 'undefined' ? window.location.origin : '');
+      const base =
+        getEnv().API_URL || (typeof window !== 'undefined' ? window.location.origin : '');
       url = `${base.replace(/\/+$/, '')}/${ep.replace(/^\/+/, '')}`;
     }
 
@@ -281,8 +301,9 @@ const buildUrl = (() => {
     }
 
     if (cache.size >= MAX_CACHE) {
+      // Evict LRU (Map head)
       const firstKey = cache.keys().next().value;
-      if (firstKey) cache.delete(firstKey);
+      if (firstKey !== undefined) cache.delete(firstKey);
     }
     cache.set(cacheKey, url);
     return url;
@@ -291,7 +312,7 @@ const buildUrl = (() => {
 
 /* --- Dev Utilities --- */
 const inferType = (v: unknown, d = 0): string => {
-  if (d > 8) return 'unknown';
+  if (d >= 8) return 'unknown';
   if (v === null) return 'null';
   if (v === undefined) return 'undefined';
 
@@ -330,13 +351,6 @@ const logTypes = (
 const calculateBackoff = (attempt: number): number => Math.min(10000, 100 * 2 ** (attempt - 1));
 
 const createErrorResponse = (error: unknown, url: string, method: string): ApiResponse<never> => {
-  interface ErrShape {
-    status?: number;
-    name?: string;
-    msg?: string;
-    message?: string;
-  }
-
   const err =
     typeof error === 'object' && error !== null ? (error as ErrShape) : { message: String(error) };
 
@@ -358,8 +372,14 @@ const createErrorResponse = (error: unknown, url: string, method: string): ApiRe
 };
 
 const parseResponse = async (res: Response): Promise<unknown> => {
-  const contentType = res.headers.get('content-type');
-  return contentType?.includes('json') ? res.json() : res.text();
+  const contentType = res.headers.get('content-type') ?? '';
+  try {
+    return contentType.includes('json') ? await res.json() : await res.text();
+  } catch {
+    // Parse failure (e.g. malformed JSON in a 500 body) — return null and
+    // let the !res.ok branch below surface the real HTTP error.
+    return null;
+  }
 };
 
 const extractErrorMessage = (data: unknown, statusText: string): string => {
@@ -375,20 +395,22 @@ const extractErrorMessage = (data: unknown, statusText: string): string => {
 const isRetryableError = (status: number, attempt: number, maxRetries: number): boolean =>
   attempt <= maxRetries && (status === 408 || status >= 500 || RETRY_CODES.has(status));
 
+const buildObjectFingerprint = (obj: Record<string, unknown>): string =>
+  Object.entries(obj)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : String(v)}`)
+    .join('&');
+
 const buildDedupeKey = (method: HttpMethod, url: string, data?: RequestBody): string => {
   if (!data) return `${method}:${url}`;
 
   if (data instanceof FormData) return `${method}:${url}:formdata`;
   if (data instanceof ArrayBuffer) return `${method}:${url}:arraybuffer`;
   if (typeof Buffer !== 'undefined' && data instanceof Buffer) return `${method}:${url}:buffer`;
-  if (typeof data === 'string') return `${method}:${url}:${data.length}`;
-  if (Array.isArray(data)) return `${method}:${url}:array:${data.length}`;
+  if (typeof data === 'string') return `${method}:${url}:${data}`;
+  if (Array.isArray(data)) return `${method}:${url}:array:${JSON.stringify(data)}`;
 
-  // Plain object — use sorted top-level keys as a cheap structural fingerprint
-  const keys = Object.keys(data as Record<string, unknown>)
-    .sort()
-    .join(',');
-  return `${method}:${url}:${keys}`;
+  return `${method}:${url}:${buildObjectFingerprint(data as Record<string, unknown>)}`;
 };
 
 /* --- Core Request --- */
@@ -408,9 +430,7 @@ export default async function apiRequest<T = unknown>(
 
   const { retries = CFG.RETRIES, timeout = CFG.TIMEOUT, priority = 'normal' } = opts;
 
-  // Callers control staleness via opts.cache / opts.next.
   const url = buildUrl(endpoint, opts.params);
-
   const key =
     opts.dedupeKey !== undefined ? opts.dedupeKey : buildDedupeKey(method, url, opts.data);
 
@@ -428,6 +448,11 @@ export default async function apiRequest<T = unknown>(
         const ctrl = new AbortController();
         const timeoutDuration = typeof timeout === 'function' ? timeout(attempt) : timeout;
         const timeoutId = setTimeout(() => ctrl.abort(), timeoutDuration);
+
+        const composedSignal =
+          opts.signal
+            ? AbortSignal.any([opts.signal, ctrl.signal])
+            : ctrl.signal;
 
         try {
           const headers: Record<string, string> = {
@@ -452,10 +477,7 @@ export default async function apiRequest<T = unknown>(
             method,
             headers,
             body,
-            signal: opts.signal || ctrl.signal,
-            // [F2] Let callers declare caching intent explicitly.
-            // Omitting cache/next passes undefined, which uses Next.js defaults
-            // (deduplication + static caching for GET in RSC, normal fetch elsewhere).
+            signal: composedSignal,
             ...(opts.next !== undefined && { next: opts.next }),
             ...(opts.cache !== undefined && { cache: opts.cache }),
           });
@@ -468,8 +490,7 @@ export default async function apiRequest<T = unknown>(
             throw { status: res.status, msg: extractErrorMessage(data, res.statusText) };
           }
 
-          // [F5] Guard at call site — inferType never runs in production
-          if (opts.logTypes && ENV.NODE_ENV === 'development') {
+          if (opts.logTypes && getEnv().NODE_ENV === 'development') {
             logTypes(endpoint, method, data, {
               time: Math.round(performance.now() - start),
               att: attempt > 1 ? attempt : undefined,
@@ -481,20 +502,42 @@ export default async function apiRequest<T = unknown>(
             responseHeaders[k] = v;
           });
 
+          const transformed = opts.transform ? opts.transform(data as T) : (data as T);
+
+          if (opts.schema) {
+            const parsed = opts.schema.safeParse(transformed);
+            if (!parsed.success) {
+              return {
+                success: false as const,
+                status: res.status,
+                error: {
+                  name: 'ValidationError',
+                  message: parsed.error.message,
+                  status: res.status,
+                  retryable: false,
+                  url,
+                  method,
+                },
+                data: null,
+              };
+            }
+            return {
+              success: true as const,
+              status: res.status,
+              data: parsed.data,
+              headers: responseHeaders,
+            };
+          }
+
           return {
             success: true as const,
             status: res.status,
-            data: opts.transform ? opts.transform(data as T) : (data as T),
+            data: transformed,
             headers: responseHeaders,
           };
         } catch (e: unknown) {
           clearTimeout(timeoutId);
-
-          interface ErrShape {
-            status?: number;
-            name?: string;
-            message?: string;
-          }
+          
           const err = (
             typeof e === 'object' && e !== null ? e : { message: String(e) }
           ) as ErrShape;
@@ -514,7 +557,7 @@ export default async function apiRequest<T = unknown>(
   );
 }
 
-/* --- Type Guards & Utilities --- */
+/* --- Type Guards --- */
 apiRequest.isSuccess = <T>(r: ApiResponse<T>): r is Extract<ApiResponse<T>, { success: true }> =>
   r.success;
 
@@ -536,3 +579,24 @@ apiRequest.utils = {
     return sanitized;
   },
 };
+
+export const api = {
+  get<T>(endpoint: string, opts?: Omit<RequestOptions<never, T>, 'data'>): Promise<ApiResponse<T>> {
+    return apiRequest<T>('GET', endpoint, opts as RequestOptions<RequestBody, T>);
+  },
+  post<T>(endpoint: string, opts?: RequestOptions<RequestBody, T>): Promise<ApiResponse<T>> {
+    return apiRequest<T>('POST', endpoint, opts);
+  },
+  put<T>(endpoint: string, opts?: RequestOptions<RequestBody, T>): Promise<ApiResponse<T>> {
+    return apiRequest<T>('PUT', endpoint, opts);
+  },
+  patch<T>(endpoint: string, opts?: RequestOptions<RequestBody, T>): Promise<ApiResponse<T>> {
+    return apiRequest<T>('PATCH', endpoint, opts);
+  },
+  delete<T>(
+    endpoint: string,
+    opts?: Omit<RequestOptions<never, T>, 'data'>,
+  ): Promise<ApiResponse<T>> {
+    return apiRequest<T>('DELETE', endpoint, opts as RequestOptions<RequestBody, T>);
+  },
+} as const;
