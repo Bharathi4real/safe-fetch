@@ -5,6 +5,7 @@
  * https://github.com/Bharathi4real/safe-fetch/
  */
 
+import { createHash } from 'crypto';
 import { type ZodSchema } from 'zod';
 
 /* ─── Public Types ─────────────────────────────────────────────────────────── */
@@ -58,9 +59,9 @@ type BodylessOptions<T> = Omit<RequestOptions<never, T>, 'data'>;
 /* ─── Constants ─────────────────────────────────────────────────────────────── */
 
 const IS_BUN = typeof globalThis !== 'undefined' && 'Bun' in globalThis;
-const IS_DEV =
-  typeof process !== 'undefined' &&
-  !(['production', 'test'] as unknown[]).includes(process.env.NODE_ENV);
+
+const IS_DEV = process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test';
+
 const RETRY_CODES = new Set([408, 429, 500, 502, 503, 504]);
 const PRIORITY_VALUES = { high: 3, normal: 2, low: 1 } as const;
 
@@ -77,9 +78,10 @@ const composeSignals = (a: AbortSignal, b: AbortSignal): AbortSignal => {
   if (typeof AbortSignal.any === 'function') return AbortSignal.any([a, b]);
   const ctrl = new AbortController();
   if (a.aborted || b.aborted) { ctrl.abort(); return ctrl.signal; }
-  const abort = () => ctrl.abort();
-  a.addEventListener('abort', abort, { once: true });
-  b.addEventListener('abort', abort, { once: true });
+  const abortA = () => { b.removeEventListener('abort', abortB); ctrl.abort(); };
+  const abortB = () => { a.removeEventListener('abort', abortA); ctrl.abort(); };
+  a.addEventListener('abort', abortA, { once: true });
+  b.addEventListener('abort', abortB, { once: true });
   return ctrl.signal;
 };
 
@@ -178,7 +180,10 @@ const getEnv = (() => {
   let cached: ReturnType<typeof build> | null = null;
 
   function build() {
-    const e = process.env || (globalThis as unknown as GlobalEnv).__ENV__ || {};
+    const e: Record<string, string | undefined> =
+      (typeof process !== 'undefined' ? process.env : null) ||
+      (globalThis as unknown as GlobalEnv).__ENV__ ||
+      {};
     return {
       API_URL: e.API_URL || e.NEXT_PUBLIC_API_URL || '',
       AUTH_USERNAME: e.AUTH_USERNAME || e.API_USERNAME || '',
@@ -208,7 +213,6 @@ export const __resetEnvCache = IS_DEV
 
 /* ─── Auth Header Cache ─────────────────────────────────────────────────────── */
 
-// NOTE: invalidateAuthCache zeros lastUpdate so next call always rebuilds — no dirty flag needed.
 const buildAuthCache = (cacheTtl: number) => {
   let cache: Record<string, string> | null = null;
   let lastUpdate = 0;
@@ -240,7 +244,14 @@ const buildAuthCache = (cacheTtl: number) => {
 const buildUrlFactory = (maxCache = 100) => {
   const cache = new Map<string, string>();
 
-  return (ep: string, base: string, p?: QueryParams): string => {
+  return (ep: string, base: string, p?: QueryParams, allowedHosts?: string[]): string => {
+    if (!base && typeof window === 'undefined') {
+      throw new Error(
+        '[SafeFetch] baseUrl is required in server contexts. ' +
+          'Set API_URL / NEXT_PUBLIC_API_URL or pass baseUrl to createSafeFetch().',
+      );
+    }
+
     const cacheKey = p ? `${ep}:${JSON.stringify(p)}` : ep;
     const cached = cache.get(cacheKey);
     if (cached) { cache.delete(cacheKey); cache.set(cacheKey, cached); return cached; }
@@ -248,6 +259,19 @@ const buildUrlFactory = (maxCache = 100) => {
     let url = /^https?:\/\//i.test(ep)
       ? ep
       : `${(base || (typeof window !== 'undefined' ? window.location.origin : '')).replace(/\/+$/, '')}/${ep.replace(/^\/+/, '')}`;
+
+    // SSRF guard
+    if (allowedHosts?.length) {
+      try {
+        const { hostname } = new URL(url);
+        if (!allowedHosts.includes(hostname)) {
+          throw new Error(`[SafeFetch] Blocked request to disallowed host: ${hostname}`);
+        }
+      } catch (err) {
+        if ((err as Error).message.startsWith('[SafeFetch]')) throw err;
+        throw new Error(`[SafeFetch] Could not parse URL for SSRF check: ${url}`);
+      }
+    }
 
     if (p) {
       const params = new URLSearchParams();
@@ -278,18 +302,23 @@ const sortedStringify = (v: unknown): string => {
 const buildDedupeKey = (method: HttpMethod, url: string, data?: RequestBody): string => {
   if (!data) return `${method}:${url}`;
   if (data instanceof FormData) return `${method}:${url}:formdata`;
-  // Merge ArrayBuffer and Buffer into a single branch
   if (data instanceof ArrayBuffer || (typeof Buffer !== 'undefined' && data instanceof Buffer))
     return `${method}:${url}:binary`;
-  if (typeof data === 'string') return `${method}:${url}:${data}`;
-  if (Array.isArray(data)) return `${method}:${url}:array:${sortedStringify(data)}`;
-  return `${method}:${url}:${sortedStringify(data)}`;
+
+  const raw = typeof data === 'string' ? data : sortedStringify(data);
+  const hash = createHash('sha256').update(raw).digest('hex').slice(0, 16);
+  return `${method}:${url}:${hash}`;
 };
 
 const calculateBackoff = (attempt: number): number =>
   Math.random() * Math.min(10_000, 100 * 2 ** (attempt - 1));
 
-interface NormalizedError { status: number; name: string; message: string }
+interface NormalizedError {
+  status: number;
+  name: string;
+  message: string;
+  retryAfter?: string;
+}
 
 const normalizeError = (e: unknown): NormalizedError => {
   if (e instanceof DOMException && e.name === 'AbortError')
@@ -303,6 +332,7 @@ const normalizeError = (e: unknown): NormalizedError => {
         typeof o.msg === 'string' ? o.msg
         : typeof o.message === 'string' ? o.message
         : 'Unknown error',
+      retryAfter: typeof o.retryAfter === 'string' ? o.retryAfter : undefined,
     };
   }
   return { status: 0, name: 'Error', message: String(e) };
@@ -341,7 +371,16 @@ const extractErrorMessage = (data: unknown, statusText: string): string => {
 };
 
 const isRetryableError = (status: number, attempt: number, maxRetries: number): boolean =>
-  attempt <= maxRetries && (status === 408 || status >= 500 || RETRY_CODES.has(status));
+  attempt <= maxRetries && RETRY_CODES.has(status);
+
+const parseRetryAfter = (retryAfter: string | undefined): number | null => {
+  if (!retryAfter) return null;
+  const seconds = Number(retryAfter);
+  if (!isNaN(seconds)) return seconds * 1_000;
+  const date = new Date(retryAfter).getTime();
+  if (!isNaN(date)) return Math.max(0, date - Date.now());
+  return null;
+};
 
 /* ─── Dev Logger ─────────────────────────────────────────────────────────────── */
 
@@ -382,6 +421,7 @@ export interface SafeFetchConfig {
   rateMax?: number;
   rateWindow?: number;
   authCacheTtl?: number;
+  allowedHosts?: string[];
   /** Override the default env-based auth header builder. */
   getAuthHeaders?: () => Record<string, string>;
 }
@@ -394,6 +434,7 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
     rateMax: instanceConfig.rateMax ?? DEFAULT_CFG.RATE_MAX,
     rateWindow: instanceConfig.rateWindow ?? DEFAULT_CFG.RATE_WINDOW,
     authCacheTtl: instanceConfig.authCacheTtl ?? DEFAULT_CFG.AUTH_CACHE_TTL,
+    allowedHosts: instanceConfig.allowedHosts,
   };
 
   const pool = new Pool(cfg.maxConcurrent);
@@ -416,9 +457,17 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
       };
     }
 
-    const { retries = cfg.retries, timeout = cfg.timeout, priority = 'normal' } = opts;
+    const { retries = cfg.retries, priority = 'normal' } = opts;
+    const timeout = opts.timeout ?? cfg.timeout;
+
+    const resolveTimeout = (attempt: number): number => {
+      const ms = typeof timeout === 'function' ? timeout(attempt) : timeout;
+      if (ms <= 0) throw new RangeError(`[SafeFetch] timeout must be > 0, got ${ms}`);
+      return ms;
+    };
+
     const baseUrl = instanceConfig.baseUrl ?? getEnv()?.API_URL ?? '';
-    const url = buildUrl(endpoint, baseUrl, opts.params);
+    const url = buildUrl(endpoint, baseUrl, opts.params, cfg.allowedHosts);
     const key =
       opts.dedupeKey !== undefined ? opts.dedupeKey : buildDedupeKey(method, url, opts.data);
     const start = performance.now();
@@ -433,7 +482,7 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
           await limiter.check(cfg.rateMax, cfg.rateWindow);
 
           const ctrl = new AbortController();
-          const timeoutDuration = typeof timeout === 'function' ? timeout(attempt) : timeout;
+          const timeoutDuration = resolveTimeout(attempt);
           const timeoutId = setTimeout(() => ctrl.abort(), timeoutDuration);
           const composedSignal = opts.signal
             ? composeSignals(opts.signal, ctrl.signal)
@@ -441,16 +490,15 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
 
           try {
             const requestId =
-              opts.headers?.['X-Request-Id'] ??
-              (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+              typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
                 ? crypto.randomUUID()
-                : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+                : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
             const headers: Record<string, string> = {
               Accept: 'application/json',
+              ...opts.headers,
               'X-Request-Id': requestId,
               ...(!opts.skipAuth ? resolveAuthHeaders() : {}),
-              ...opts.headers,
             };
 
             if (opts.data && !(opts.data instanceof FormData)) {
@@ -476,6 +524,13 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
 
             clearTimeout(timeoutId);
 
+            // FIX #15 (auth cache) — automatically invalidate the auth cache on
+            // 401 so the next retry picks up fresh credentials rather than
+            // replaying a stale token for the full cacheTtl window.
+            if (res.status === 401) {
+              authCache.invalidateAuthCache();
+            }
+
             const parsed = await parseResponse(res);
             const rawData: unknown = parsed.ok ? parsed.data : null;
 
@@ -483,14 +538,25 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
               const message = parsed.ok
                 ? extractErrorMessage(rawData, res.statusText)
                 : res.statusText;
-              throw { status: res.status, msg: message };
+
+              const retryAfter = res.headers.get('Retry-After') ?? undefined;
+              throw { status: res.status, msg: message, retryAfter };
             }
 
-            if (!parsed.ok && IS_DEV) {
-              console.warn(
-                `[SafeFetch] ${method} ${endpoint} — body parse failed (${parsed.reason}). ` +
-                  `Response data will be null.`,
-              );
+            if (!parsed.ok) {
+              return {
+                success: false as const,
+                status: res.status,
+                error: {
+                  name: 'ParseError',
+                  message: `Response body could not be parsed (${parsed.reason})`,
+                  status: res.status,
+                  retryable: false,
+                  url,
+                  method,
+                },
+                data: null,
+              };
             }
 
             if (opts.logTypes && IS_DEV) {
@@ -503,7 +569,26 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
             const responseHeaders: Record<string, string> = {};
             res.headers.forEach((v, k) => { responseHeaders[k] = v; });
 
-            const transformed = opts.transform ? opts.transform(rawData as T) : (rawData as T);
+            let transformed: T;
+            try {
+              transformed = opts.transform ? opts.transform(rawData as T) : (rawData as T);
+            } catch (transformErr) {
+              return {
+                success: false as const,
+                status: res.status,
+                error: {
+                  name: 'TransformError',
+                  message: transformErr instanceof Error
+                    ? transformErr.message
+                    : 'transform() threw an unexpected error',
+                  status: res.status,
+                  retryable: false,
+                  url,
+                  method,
+                },
+                data: null,
+              };
+            }
 
             if (opts.schema) {
               const result = opts.schema.safeParse(transformed);
@@ -540,10 +625,13 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
             };
           } catch (e: unknown) {
             clearTimeout(timeoutId);
-            const { status } = normalizeError(e);
-            if (!isRetryableError(status, attempt, retries))
+            const normalized = normalizeError(e);
+            if (!isRetryableError(normalized.status, attempt, retries))
               return createErrorResponse(e, url, method, false);
-            await new Promise<void>((r) => setTimeout(r, calculateBackoff(attempt)));
+
+            const retryAfterMs = parseRetryAfter(normalized.retryAfter);
+            const backoff = retryAfterMs !== null ? retryAfterMs : calculateBackoff(attempt);
+            await new Promise<void>((r) => setTimeout(r, backoff));
           }
         }
       },
