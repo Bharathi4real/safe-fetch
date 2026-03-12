@@ -55,19 +55,14 @@ export type ApiResponse<T = unknown> =
 
 type BodylessOptions<T> = Omit<RequestOptions<never, T>, 'data'>;
 
-/* ─── Runtime Detection ─────────────────────────────────────────────────────── */
+/* ─── Constants ─────────────────────────────────────────────────────────────── */
 
 const IS_BUN = typeof globalThis !== 'undefined' && 'Bun' in globalThis;
-
 const IS_DEV =
   typeof process !== 'undefined' &&
-  process.env.NODE_ENV !== 'production' &&
-  process.env.NODE_ENV !== 'test';
-
+  !(['production', 'test'] as unknown[]).includes(process.env.NODE_ENV);
 const RETRY_CODES = new Set([408, 429, 500, 502, 503, 504]);
 const PRIORITY_VALUES = { high: 3, normal: 2, low: 1 } as const;
-
-/* ─── Default Config ─────────────────────────────────────────────────────────── */
 
 const DEFAULT_CFG = {
   RETRIES: 2,
@@ -80,15 +75,15 @@ const DEFAULT_CFG = {
 
 const composeSignals = (a: AbortSignal, b: AbortSignal): AbortSignal => {
   if (typeof AbortSignal.any === 'function') return AbortSignal.any([a, b]);
-
   const ctrl = new AbortController();
+  if (a.aborted || b.aborted) { ctrl.abort(); return ctrl.signal; }
   const abort = () => ctrl.abort();
   a.addEventListener('abort', abort, { once: true });
   b.addEventListener('abort', abort, { once: true });
-  // If either is already aborted, fire immediately
-  if (a.aborted || b.aborted) ctrl.abort();
   return ctrl.signal;
 };
+
+/* ─── Rate Limiter ──────────────────────────────────────────────────────────── */
 
 class RateLimiter {
   private readonly timestamps: Float64Array;
@@ -103,22 +98,16 @@ class RateLimiter {
     while (true) {
       const now = Date.now();
       const cutoff = now - win;
-
-      // Evict expired timestamps from the ring-buffer head
       while (this.size > 0 && this.timestamps[this.head] < cutoff) {
         this.head = (this.head + 1) % this.capacity;
         this.size--;
       }
-
       if (this.size < max) break;
-
-      const waitTime = win - (now - this.timestamps[this.head]);
-      await new Promise<void>((r) => setTimeout(r, Math.max(0, waitTime)));
+      await new Promise<void>((r) =>
+        setTimeout(r, Math.max(0, win - (now - this.timestamps[this.head]))),
+      );
     }
-
-    // Record this request
-    const index = (this.head + this.size) % this.capacity;
-    this.timestamps[index] = Date.now();
+    this.timestamps[(this.head + this.size) % this.capacity] = Date.now();
     this.size++;
   }
 
@@ -126,6 +115,7 @@ class RateLimiter {
 }
 
 /* ─── Connection Pool ───────────────────────────────────────────────────────── */
+
 class Pool {
   private readonly queue: Array<{ fn: () => void; pri: number }> = [];
   private active = 0;
@@ -149,7 +139,6 @@ class Pool {
         try {
           resolve(await fn());
         } catch (e) {
-          if (key) this.pending.delete(key);
           reject(e);
         } finally {
           this.active--;
@@ -157,12 +146,7 @@ class Pool {
           this.processQueue();
         }
       };
-
-      if (this.active < this.max) {
-        run();
-      } else {
-        this.enqueue(run, pri);
-      }
+      this.active < this.max ? run() : this.enqueue(run, pri);
     });
 
     if (key) this.pending.set(key, task);
@@ -170,65 +154,51 @@ class Pool {
   }
 
   private processQueue(): void {
-    if (this.queue.length > 0 && this.active < this.max) {
-      this.queue.shift()?.fn();
-    }
+    if (this.queue.length > 0 && this.active < this.max) this.queue.shift()?.fn();
   }
 
   private enqueue(fn: () => void, pri: 'high' | 'normal' | 'low'): void {
     const priVal = PRIORITY_VALUES[pri];
-    let left = 0;
-    let right = this.queue.length;
-
-    while (left < right) {
-      const mid = (left + right) >>> 1;
-      if (this.queue[mid].pri >= priVal) left = mid + 1;
-      else right = mid;
+    let l = 0, r = this.queue.length;
+    while (l < r) {
+      const m = (l + r) >>> 1;
+      this.queue[m].pri >= priVal ? (l = m + 1) : (r = m);
     }
-
-    this.queue.splice(left, 0, { fn, pri: priVal });
+    this.queue.splice(l, 0, { fn, pri: priVal });
   }
 
   stats = () => ({ active: this.active, queued: this.queue.length });
 }
 
 /* ─── Environment ───────────────────────────────────────────────────────────── */
-interface GlobalEnv {
-  __ENV__?: Record<string, string>;
-}
+
+interface GlobalEnv { __ENV__?: Record<string, string> }
 
 const getEnv = (() => {
-  let cachedEnv: ReturnType<typeof createEnv> | null = null;
+  let cached: ReturnType<typeof build> | null = null;
 
-  function createEnv() {
-    const env = process.env || (globalThis as unknown as GlobalEnv).__ENV__ || {};
+  function build() {
+    const e = process.env || (globalThis as unknown as GlobalEnv).__ENV__ || {};
     return {
-      API_URL: env.API_URL || env.NEXT_PUBLIC_API_URL || '',
-      AUTH_USERNAME: env.AUTH_USERNAME || env.API_USERNAME || '',
-      AUTH_PASSWORD: env.AUTH_PASSWORD || env.API_PASSWORD || '',
-      API_TOKEN: env.AUTH_TOKEN || env.API_TOKEN || '',
+      API_URL: e.API_URL || e.NEXT_PUBLIC_API_URL || '',
+      AUTH_USERNAME: e.AUTH_USERNAME || e.API_USERNAME || '',
+      AUTH_PASSWORD: e.AUTH_PASSWORD || e.API_PASSWORD || '',
+      API_TOKEN: e.AUTH_TOKEN || e.API_TOKEN || '',
     };
   }
 
   const get = () => {
-    if (!cachedEnv) {
-      cachedEnv = createEnv();
-      if (!cachedEnv.API_URL) {
+    if (!cached) {
+      cached = build();
+      if (!cached.API_URL)
         console.error('\x1b[31m%s\x1b[0m', '❌ [SafeFetch] Missing API_URL');
-      }
-      if (!cachedEnv.AUTH_USERNAME && !cachedEnv.API_TOKEN) {
+      if (!cached.AUTH_USERNAME && !cached.API_TOKEN)
         console.error('\x1b[31m%s\x1b[0m', '❌ [SafeFetch] Missing Auth Credentials');
-      }
     }
-    return cachedEnv;
+    return cached;
   };
 
-  if (IS_DEV) {
-    (get as { __resetCache?: () => void }).__resetCache = () => {
-      cachedEnv = null;
-    };
-  }
-
+  if (IS_DEV) (get as { __resetCache?: () => void }).__resetCache = () => { cached = null; };
   return get;
 })();
 
@@ -237,132 +207,102 @@ export const __resetEnvCache = IS_DEV
   : undefined;
 
 /* ─── Auth Header Cache ─────────────────────────────────────────────────────── */
+
+// NOTE: invalidateAuthCache zeros lastUpdate so next call always rebuilds — no dirty flag needed.
 const buildAuthCache = (cacheTtl: number) => {
   let cache: Record<string, string> | null = null;
   let lastUpdate = 0;
-  let dirty = false;
 
   const build = (): Record<string, string> => {
     const env = getEnv();
-    const headers: Record<string, string> = {};
-
     if (env?.AUTH_USERNAME && env.AUTH_PASSWORD) {
-      const credentials = `${env.AUTH_USERNAME}:${env.AUTH_PASSWORD}`;
+      const creds = `${env.AUTH_USERNAME}:${env.AUTH_PASSWORD}`;
       const encoded =
-        typeof btoa !== 'undefined'
-          ? btoa(credentials)
-          : Buffer.from(credentials).toString('base64');
-      headers.Authorization = `Basic ${encoded}`;
-    } else if (env?.API_TOKEN) {
-      headers.Authorization = `Bearer ${env.API_TOKEN}`;
+        typeof btoa !== 'undefined' ? btoa(creds) : Buffer.from(creds).toString('base64');
+      return { Authorization: `Basic ${encoded}` };
     }
-
-    return headers;
+    return env?.API_TOKEN ? { Authorization: `Bearer ${env.API_TOKEN}` } : {};
   };
 
   return {
     getAuthHeaders(): Record<string, string> {
       const now = Date.now();
-      if (cache && !dirty && now - lastUpdate < cacheTtl) return cache;
-      dirty = false;
+      if (cache && now - lastUpdate < cacheTtl) return cache;
       lastUpdate = now;
-      cache = build();
-      return cache;
+      return (cache = build());
     },
-    invalidateAuthCache(): void {
-      dirty = true;
-    },
+    invalidateAuthCache(): void { lastUpdate = 0; },
   };
 };
 
 /* ─── URL Builder (LRU cache) ───────────────────────────────────────────────── */
+
 const buildUrlFactory = (maxCache = 100) => {
   const cache = new Map<string, string>();
 
   return (ep: string, base: string, p?: QueryParams): string => {
     const cacheKey = p ? `${ep}:${JSON.stringify(p)}` : ep;
     const cached = cache.get(cacheKey);
+    if (cached) { cache.delete(cacheKey); cache.set(cacheKey, cached); return cached; }
 
-    if (cached) {
-      cache.delete(cacheKey);
-      cache.set(cacheKey, cached);
-      return cached;
-    }
-
-    let url = ep;
-    if (!/^https?:\/\//i.test(ep)) {
-      const resolvedBase =
-        base || (typeof window !== 'undefined' ? window.location.origin : '');
-      url = `${resolvedBase.replace(/\/+$/, '')}/${ep.replace(/^\/+/, '')}`;
-    }
+    let url = /^https?:\/\//i.test(ep)
+      ? ep
+      : `${(base || (typeof window !== 'undefined' ? window.location.origin : '')).replace(/\/+$/, '')}/${ep.replace(/^\/+/, '')}`;
 
     if (p) {
       const params = new URLSearchParams();
-      for (const [k, v] of Object.entries(p)) {
-        if (v != null) params.append(k, String(v));
-      }
+      for (const [k, v] of Object.entries(p)) if (v != null) params.append(k, String(v));
       const qs = params.toString();
       if (qs) url += `?${qs}`;
     }
 
     if (cache.size >= maxCache) {
-      const firstKey = cache.keys().next().value;
-      if (firstKey !== undefined) cache.delete(firstKey);
+      const first = cache.keys().next().value;
+      if (first !== undefined) cache.delete(first);
     }
-
     cache.set(cacheKey, url);
     return url;
   };
 };
 
+/* ─── Helpers ───────────────────────────────────────────────────────────────── */
+
 const sortedStringify = (v: unknown): string => {
   if (v === null || typeof v !== 'object') return JSON.stringify(v);
   if (Array.isArray(v)) return `[${v.map(sortedStringify).join(',')}]`;
-
-  const sorted = Object.keys(v as object)
-    .sort()
-    .map((k) => `${JSON.stringify(k)}:${sortedStringify((v as Record<string, unknown>)[k])}`);
-
-  return `{${sorted.join(',')}}`;
+  return `{${Object.keys(v as object).sort().map((k) =>
+    `${JSON.stringify(k)}:${sortedStringify((v as Record<string, unknown>)[k])}`
+  ).join(',')}}`;
 };
 
 const buildDedupeKey = (method: HttpMethod, url: string, data?: RequestBody): string => {
   if (!data) return `${method}:${url}`;
   if (data instanceof FormData) return `${method}:${url}:formdata`;
-  if (data instanceof ArrayBuffer) return `${method}:${url}:arraybuffer`;
-  if (typeof Buffer !== 'undefined' && data instanceof Buffer) return `${method}:${url}:buffer`;
+  // Merge ArrayBuffer and Buffer into a single branch
+  if (data instanceof ArrayBuffer || (typeof Buffer !== 'undefined' && data instanceof Buffer))
+    return `${method}:${url}:binary`;
   if (typeof data === 'string') return `${method}:${url}:${data}`;
   if (Array.isArray(data)) return `${method}:${url}:array:${sortedStringify(data)}`;
   return `${method}:${url}:${sortedStringify(data)}`;
 };
 
-const calculateBackoff = (attempt: number): number => {
-  const cap = 10_000;
-  const ceiling = Math.min(cap, 100 * 2 ** (attempt - 1));
-  return Math.random() * ceiling;
-};
+const calculateBackoff = (attempt: number): number =>
+  Math.random() * Math.min(10_000, 100 * 2 ** (attempt - 1));
 
-interface NormalizedError {
-  status: number;
-  name: string;
-  message: string;
-}
+interface NormalizedError { status: number; name: string; message: string }
 
 const normalizeError = (e: unknown): NormalizedError => {
-  if (e instanceof DOMException && e.name === 'AbortError') {
+  if (e instanceof DOMException && e.name === 'AbortError')
     return { status: 408, name: 'AbortError', message: 'Request aborted' };
-  }
   if (typeof e === 'object' && e !== null) {
-    const obj = e as Record<string, unknown>;
+    const o = e as Record<string, unknown>;
     return {
-      status: typeof obj.status === 'number' ? obj.status : 0,
-      name: typeof obj.name === 'string' ? obj.name : 'Error',
+      status: typeof o.status === 'number' ? o.status : 0,
+      name: typeof o.name === 'string' ? o.name : 'Error',
       message:
-        typeof obj.msg === 'string'
-          ? obj.msg
-          : typeof obj.message === 'string'
-            ? obj.message
-            : 'Unknown error',
+        typeof o.msg === 'string' ? o.msg
+        : typeof o.message === 'string' ? o.message
+        : 'Unknown error',
     };
   }
   return { status: 0, name: 'Error', message: String(e) };
@@ -375,47 +315,27 @@ const createErrorResponse = (
   retryable = false,
 ): ApiResponse<never> => {
   const { status, name, message } = normalizeError(e);
-  return {
-    success: false,
-    status,
-    error: { name, message, status, retryable, url, method },
-    data: null,
-  };
+  return { success: false, status, error: { name, message, status, retryable, url, method }, data: null };
 };
 
-type ParseResult =
-  | { ok: true; data: unknown }
-  | { ok: false; reason: 'parse_error' | 'empty' };
+type ParseResult = { ok: true; data: unknown } | { ok: false; reason: 'parse_error' | 'empty' };
 
 const parseResponse = async (res: Response): Promise<ParseResult> => {
-  const contentType = res.headers.get('content-type') ?? '';
   let text: string;
-
-  try {
-    text = await res.text();
-  } catch {
-    return { ok: false, reason: 'parse_error' };
-  }
-
+  try { text = await res.text(); } catch { return { ok: false, reason: 'parse_error' }; }
   if (!text.trim()) return { ok: false, reason: 'empty' };
-
-  if (contentType.includes('json')) {
-    try {
-      return { ok: true, data: JSON.parse(text) };
-    } catch {
-      return { ok: false, reason: 'parse_error' };
-    }
+  if ((res.headers.get('content-type') ?? '').includes('json')) {
+    try { return { ok: true, data: JSON.parse(text) }; } catch { return { ok: false, reason: 'parse_error' }; }
   }
-
   return { ok: true, data: text };
 };
 
 const extractErrorMessage = (data: unknown, statusText: string): string => {
   if (typeof data === 'string') return data;
   if (typeof data === 'object' && data !== null) {
-    const obj = data as Record<string, unknown>;
-    if (typeof obj.message === 'string') return obj.message;
-    if (typeof obj.error === 'string') return obj.error;
+    const o = data as Record<string, unknown>;
+    if (typeof o.message === 'string') return o.message;
+    if (typeof o.error === 'string') return o.error;
   }
   return statusText;
 };
@@ -423,18 +343,17 @@ const extractErrorMessage = (data: unknown, statusText: string): string => {
 const isRetryableError = (status: number, attempt: number, maxRetries: number): boolean =>
   attempt <= maxRetries && (status === 408 || status >= 500 || RETRY_CODES.has(status));
 
-/* ─── Dev Utilities ──────────────────────────────────────────────────────────── */
+/* ─── Dev Logger ─────────────────────────────────────────────────────────────── */
+
 const inferType = (v: unknown, d = 0): string => {
   if (d >= 8) return 'unknown';
   if (v === null) return 'null';
   if (v === undefined) return 'undefined';
-  const type = typeof v;
-  if (type !== 'object') return type;
+  if (typeof v !== 'object') return typeof v;
   if (Array.isArray(v)) return v.length ? `(${inferType(v[0], d + 1)})[]` : 'unknown[]';
   const entries = Object.entries(v as Record<string, unknown>).slice(0, 10);
-  if (entries.length === 0) return '{}';
-  const props = entries.map(([k, val]) => `  ${k}: ${inferType(val, d + 1)}`).join(',\n');
-  return `{\n${props}\n}`;
+  if (!entries.length) return '{}';
+  return `{\n${entries.map(([k, val]) => `  ${k}: ${inferType(val, d + 1)}`).join(',\n')}\n}`;
 };
 
 const logTypes = (
@@ -447,11 +366,12 @@ const logTypes = (
     typeof data === 'object' && data !== null && 'data' in data
       ? (data as { data: unknown }).data
       : data;
-  const attemptInfo = meta?.att ? ` [attempt ${meta.att}]` : '';
   console.log(
-    `🔍 [SafeFetch] ${method} ${ep} (${meta?.time}ms)${attemptInfo}\nType: ${inferType(payload)}`,
+    `🔍 [SafeFetch] ${method} ${ep} (${meta?.time}ms)${meta?.att ? ` [attempt ${meta.att}]` : ''}\nType: ${inferType(payload)}`,
   );
 };
+
+/* ─── Factory ───────────────────────────────────────────────────────────────── */
 
 export interface SafeFetchConfig {
   /** Base URL. Defaults to API_URL / NEXT_PUBLIC_API_URL env var. */
@@ -480,10 +400,8 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
   const limiter = new RateLimiter(cfg.rateMax);
   const buildUrl = buildUrlFactory();
   const authCache = buildAuthCache(cfg.authCacheTtl);
-
   const resolveAuthHeaders = instanceConfig.getAuthHeaders ?? authCache.getAuthHeaders;
 
-  /* ── Core Request ────────────────────────────────────────────────────────── */
   async function apiRequest<T = unknown>(
     method: HttpMethod,
     endpoint: string,
@@ -498,17 +416,11 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
       };
     }
 
-    const {
-      retries = cfg.retries,
-      timeout = cfg.timeout,
-      priority = 'normal',
-    } = opts;
-
+    const { retries = cfg.retries, timeout = cfg.timeout, priority = 'normal' } = opts;
     const baseUrl = instanceConfig.baseUrl ?? getEnv()?.API_URL ?? '';
     const url = buildUrl(endpoint, baseUrl, opts.params);
     const key =
       opts.dedupeKey !== undefined ? opts.dedupeKey : buildDedupeKey(method, url, opts.data);
-
     const start = performance.now();
 
     return pool.exec(
@@ -523,7 +435,6 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
           const ctrl = new AbortController();
           const timeoutDuration = typeof timeout === 'function' ? timeout(attempt) : timeout;
           const timeoutId = setTimeout(() => ctrl.abort(), timeoutDuration);
-
           const composedSignal = opts.signal
             ? composeSignals(opts.signal, ctrl.signal)
             : ctrl.signal;
@@ -566,7 +477,6 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
             clearTimeout(timeoutId);
 
             const parsed = await parseResponse(res);
-
             const rawData: unknown = parsed.ok ? parsed.data : null;
 
             if (!res.ok) {
@@ -591,9 +501,7 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
             }
 
             const responseHeaders: Record<string, string> = {};
-            res.headers.forEach((v, k) => {
-              responseHeaders[k] = v;
-            });
+            res.headers.forEach((v, k) => { responseHeaders[k] = v; });
 
             const transformed = opts.transform ? opts.transform(rawData as T) : (rawData as T);
 
@@ -632,13 +540,9 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
             };
           } catch (e: unknown) {
             clearTimeout(timeoutId);
-
             const { status } = normalizeError(e);
-
-            if (!isRetryableError(status, attempt, retries)) {
+            if (!isRetryableError(status, attempt, retries))
               return createErrorResponse(e, url, method, false);
-            }
-
             await new Promise<void>((r) => setTimeout(r, calculateBackoff(attempt)));
           }
         }
@@ -648,7 +552,6 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
     );
   }
 
-  /* ── Type Guards ─────────────────────────────────────────────────────────── */
   apiRequest.isSuccess = <T>(
     r: ApiResponse<T>,
   ): r is Extract<ApiResponse<T>, { success: true }> => r.success;
@@ -664,28 +567,26 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
       runtime: IS_BUN ? 'bun' : 'node',
     }),
     sanitizeHeaders: (h: Record<string, string>): Record<string, string> => {
-      const sanitized = { ...h };
-      for (const key of ['Authorization', 'X-API-Key', 'Cookie']) {
-        if (sanitized[key]) sanitized[key] = '[REDACTED]';
-      }
-      return sanitized;
+      const s = { ...h };
+      for (const k of ['Authorization', 'X-API-Key', 'Cookie']) if (s[k]) s[k] = '[REDACTED]';
+      return s;
     },
   };
 
   const api = {
-    get<T>(endpoint: string, opts?: BodylessOptions<T>): Promise<ApiResponse<T>> {
+    get<T>(endpoint: string, opts?: BodylessOptions<T>) {
       return apiRequest<T>('GET', endpoint, opts as RequestOptions<RequestBody, T>);
     },
-    post<T>(endpoint: string, opts?: RequestOptions<RequestBody, T>): Promise<ApiResponse<T>> {
+    post<T>(endpoint: string, opts?: RequestOptions<RequestBody, T>) {
       return apiRequest<T>('POST', endpoint, opts);
     },
-    put<T>(endpoint: string, opts?: RequestOptions<RequestBody, T>): Promise<ApiResponse<T>> {
+    put<T>(endpoint: string, opts?: RequestOptions<RequestBody, T>) {
       return apiRequest<T>('PUT', endpoint, opts);
     },
-    patch<T>(endpoint: string, opts?: RequestOptions<RequestBody, T>): Promise<ApiResponse<T>> {
+    patch<T>(endpoint: string, opts?: RequestOptions<RequestBody, T>) {
       return apiRequest<T>('PATCH', endpoint, opts);
     },
-    delete<T>(endpoint: string, opts?: BodylessOptions<T>): Promise<ApiResponse<T>> {
+    delete<T>(endpoint: string, opts?: BodylessOptions<T>) {
       return apiRequest<T>('DELETE', endpoint, opts as RequestOptions<RequestBody, T>);
     },
   } as const;
