@@ -5,12 +5,12 @@
  * https://github.com/Bharathi4real/safe-fetch/
  */
 
-import { createHash } from 'crypto';
-import { type ZodSchema } from 'zod';
+import { createHash } from "node:crypto";
+import type { ZodSchema } from "zod";
 
 /* ─── Public Types ─────────────────────────────────────────────────────────── */
 
-const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const;
+const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH"] as const;
 export type HttpMethod = (typeof HTTP_METHODS)[number];
 
 export type RequestBody =
@@ -22,9 +22,15 @@ export type RequestBody =
   | null
   | unknown[];
 
-export type QueryParams = Record<string, string | number | boolean | null | undefined>;
+export type QueryParams = Record<
+  string,
+  string | number | boolean | null | undefined
+>;
 
-export interface RequestOptions<TBody extends RequestBody = RequestBody, TResponse = unknown> {
+export interface RequestOptions<
+  TBody extends RequestBody = RequestBody,
+  TResponse = unknown,
+> {
   data?: TBody;
   params?: QueryParams;
   retries?: number;
@@ -32,7 +38,7 @@ export interface RequestOptions<TBody extends RequestBody = RequestBody, TRespon
   headers?: Record<string, string>;
   transform?(data: TResponse): TResponse;
   schema?: ZodSchema<TResponse>;
-  priority?: 'high' | 'normal' | 'low';
+  priority?: "high" | "normal" | "low";
   signal?: AbortSignal;
   logTypes?: boolean;
   cache?: RequestCache;
@@ -51,16 +57,23 @@ export interface ApiError {
 }
 
 export type ApiResponse<T = unknown> =
-  | { success: true; status: number; data: T; headers: Record<string, string>; requestId: string }
+  | {
+      success: true;
+      status: number;
+      data: T;
+      headers: Record<string, string>;
+      requestId: string;
+    }
   | { success: false; status: number; error: ApiError; data: null };
 
-type BodylessOptions<T> = Omit<RequestOptions<never, T>, 'data'>;
+type BodylessOptions<T> = Omit<RequestOptions<never, T>, "data">;
 
 /* ─── Constants ─────────────────────────────────────────────────────────────── */
 
-const IS_BUN = typeof globalThis !== 'undefined' && 'Bun' in globalThis;
+const IS_BUN = typeof globalThis !== "undefined" && "Bun" in globalThis;
 
-const IS_DEV = process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test';
+const IS_DEV =
+  process.env.NODE_ENV !== "production" && process.env.NODE_ENV !== "test";
 
 const RETRY_CODES = new Set([408, 429, 500, 502, 503, 504]);
 const PRIORITY_VALUES = { high: 3, normal: 2, low: 1 } as const;
@@ -75,13 +88,22 @@ const DEFAULT_CFG = {
 } as const;
 
 const composeSignals = (a: AbortSignal, b: AbortSignal): AbortSignal => {
-  if (typeof AbortSignal.any === 'function') return AbortSignal.any([a, b]);
+  if (typeof AbortSignal.any === "function") return AbortSignal.any([a, b]);
   const ctrl = new AbortController();
-  if (a.aborted || b.aborted) { ctrl.abort(); return ctrl.signal; }
-  const abortA = () => { b.removeEventListener('abort', abortB); ctrl.abort(); };
-  const abortB = () => { a.removeEventListener('abort', abortA); ctrl.abort(); };
-  a.addEventListener('abort', abortA, { once: true });
-  b.addEventListener('abort', abortB, { once: true });
+  if (a.aborted || b.aborted) {
+    ctrl.abort();
+    return ctrl.signal;
+  }
+  const abortA = () => {
+    b.removeEventListener("abort", abortB);
+    ctrl.abort();
+  };
+  const abortB = () => {
+    a.removeEventListener("abort", abortA);
+    ctrl.abort();
+  };
+  a.addEventListener("abort", abortA, { once: true });
+  b.addEventListener("abort", abortB, { once: true });
   return ctrl.signal;
 };
 
@@ -127,7 +149,7 @@ class Pool {
 
   async exec<T>(
     fn: () => Promise<T>,
-    pri: 'high' | 'normal' | 'low' = 'normal',
+    pri: "high" | "normal" | "low" = "normal",
     key?: string | null,
   ): Promise<T> {
     if (key) {
@@ -156,15 +178,21 @@ class Pool {
   }
 
   private processQueue(): void {
-    if (this.queue.length > 0 && this.active < this.max) this.queue.shift()?.fn();
+    if (this.queue.length > 0 && this.active < this.max)
+      this.queue.shift()?.fn();
   }
 
-  private enqueue(fn: () => void, pri: 'high' | 'normal' | 'low'): void {
+  private enqueue(fn: () => void, pri: "high" | "normal" | "low"): void {
     const priVal = PRIORITY_VALUES[pri];
-    let l = 0, r = this.queue.length;
+    let l = 0,
+      r = this.queue.length;
     while (l < r) {
       const m = (l + r) >>> 1;
-      this.queue[m].pri >= priVal ? (l = m + 1) : (r = m);
+      if (this.queue[m].pri >= priVal) {
+        l = m + 1;
+      } else {
+        r = m;
+      }
     }
     this.queue.splice(l, 0, { fn, pri: priVal });
   }
@@ -174,21 +202,23 @@ class Pool {
 
 /* ─── Environment ───────────────────────────────────────────────────────────── */
 
-interface GlobalEnv { __ENV__?: Record<string, string> }
+interface GlobalEnv {
+  __ENV__?: Record<string, string>;
+}
 
 const getEnv = (() => {
   let cached: ReturnType<typeof build> | null = null;
 
   function build() {
     const e: Record<string, string | undefined> =
-      (typeof process !== 'undefined' ? process.env : null) ||
+      (typeof process !== "undefined" ? process.env : null) ||
       (globalThis as unknown as GlobalEnv).__ENV__ ||
       {};
     return {
-      API_URL: e.API_URL || e.NEXT_PUBLIC_API_URL || '',
-      AUTH_USERNAME: e.AUTH_USERNAME || e.API_USERNAME || '',
-      AUTH_PASSWORD: e.AUTH_PASSWORD || e.API_PASSWORD || '',
-      API_TOKEN: e.AUTH_TOKEN || e.API_TOKEN || '',
+      API_URL: e.API_URL || e.NEXT_PUBLIC_API_URL || "",
+      AUTH_USERNAME: e.AUTH_USERNAME || e.API_USERNAME || "",
+      AUTH_PASSWORD: e.AUTH_PASSWORD || e.API_PASSWORD || "",
+      API_TOKEN: e.AUTH_TOKEN || e.API_TOKEN || "",
     };
   }
 
@@ -196,14 +226,20 @@ const getEnv = (() => {
     if (!cached) {
       cached = build();
       if (!cached.API_URL)
-        console.error('\x1b[31m%s\x1b[0m', '❌ [SafeFetch] Missing API_URL');
+        console.error("\x1b[31m%s\x1b[0m", "❌ [SafeFetch] Missing API_URL");
       if (!cached.AUTH_USERNAME && !cached.API_TOKEN)
-        console.error('\x1b[31m%s\x1b[0m', '❌ [SafeFetch] Missing Auth Credentials');
+        console.error(
+          "\x1b[31m%s\x1b[0m",
+          "❌ [SafeFetch] Missing Auth Credentials",
+        );
     }
     return cached;
   };
 
-  if (IS_DEV) (get as { __resetCache?: () => void }).__resetCache = () => { cached = null; };
+  if (IS_DEV)
+    (get as { __resetCache?: () => void }).__resetCache = () => {
+      cached = null;
+    };
   return get;
 })();
 
@@ -222,7 +258,9 @@ const buildAuthCache = (cacheTtl: number) => {
     if (env?.AUTH_USERNAME && env.AUTH_PASSWORD) {
       const creds = `${env.AUTH_USERNAME}:${env.AUTH_PASSWORD}`;
       const encoded =
-        typeof btoa !== 'undefined' ? btoa(creds) : Buffer.from(creds).toString('base64');
+        typeof btoa !== "undefined"
+          ? btoa(creds)
+          : Buffer.from(creds).toString("base64");
       return { Authorization: `Basic ${encoded}` };
     }
     return env?.API_TOKEN ? { Authorization: `Bearer ${env.API_TOKEN}` } : {};
@@ -233,9 +271,12 @@ const buildAuthCache = (cacheTtl: number) => {
       const now = Date.now();
       if (cache && now - lastUpdate < cacheTtl) return cache;
       lastUpdate = now;
-      return (cache = build());
+      cache = build();
+      return cache;
     },
-    invalidateAuthCache(): void { lastUpdate = 0; },
+    invalidateAuthCache(): void {
+      lastUpdate = 0;
+    },
   };
 };
 
@@ -244,38 +285,52 @@ const buildAuthCache = (cacheTtl: number) => {
 const buildUrlFactory = (maxCache = 100) => {
   const cache = new Map<string, string>();
 
-  return (ep: string, base: string, p?: QueryParams, allowedHosts?: string[]): string => {
-    if (!base && typeof window === 'undefined') {
+  return (
+    ep: string,
+    base: string,
+    p?: QueryParams,
+    allowedHosts?: string[],
+  ): string => {
+    if (!base && typeof window === "undefined") {
       throw new Error(
-        '[SafeFetch] baseUrl is required in server contexts. ' +
-          'Set API_URL / NEXT_PUBLIC_API_URL or pass baseUrl to createSafeFetch().',
+        "[SafeFetch] baseUrl is required in server contexts. " +
+          "Set API_URL / NEXT_PUBLIC_API_URL or pass baseUrl to createSafeFetch().",
       );
     }
 
     const cacheKey = p ? `${ep}:${JSON.stringify(p)}` : ep;
     const cached = cache.get(cacheKey);
-    if (cached) { cache.delete(cacheKey); cache.set(cacheKey, cached); return cached; }
+    if (cached) {
+      cache.delete(cacheKey);
+      cache.set(cacheKey, cached);
+      return cached;
+    }
 
     let url = /^https?:\/\//i.test(ep)
       ? ep
-      : `${(base || (typeof window !== 'undefined' ? window.location.origin : '')).replace(/\/+$/, '')}/${ep.replace(/^\/+/, '')}`;
+      : `${(base || (typeof window !== "undefined" ? window.location.origin : "")).replace(/\/+$/, "")}/${ep.replace(/^\/+/, "")}`;
 
     // SSRF guard
     if (allowedHosts?.length) {
       try {
         const { hostname } = new URL(url);
         if (!allowedHosts.includes(hostname)) {
-          throw new Error(`[SafeFetch] Blocked request to disallowed host: ${hostname}`);
+          throw new Error(
+            `[SafeFetch] Blocked request to disallowed host: ${hostname}`,
+          );
         }
       } catch (err) {
-        if ((err as Error).message.startsWith('[SafeFetch]')) throw err;
-        throw new Error(`[SafeFetch] Could not parse URL for SSRF check: ${url}`);
+        if ((err as Error).message.startsWith("[SafeFetch]")) throw err;
+        throw new Error(
+          `[SafeFetch] Could not parse URL for SSRF check: ${url}`,
+        );
       }
     }
 
     if (p) {
       const params = new URLSearchParams();
-      for (const [k, v] of Object.entries(p)) if (v != null) params.append(k, String(v));
+      for (const [k, v] of Object.entries(p))
+        if (v != null) params.append(k, String(v));
       const qs = params.toString();
       if (qs) url += `?${qs}`;
     }
@@ -292,21 +347,32 @@ const buildUrlFactory = (maxCache = 100) => {
 /* ─── Helpers ───────────────────────────────────────────────────────────────── */
 
 const sortedStringify = (v: unknown): string => {
-  if (v === null || typeof v !== 'object') return JSON.stringify(v);
-  if (Array.isArray(v)) return `[${v.map(sortedStringify).join(',')}]`;
-  return `{${Object.keys(v as object).sort().map((k) =>
-    `${JSON.stringify(k)}:${sortedStringify((v as Record<string, unknown>)[k])}`
-  ).join(',')}}`;
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(sortedStringify).join(",")}]`;
+  return `{${Object.keys(v as object)
+    .sort()
+    .map(
+      (k) =>
+        `${JSON.stringify(k)}:${sortedStringify((v as Record<string, unknown>)[k])}`,
+    )
+    .join(",")}}`;
 };
 
-const buildDedupeKey = (method: HttpMethod, url: string, data?: RequestBody): string => {
+const buildDedupeKey = (
+  method: HttpMethod,
+  url: string,
+  data?: RequestBody,
+): string => {
   if (!data) return `${method}:${url}`;
   if (data instanceof FormData) return `${method}:${url}:formdata`;
-  if (data instanceof ArrayBuffer || (typeof Buffer !== 'undefined' && data instanceof Buffer))
+  if (
+    data instanceof ArrayBuffer ||
+    (typeof Buffer !== "undefined" && data instanceof Buffer)
+  )
     return `${method}:${url}:binary`;
 
-  const raw = typeof data === 'string' ? data : sortedStringify(data);
-  const hash = createHash('sha256').update(raw).digest('hex').slice(0, 16);
+  const raw = typeof data === "string" ? data : sortedStringify(data);
+  const hash = createHash("sha256").update(raw).digest("hex").slice(0, 16);
   return `${method}:${url}:${hash}`;
 };
 
@@ -321,21 +387,23 @@ interface NormalizedError {
 }
 
 const normalizeError = (e: unknown): NormalizedError => {
-  if (e instanceof DOMException && e.name === 'AbortError')
-    return { status: 408, name: 'AbortError', message: 'Request aborted' };
-  if (typeof e === 'object' && e !== null) {
+  if (e instanceof DOMException && e.name === "AbortError")
+    return { status: 408, name: "AbortError", message: "Request aborted" };
+  if (typeof e === "object" && e !== null) {
     const o = e as Record<string, unknown>;
     return {
-      status: typeof o.status === 'number' ? o.status : 0,
-      name: typeof o.name === 'string' ? o.name : 'Error',
+      status: typeof o.status === "number" ? o.status : 0,
+      name: typeof o.name === "string" ? o.name : "Error",
       message:
-        typeof o.msg === 'string' ? o.msg
-        : typeof o.message === 'string' ? o.message
-        : 'Unknown error',
-      retryAfter: typeof o.retryAfter === 'string' ? o.retryAfter : undefined,
+        typeof o.msg === "string"
+          ? o.msg
+          : typeof o.message === "string"
+            ? o.message
+            : "Unknown error",
+      retryAfter: typeof o.retryAfter === "string" ? o.retryAfter : undefined,
     };
   }
-  return { status: 0, name: 'Error', message: String(e) };
+  return { status: 0, name: "Error", message: String(e) };
 };
 
 const createErrorResponse = (
@@ -345,54 +413,73 @@ const createErrorResponse = (
   retryable = false,
 ): ApiResponse<never> => {
   const { status, name, message } = normalizeError(e);
-  return { success: false, status, error: { name, message, status, retryable, url, method }, data: null };
+  return {
+    success: false,
+    status,
+    error: { name, message, status, retryable, url, method },
+    data: null,
+  };
 };
 
-type ParseResult = { ok: true; data: unknown } | { ok: false; reason: 'parse_error' | 'empty' };
+type ParseResult =
+  | { ok: true; data: unknown }
+  | { ok: false; reason: "parse_error" | "empty" };
 
 const parseResponse = async (res: Response): Promise<ParseResult> => {
   let text: string;
-  try { text = await res.text(); } catch { return { ok: false, reason: 'parse_error' }; }
-  if (!text.trim()) return { ok: false, reason: 'empty' };
-  if ((res.headers.get('content-type') ?? '').includes('json')) {
-    try { return { ok: true, data: JSON.parse(text) }; } catch { return { ok: false, reason: 'parse_error' }; }
+  try {
+    text = await res.text();
+  } catch {
+    return { ok: false, reason: "parse_error" };
+  }
+  if (!text.trim()) return { ok: false, reason: "empty" };
+  if ((res.headers.get("content-type") ?? "").includes("json")) {
+    try {
+      return { ok: true, data: JSON.parse(text) };
+    } catch {
+      return { ok: false, reason: "parse_error" };
+    }
   }
   return { ok: true, data: text };
 };
 
 const extractErrorMessage = (data: unknown, statusText: string): string => {
-  if (typeof data === 'string') return data;
-  if (typeof data === 'object' && data !== null) {
+  if (typeof data === "string") return data;
+  if (typeof data === "object" && data !== null) {
     const o = data as Record<string, unknown>;
-    if (typeof o.message === 'string') return o.message;
-    if (typeof o.error === 'string') return o.error;
+    if (typeof o.message === "string") return o.message;
+    if (typeof o.error === "string") return o.error;
   }
   return statusText;
 };
 
-const isRetryableError = (status: number, attempt: number, maxRetries: number): boolean =>
-  attempt <= maxRetries && RETRY_CODES.has(status);
+const isRetryableError = (
+  status: number,
+  attempt: number,
+  maxRetries: number,
+): boolean => attempt <= maxRetries && RETRY_CODES.has(status);
 
 const parseRetryAfter = (retryAfter: string | undefined): number | null => {
   if (!retryAfter) return null;
   const seconds = Number(retryAfter);
-  if (!isNaN(seconds)) return seconds * 1_000;
+  if (!Number.isNaN(seconds)) return seconds * 1_000;
   const date = new Date(retryAfter).getTime();
-  if (!isNaN(date)) return Math.max(0, date - Date.now());
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
   return null;
 };
 
 /* ─── Dev Logger ─────────────────────────────────────────────────────────────── */
 
 const inferType = (v: unknown, d = 0): string => {
-  if (d >= 8) return 'unknown';
-  if (v === null) return 'null';
-  if (v === undefined) return 'undefined';
-  if (typeof v !== 'object') return typeof v;
-  if (Array.isArray(v)) return v.length ? `(${inferType(v[0], d + 1)})[]` : 'unknown[]';
+  if (d >= 8) return "unknown";
+  if (v === null) return "null";
+  if (v === undefined) return "undefined";
+  if (typeof v !== "object") return typeof v;
+  if (Array.isArray(v))
+    return v.length ? `(${inferType(v[0], d + 1)})[]` : "unknown[]";
   const entries = Object.entries(v as Record<string, unknown>).slice(0, 10);
-  if (!entries.length) return '{}';
-  return `{\n${entries.map(([k, val]) => `  ${k}: ${inferType(val, d + 1)}`).join(',\n')}\n}`;
+  if (!entries.length) return "{}";
+  return `{\n${entries.map(([k, val]) => `  ${k}: ${inferType(val, d + 1)}`).join(",\n")}\n}`;
 };
 
 const logTypes = (
@@ -402,11 +489,11 @@ const logTypes = (
   meta?: { time: number; att?: number },
 ): void => {
   const payload =
-    typeof data === 'object' && data !== null && 'data' in data
+    typeof data === "object" && data !== null && "data" in data
       ? (data as { data: unknown }).data
       : data;
   console.log(
-    `🔍 [SafeFetch] ${method} ${ep} (${meta?.time}ms)${meta?.att ? ` [attempt ${meta.att}]` : ''}\nType: ${inferType(payload)}`,
+    `🔍 [SafeFetch] ${method} ${ep} (${meta?.time}ms)${meta?.att ? ` [attempt ${meta.att}]` : ""}\nType: ${inferType(payload)}`,
   );
 };
 
@@ -441,7 +528,8 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
   const limiter = new RateLimiter(cfg.rateMax);
   const buildUrl = buildUrlFactory();
   const authCache = buildAuthCache(cfg.authCacheTtl);
-  const resolveAuthHeaders = instanceConfig.getAuthHeaders ?? authCache.getAuthHeaders;
+  const resolveAuthHeaders =
+    instanceConfig.getAuthHeaders ?? authCache.getAuthHeaders;
 
   async function apiRequest<T = unknown>(
     method: HttpMethod,
@@ -452,24 +540,31 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
       return {
         success: false,
         status: 400,
-        error: { name: 'ValidationError', message: 'Invalid HTTP method', status: 400 },
+        error: {
+          name: "ValidationError",
+          message: "Invalid HTTP method",
+          status: 400,
+        },
         data: null,
       };
     }
 
-    const { retries = cfg.retries, priority = 'normal' } = opts;
+    const { retries = cfg.retries, priority = "normal" } = opts;
     const timeout = opts.timeout ?? cfg.timeout;
 
     const resolveTimeout = (attempt: number): number => {
-      const ms = typeof timeout === 'function' ? timeout(attempt) : timeout;
-      if (ms <= 0) throw new RangeError(`[SafeFetch] timeout must be > 0, got ${ms}`);
+      const ms = typeof timeout === "function" ? timeout(attempt) : timeout;
+      if (ms <= 0)
+        throw new RangeError(`[SafeFetch] timeout must be > 0, got ${ms}`);
       return ms;
     };
 
-    const baseUrl = instanceConfig.baseUrl ?? getEnv()?.API_URL ?? '';
+    const baseUrl = instanceConfig.baseUrl ?? getEnv()?.API_URL ?? "";
     const url = buildUrl(endpoint, baseUrl, opts.params, cfg.allowedHosts);
     const key =
-      opts.dedupeKey !== undefined ? opts.dedupeKey : buildDedupeKey(method, url, opts.data);
+      opts.dedupeKey !== undefined
+        ? opts.dedupeKey
+        : buildDedupeKey(method, url, opts.data);
     const start = performance.now();
 
     return pool.exec(
@@ -490,25 +585,26 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
 
           try {
             const requestId =
-              typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+              typeof crypto !== "undefined" &&
+              typeof crypto.randomUUID === "function"
                 ? crypto.randomUUID()
                 : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
             const headers: Record<string, string> = {
-              Accept: 'application/json',
+              Accept: "application/json",
               ...opts.headers,
-              'X-Request-Id': requestId,
+              "X-Request-Id": requestId,
               ...(!opts.skipAuth ? resolveAuthHeaders() : {}),
             };
 
             if (opts.data && !(opts.data instanceof FormData)) {
-              headers['Content-Type'] = 'application/json';
+              headers["Content-Type"] = "application/json";
             }
 
             const body = opts.data
               ? opts.data instanceof FormData ||
                 opts.data instanceof ArrayBuffer ||
-                (typeof Buffer !== 'undefined' && opts.data instanceof Buffer)
+                (typeof Buffer !== "undefined" && opts.data instanceof Buffer)
                 ? (opts.data as BodyInit)
                 : JSON.stringify(opts.data)
               : undefined;
@@ -539,7 +635,7 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
                 ? extractErrorMessage(rawData, res.statusText)
                 : res.statusText;
 
-              const retryAfter = res.headers.get('Retry-After') ?? undefined;
+              const retryAfter = res.headers.get("Retry-After") ?? undefined;
               throw { status: res.status, msg: message, retryAfter };
             }
 
@@ -548,7 +644,7 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
                 success: false as const,
                 status: res.status,
                 error: {
-                  name: 'ParseError',
+                  name: "ParseError",
                   message: `Response body could not be parsed (${parsed.reason})`,
                   status: res.status,
                   retryable: false,
@@ -567,20 +663,25 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
             }
 
             const responseHeaders: Record<string, string> = {};
-            res.headers.forEach((v, k) => { responseHeaders[k] = v; });
+            res.headers.forEach((v, k) => {
+              responseHeaders[k] = v;
+            });
 
             let transformed: T;
             try {
-              transformed = opts.transform ? opts.transform(rawData as T) : (rawData as T);
+              transformed = opts.transform
+                ? opts.transform(rawData as T)
+                : (rawData as T);
             } catch (transformErr) {
               return {
                 success: false as const,
                 status: res.status,
                 error: {
-                  name: 'TransformError',
-                  message: transformErr instanceof Error
-                    ? transformErr.message
-                    : 'transform() threw an unexpected error',
+                  name: "TransformError",
+                  message:
+                    transformErr instanceof Error
+                      ? transformErr.message
+                      : "transform() threw an unexpected error",
                   status: res.status,
                   retryable: false,
                   url,
@@ -597,7 +698,7 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
                   success: false as const,
                   status: res.status,
                   error: {
-                    name: 'ValidationError',
+                    name: "ValidationError",
                     message: result.error.message,
                     status: res.status,
                     retryable: false,
@@ -630,7 +731,8 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
               return createErrorResponse(e, url, method, false);
 
             const retryAfterMs = parseRetryAfter(normalized.retryAfter);
-            const backoff = retryAfterMs !== null ? retryAfterMs : calculateBackoff(attempt);
+            const backoff =
+              retryAfterMs !== null ? retryAfterMs : calculateBackoff(attempt);
             await new Promise<void>((r) => setTimeout(r, backoff));
           }
         }
@@ -652,34 +754,47 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
     getStats: () => ({
       pool: pool.stats(),
       rateLimit: limiter.stats(),
-      runtime: IS_BUN ? 'bun' : 'node',
+      runtime: IS_BUN ? "bun" : "node",
     }),
     sanitizeHeaders: (h: Record<string, string>): Record<string, string> => {
       const s = { ...h };
-      for (const k of ['Authorization', 'X-API-Key', 'Cookie']) if (s[k]) s[k] = '[REDACTED]';
+      for (const k of ["Authorization", "X-API-Key", "Cookie"])
+        if (s[k]) s[k] = "[REDACTED]";
       return s;
     },
   };
 
   const api = {
     get<T>(endpoint: string, opts?: BodylessOptions<T>) {
-      return apiRequest<T>('GET', endpoint, opts as RequestOptions<RequestBody, T>);
+      return apiRequest<T>(
+        "GET",
+        endpoint,
+        opts as RequestOptions<RequestBody, T>,
+      );
     },
     post<T>(endpoint: string, opts?: RequestOptions<RequestBody, T>) {
-      return apiRequest<T>('POST', endpoint, opts);
+      return apiRequest<T>("POST", endpoint, opts);
     },
     put<T>(endpoint: string, opts?: RequestOptions<RequestBody, T>) {
-      return apiRequest<T>('PUT', endpoint, opts);
+      return apiRequest<T>("PUT", endpoint, opts);
     },
     patch<T>(endpoint: string, opts?: RequestOptions<RequestBody, T>) {
-      return apiRequest<T>('PATCH', endpoint, opts);
+      return apiRequest<T>("PATCH", endpoint, opts);
     },
     delete<T>(endpoint: string, opts?: BodylessOptions<T>) {
-      return apiRequest<T>('DELETE', endpoint, opts as RequestOptions<RequestBody, T>);
+      return apiRequest<T>(
+        "DELETE",
+        endpoint,
+        opts as RequestOptions<RequestBody, T>,
+      );
     },
   } as const;
 
-  return { apiRequest, api, invalidateAuthCache: authCache.invalidateAuthCache };
+  return {
+    apiRequest,
+    api,
+    invalidateAuthCache: authCache.invalidateAuthCache,
+  };
 }
 
 /* ─── Default Singleton ──────────────────────────────────────────────────────── */
