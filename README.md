@@ -433,11 +433,11 @@ SafeFetch reads the following environment variables:
 
 SafeFetch includes safeguards against common networking risks:
 
-• SSRF protection
-• Auth cache invalidation on unauthorized responses
-• Header sanitization utilities
-• Request timeout enforcement
-• Retry-storm prevention
+- SSRF protection
+- Auth cache invalidation on unauthorized responses
+- Header sanitization utilities
+- Request timeout enforcement
+- Retry-storm prevention
 
 ---
 
@@ -451,7 +451,7 @@ Copyright © 2025 Bharathi4real
 
 # Author
 
-Bharathi
+Bharathi4real
 https://github.com/Bharathi4real/safe-fetch
 
 ---
