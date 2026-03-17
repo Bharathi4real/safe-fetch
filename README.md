@@ -1,225 +1,459 @@
 # 🛡️ SafeFetch
 
-> **Optimized Typed Fetch utility for Next.js 16 & Bun.**
-> A memory-optimized HTTP client featuring priority-based pooling, adaptive rate limiting, and recursive type inference.
----
+**A high-performance, type-safe fetch utility for modern full-stack applications.**
 
-## Key Features
+SafeFetch is a lightweight HTTP client built on top of the native `fetch` API.
+It introduces **intelligent retries, request deduplication, concurrency pooling, adaptive rate limiting, schema validation, and secure authentication handling** — all while keeping the runtime footprint extremely small.
 
-* **Priority-Based Pooling**: Internal queue handles concurrent requests based on importance (`high`, `normal`, `low`).
-* **Bun-Optimized**: Automatically detects the **Bun** runtime to scale concurrency (20 tasks vs 10 in Node).
-* **Smart Retries**: Automatic exponential backoff for specific status codes (`408`, `429`, `500-504`).
-* **Adaptive Rate Limiting**: Built-in sliding window limiter (default: 100 req/min) with intelligent queuing.
-* **Request Deduplication**: Identical concurrent requests are merged into one network call to prevent over-fetching.
-* **Live Type Inference**: (Dev Only) Recursively inspects API responses and logs ready-to-use TypeScript interfaces.
-* **Unified Auth**: Automated Bearer and Basic Auth injection with 5-minute credential caching.
+Designed primarily for **Next.js, Node.js, and Bun environments**, SafeFetch focuses on **resilience, performance, and predictable API behavior**.
 
 ---
 
-## Quick Start
+# Why SafeFetch Exists
 
-```typescript
-import apiRequest from '@/lib/safe-fetch';
+Modern applications frequently suffer from problems such as:
 
+| Problem                     | Typical Result              |
+| --------------------------- | --------------------------- |
+| Duplicate API calls         | Unnecessary load on servers |
+| Unbounded concurrency       | Resource exhaustion         |
+| Transient failures          | Random UI breakage          |
+| Weak response typing        | Runtime bugs                |
+| Credential refresh issues   | Authentication loops        |
+| Unstructured error handling | Hard-to-debug failures      |
+
+SafeFetch solves these issues through a **layered architecture** combining:
+
+* concurrency pooling
+* rate limiting
+* retry orchestration
+* typed validation
+* authentication caching
+* request deduplication
+
+All implemented **without external runtime dependencies**.
+
+---
+
+# Key Features
+
+## Intelligent Request Pooling
+
+SafeFetch manages network concurrency using an internal priority queue.
+
+```
+high → normal → low
+```
+
+This ensures critical requests are executed first while background tasks are deferred.
+
+---
+
+## Built-in Rate Limiting
+
+A sliding window limiter prevents API flooding.
+
+Default configuration:
+
+```
+100 requests / minute
+```
+
+Requests exceeding the limit are queued automatically.
+
+---
+
+## Automatic Retries
+
+SafeFetch retries transient network failures using exponential backoff.
+
+Retryable status codes:
+
+```
+408
+429
+500
+502
+503
+504
+```
+
+It also respects server-provided `Retry-After` headers.
+
+---
+
+## Request Deduplication
+
+Concurrent requests targeting the same resource are automatically merged.
+
+```
+Component A
+Component B
+Component C
+        ↓
+     One network request
+```
+
+All callers receive the same resolved promise.
+
+---
+
+## Type-Safe Responses
+
+SafeFetch returns a **discriminated union response type**, eliminating unsafe data access.
+
+```ts
+if (apiRequest.isSuccess(response)) {
+  response.data
+} else {
+  response.error
+}
+```
+
+This pattern prevents accessing data before verifying success.
+
+---
+
+## Zod Schema Validation
+
+Optional runtime validation ensures API responses match expected structures.
+
+```ts
+schema: UserSchema
+```
+
+Invalid responses fail safely before reaching application logic.
+
+---
+
+## Authentication Management
+
+SafeFetch supports both:
+
+**Bearer Token**
+
+```
+Authorization: Bearer <token>
+```
+
+**Basic Auth**
+
+```
+Authorization: Basic <base64>
+```
+
+Auth headers are cached for **5 minutes** to avoid unnecessary recomputation.
+
+If a request returns **401**, the cache automatically invalidates.
+
+---
+
+## SSRF Protection
+
+Requests can be restricted to specific hosts.
+
+```ts
+allowedHosts: ["api.example.com"]
+```
+
+Requests targeting other hosts are blocked immediately.
+
+---
+
+## Runtime Awareness
+
+SafeFetch automatically adapts concurrency depending on runtime.
+
+| Runtime | Max Concurrent Requests |
+| ------- | ----------------------- |
+| Node.js | 10                      |
+| Bun     | 20                      |
+
+---
+
+# Architecture Overview
+
+SafeFetch consists of several internal subsystems working together:
+
+```
+User Request
+     │
+     ▼
+URL Builder (LRU Cache)
+     │
+     ▼
+Deduplication Key Generator
+     │
+     ▼
+Priority Connection Pool
+     │
+     ▼
+Rate Limiter
+     │
+     ▼
+Fetch Execution
+     │
+     ▼
+Response Parser
+     │
+     ▼
+Transform / Schema Validation
+     │
+     ▼
+Typed ApiResponse
+```
+
+This layered architecture ensures **predictable networking behavior even under heavy load**.
+
+---
+
+# Getting Started
+
+Clone the repository or copy the `safe-fetch.ts` file into your project.
+
+Example structure:
+
+```
+project
+ ├─ lib
+ │   └─ safe-fetch.ts
+ ├─ app
+ ├─ components
+ └─ services
+```
+
+Import the utility where needed:
+
+```ts
+import apiRequest from "@/lib/safe-fetch"
+```
+
+---
+
+# Basic Usage
+
+```ts
 interface User {
-  id: string;
-  name: string;
+  id: string
+  name: string
 }
 
-const response = await apiRequest<User>('GET', '/api/user/1');
+const response = await apiRequest<User>("GET", "/users/1")
 
 if (apiRequest.isSuccess(response)) {
-  console.log(response.data.name); 
-}
-
-```
-
----
-
-## RequestOptions: Complete Usage Guide
-
-The `RequestOptions` object allows you to fine-tune every aspect of the network request. Below are examples for every property available in the 2025 implementation.
-
-### 1. `data` (The Payload)
-
-Supports JSON objects, `FormData` (for file uploads), or raw strings.
-
-```typescript
-// JSON Data
-await apiRequest('POST', '/users', { data: { name: 'John Doe' } });
-
-// FormData (File Upload)
-const form = new FormData();
-form.append('avatar', fileBlob);
-await apiRequest('POST', '/upload', { data: form });
-
-```
-
-### 2. `params` (Query Parameters)
-
-Automatically serializes objects into URL search strings, filtering out `null` or `undefined` values.
-
-```typescript
-await apiRequest('GET', '/posts', { 
-  params: { page: 1, limit: 10, search: 'NextJS', archived: false } 
-});
-// Result: /posts?page=1&limit=10&search=NextJS&archived=false
-
-```
-
-### 3. `priority` (Pool Management)
-
-Determines the order of execution in the internal queue.
-
-```typescript
-// Jump to the front of the queue
-await apiRequest('GET', '/critical-config', { priority: 'high' });
-
-// Process only when the system is idle
-await apiRequest('POST', '/telemetry', { priority: 'low' });
-
-```
-
-### 4. `dedupeKey` (Request Merging)
-
-Prevents redundant calls. If a request with the same key is already in-flight, SafeFetch returns that existing promise instead of hitting the network again.
-
-```typescript
-// Multiple components can call this simultaneously safely
-await apiRequest('GET', '/settings', { dedupeKey: 'global-settings-key' });
-
-```
-
-### 5. `skipAuth` (Authentication Bypass)
-
-Ignores global environment credentials (Bearer/Basic) for this specific call. Useful for external public APIs.
-
-```typescript
-await apiRequest('GET', 'https://api.github.com/zen', { skipAuth: true });
-
-```
-
-### 6. `logTypes` (Development Tool)
-
-Recursively inspects the JSON response and logs a copy-pasteable TypeScript interface to the console.
-
-```typescript
-// Only works in process.env.NODE_ENV === 'development'
-await apiRequest('GET', '/api/user/profile', { logTypes: true });
-
-```
-
-### 7. `timeout` (Adaptive or Fixed)
-
-Accepts a number (ms) or a function that calculates timeout based on the retry attempt.
-
-```typescript
-await apiRequest('GET', '/unstable-api', { 
-  timeout: (attempt) => attempt * 5000 // 5s, then 10s, then 15s...
-});
-
-```
-
-### 8. `retries` (Retry Logic)
-
-Overrides the default (2) retries for idempotent operations.
-
-```typescript
-await apiRequest('GET', '/vital-resource', { retries: 5 });
-
-```
-
-### 9. `transform` (Data Post-Processing)
-
-Modify data after a successful fetch but before the application receives it.
-
-```typescript
-await apiRequest<User>('GET', '/user/1', {
-  transform: (data) => ({
-    ...data,
-    displayName: data.nickname || data.name
-  })
-});
-
-```
-
-### 10. `headers` (Custom Headers)
-
-Merge custom headers with SafeFetch's auto-generated headers (like Content-Type and Auth).
-
-```typescript
-await apiRequest('GET', '/data', { 
-  headers: { 'X-Project-ID': '99', 'Accept-Encoding': 'gzip' } 
-});
-
-```
-
-### 11. `cache` & `next` (Next.js 16 Integration)
-
-Full support for the Next.js extended fetch API for caching and revalidation tags.
-
-```typescript
-await apiRequest('GET', '/products', {
-  cache: 'force-cache',
-  next: { 
-    revalidate: 3600, 
-    tags: ['product-list', 'inventory'] 
-  }
-});
-
-```
-
-### 12. `signal` (Manual Cancellation)
-
-Cancel a request manually using an `AbortController`.
-
-```typescript
-const controller = new AbortController();
-const request = apiRequest('GET', '/huge-payload', { signal: controller.signal });
-
-// Some logic triggers cancellation
-controller.abort();
-
-```
-
----
-
-## Response Handling & Utilities
-
-SafeFetch returns a discriminated union, making it impossible to access data without checking for success first.
-
-```typescript
-const res = await apiRequest<User>('GET', '/me');
-
-if (apiRequest.isSuccess(res)) {
-  // res.data is typed as User
-  console.log(res.status, res.headers);
+  console.log(response.data.name)
 } else {
-  // res.error contains name, message, status, and retryable flag
-  console.error(res.error.message);
+  console.error(response.error.message)
 }
-
-```
-
-### System Monitoring
-
-```typescript
-const stats = apiRequest.utils.getStats();
-
-console.log(stats.pool);      // { active: number, queued: number }
-console.log(stats.rateLimit); // { current: number }
-console.log(stats.runtime);   // "bun" | "node"
-
 ```
 
 ---
 
-## Environment Variables
+# REST Helper API
 
-SafeFetch reads these keys for its internal `getEnv` utility:
+SafeFetch includes convenience wrappers.
 
-| Variable | Description |
-| --- | --- |
-| `NEXT_PUBLIC_API_URL` | Base API URL for relative paths. |
-| `API_TOKEN` | Injected as `Authorization: Bearer <token>`. |
-| `AUTH_USERNAME` / `AUTH_PASSWORD` | Injected as `Authorization: Basic <base64>`. |
+```ts
+import { api } from "@/lib/safe-fetch"
+
+api.get<T>(endpoint, options)
+api.post<T>(endpoint, options)
+api.put<T>(endpoint, options)
+api.patch<T>(endpoint, options)
+api.delete<T>(endpoint, options)
+```
+
+Example:
+
+```ts
+const user = await api.get<User>("/users/1")
+```
+
+---
+
+# Request Options
+
+`RequestOptions` controls request behavior.
+
+```ts
+interface RequestOptions {
+  data?: RequestBody
+  params?: QueryParams
+  retries?: number
+  timeout?: number | ((attempt:number)=>number)
+  headers?: Record<string,string>
+  transform?(data): unknown
+  schema?: ZodSchema
+  priority?: "high" | "normal" | "low"
+  signal?: AbortSignal
+  logTypes?: boolean
+  cache?: RequestCache
+  next?: { revalidate?: number | false; tags?: string[] }
+  dedupeKey?: string | null
+  skipAuth?: boolean
+}
+```
+
+---
+
+# Sending Data
+
+### JSON
+
+```ts
+await api.post("/users", {
+  data: { name: "Bharathi" }
+})
+```
+
+### FormData
+
+```ts
+const form = new FormData()
+form.append("avatar", file)
+
+await api.post("/upload", { data: form })
+```
+
+---
+
+# Query Parameters
+
+```ts
+await api.get("/posts", {
+  params: {
+    page: 1,
+    limit: 10,
+    search: "NextJS"
+  }
+})
+```
+
+Produces:
+
+```
+/posts?page=1&limit=10&search=NextJS
+```
+
+---
+
+# Retry Configuration
+
+```ts
+await api.get("/critical-resource", {
+  retries: 5
+})
+```
+
+---
+
+# Adaptive Timeout
+
+```ts
+await api.get("/slow-api", {
+  timeout: attempt => attempt * 4000
+})
+```
+
+---
+
+# Request Deduplication
+
+```ts
+await api.get("/settings", {
+  dedupeKey: "global-settings"
+})
+```
+
+---
+
+# Next.js Cache Integration
+
+SafeFetch supports Next.js extended fetch caching.
+
+```ts
+await api.get("/products", {
+  cache: "force-cache",
+  next: {
+    revalidate: 3600,
+    tags: ["products"]
+  }
+})
+```
+
+---
+
+# Request Cancellation
+
+```ts
+const controller = new AbortController()
+
+api.get("/large-dataset", {
+  signal: controller.signal
+})
+
+controller.abort()
+```
+
+---
+
+# Runtime Monitoring
+
+```ts
+const stats = apiRequest.utils.getStats()
+```
+
+Example:
+
+```ts
+{
+  pool: { active: 2, queued: 3 },
+  rateLimit: { current: 5 },
+  runtime: "node"
+}
+```
+
+---
+
+# Environment Variables
+
+SafeFetch reads the following environment variables:
+
+| Variable            | Purpose               |
+| ------------------- | --------------------- |
+| API_URL             | Default API base URL  |
+| NEXT_PUBLIC_API_URL | Client-side API URL   |
+| API_TOKEN           | Bearer authentication |
+| AUTH_USERNAME       | Basic auth username   |
+| AUTH_PASSWORD       | Basic auth password   |
+
+---
+
+# Security Considerations
+
+SafeFetch includes safeguards against common networking risks:
+
+• SSRF protection
+• Auth cache invalidation on unauthorized responses
+• Header sanitization utilities
+• Request timeout enforcement
+• Retry-storm prevention
+
+---
+
+# License
+
+BSD 3-Clause License
+
+Copyright © 2025 Bharathi4real
+
+---
+
+# Author
+
+Bharathi
+https://github.com/Bharathi4real/safe-fetch
+
+---
+
+⭐ If this utility helps your project, consider starring the repository.
