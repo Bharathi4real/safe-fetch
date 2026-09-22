@@ -5,7 +5,7 @@
 SafeFetch is a lightweight HTTP client built on top of the native `fetch` API.
 It introduces **intelligent retries, request deduplication, concurrency pooling, adaptive rate limiting, schema validation, and secure authentication handling** — all while keeping the runtime footprint extremely small.
 
-Designed primarily for **Next.js, Node.js, and Bun environments**, SafeFetch focuses on **resilience, performance, and predictable API behavior**.
+Designed primarily for **Next.js, Node.js, Bun, and Edge Runtime environments**, SafeFetch focuses on **resilience, performance, and predictable API behavior**.
 
 ---
 
@@ -31,7 +31,7 @@ SafeFetch solves these issues through a **layered architecture** combining:
 * authentication caching
 * request deduplication
 
-All implemented **without external runtime dependencies**.
+All implemented **without external runtime dependencies** — SafeFetch has no `node:crypto`, no `node:buffer`, and no other Node-only static imports, so the same file runs unmodified in Node.js, Bun, browsers, and the Edge Runtime.
 
 ---
 
@@ -124,6 +124,12 @@ schema: UserSchema
 
 Invalid responses fail safely before reaching application logic.
 
+`zod` is a peer dependency — install it if you use `schema`:
+
+```
+npm install zod
+```
+
 ---
 
 ## Authentication Management
@@ -150,24 +156,43 @@ If a request returns **401**, the cache automatically invalidates.
 
 ## SSRF Protection
 
-Requests can be restricted to specific hosts.
+An instance can be restricted to a fixed set of hosts via `createSafeFetch()`:
 
 ```ts
-allowedHosts: ["api.example.com"]
+createSafeFetch({
+  allowedHosts: ["api.example.com"]
+})
 ```
 
-Requests targeting other hosts are blocked immediately.
+Any request whose resolved hostname isn't in the list is blocked before the network call is made.
 
 ---
 
 ## Runtime Awareness
 
-SafeFetch automatically adapts concurrency depending on runtime.
+SafeFetch automatically adapts default concurrency depending on runtime.
 
-| Runtime | Max Concurrent Requests |
-| ------- | ----------------------- |
-| Node.js | 10                      |
-| Bun     | 20                      |
+| Runtime          | Max Concurrent Requests |
+| ---------------- | ------------------------ |
+| Node.js           | 10                       |
+| Bun                | 20                       |
+| Edge Runtime | 10 (Node.js default)     |
+
+---
+
+# Runtime Compatibility
+
+SafeFetch is written against Web-standard APIs only (`fetch`, `AbortController`, `URL`, `crypto.randomUUID`, `Float64Array`), so it works unchanged across:
+
+| Environment                                             | Supported |
+| -------------------------------------------------------- | :-------: |
+| Node.js (API routes, Server Actions, Server Components) |     ✅     |
+| Bun                                                       |     ✅     |
+| Browser (client components)                              |     ✅     |
+| Next.js Edge Middleware                                   |     ✅     |
+| Next.js Edge Route Handlers (`runtime = "edge"`)           |     ✅     |
+
+There is no separate "edge build" — import the same `safe-fetch.ts` everywhere.
 
 ---
 
@@ -228,6 +253,8 @@ Import the utility where needed:
 import apiRequest from "@/lib/safe-fetch"
 ```
 
+Using `schema` validation also requires `zod` as a dependency (see [Zod Schema Validation](#zod-schema-validation)).
+
 ---
 
 # Basic Usage
@@ -268,6 +295,42 @@ Example:
 ```ts
 const user = await api.get<User>("/users/1")
 ```
+
+---
+
+# Configuration
+
+The default `apiRequest`/`api` export is a ready-to-use singleton. For a dedicated instance — a different base URL, stricter retries, a host allowlist — use `createSafeFetch()`:
+
+```ts
+import { createSafeFetch } from "@/lib/safe-fetch"
+
+const { api, apiRequest, invalidateAuthCache } = createSafeFetch({
+  baseUrl: "https://api.example.com",
+  retries: 2,
+  timeout: 60_000,
+  maxConcurrent: 10,
+  rateMax: 100,
+  rateWindow: 60_000,
+  authCacheTtl: 300_000,
+  allowedHosts: ["api.example.com"],
+  getAuthHeaders: () => ({ Authorization: "Bearer <token>" })
+})
+```
+
+| Option            | Default                        | Purpose                                                        |
+| ------------------ | ------------------------------- | ---------------------------------------------------------------- |
+| `baseUrl`             | `API_URL` / `NEXT_PUBLIC_API_URL` | Base URL prepended to relative endpoints                          |
+| `retries`             | `2`                              | Max retry attempts per request                                    |
+| `timeout`             | `60000` (ms)                     | Per-attempt request timeout                                       |
+| `maxConcurrent`       | `10` (`20` on Bun)               | Connection pool size                                               |
+| `rateMax`             | `100`                            | Max requests per `rateWindow`                                     |
+| `rateWindow`          | `60000` (ms)                     | Rate-limit sliding window                                          |
+| `authCacheTtl`        | `300000` (ms)                    | How long auth headers are cached before rebuilding                 |
+| `allowedHosts`        | *(unset — all hosts allowed)*    | SSRF allowlist                                                     |
+| `getAuthHeaders`      | env-based token/basic-auth       | Override to supply auth headers from your own logic                |
+
+Each instance created by `createSafeFetch()` has its own pool, rate limiter, URL cache, and auth cache — instances never share state.
 
 ---
 
@@ -365,6 +428,8 @@ await api.get("/settings", {
 })
 ```
 
+Omit `dedupeKey` and SafeFetch derives one automatically from the method, URL, and (for non-`GET` requests) a hash of the body — so identical concurrent calls still dedupe without any extra config.
+
 ---
 
 # Next.js Cache Integration
@@ -380,6 +445,8 @@ await api.get("/products", {
   }
 })
 ```
+
+> Since Next.js 15, `fetch` requests are **uncached by default**. Pass `cache: "force-cache"` and/or `next.revalidate` explicitly when you want caching — omit both for always-fresh data.
 
 ---
 
@@ -417,15 +484,17 @@ Example:
 
 # Environment Variables
 
-SafeFetch reads the following environment variables:
+SafeFetch reads the following environment variables (checked in this order per credential type):
 
-| Variable            | Purpose               |
-| ------------------- | --------------------- |
-| API_URL             | Default API base URL  |
-| NEXT_PUBLIC_API_URL | Client-side API URL   |
-| API_TOKEN           | Bearer authentication |
-| AUTH_USERNAME       | Basic auth username   |
-| AUTH_PASSWORD       | Basic auth password   |
+| Variable                       | Purpose                              |
+| -------------------------------- | --------------------------------------- |
+| `API_URL`                          | Default API base URL                    |
+| `NEXT_PUBLIC_API_URL`              | Fallback base URL (e.g. client bundles) |
+| `AUTH_USERNAME` / `API_USERNAME`   | Basic auth username                     |
+| `AUTH_PASSWORD` / `API_PASSWORD`   | Basic auth password                     |
+| `AUTH_TOKEN` / `API_TOKEN`         | Bearer token                            |
+
+If both a username/password pair and a token are set, Basic Auth takes priority. Any of these can be bypassed per-instance with the `getAuthHeaders` config option, or per-request with `skipAuth: true`.
 
 ---
 
@@ -433,11 +502,11 @@ SafeFetch reads the following environment variables:
 
 SafeFetch includes safeguards against common networking risks:
 
-- SSRF protection
-- Auth cache invalidation on unauthorized responses
-- Header sanitization utilities
-- Request timeout enforcement
-- Retry-storm prevention
+- SSRF protection via `allowedHosts`
+- Auth cache invalidation on unauthorized (401) responses
+- Header sanitization utilities (`apiRequest.utils.sanitizeHeaders`)
+- Request timeout enforcement (fixed or per-attempt function)
+- Retry-storm prevention (bounded exponential backoff + jitter, `Retry-After` aware)
 
 ---
 
