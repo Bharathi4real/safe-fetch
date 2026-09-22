@@ -1,6 +1,8 @@
 # Real-World Usage Patterns
 
-These examples demonstrate how SafeFetch fits into common application architectures such as **Next.js server components, React client components, service layers, and backend APIs**.
+These examples demonstrate how SafeFetch fits into common application architectures such as **Next.js server components, Edge Middleware, React client components, service layers, and backend APIs**.
+
+> **Edge Runtime note:** SafeFetch has no Node-only static imports (no `node:crypto`, no `node:buffer`), so every pattern below — including the server component and route handler examples — also works unmodified in `middleware.ts` and in Route Handlers with `export const runtime = "edge"`. See [Using SafeFetch in Edge Middleware](#using-safefetch-in-edge-middleware).
 
 ---
 
@@ -37,11 +39,60 @@ export default async function DashboardPage() {
 }
 ```
 
+> Since Next.js 15, `fetch` is **uncached by default** — you now opt in to caching explicitly rather than opting out. Pass `next: { revalidate }` (as above) or `cache: "force-cache"` when you want a cached response; omit both for always-fresh data.
+
 Benefits in server components:
 
-* automatic Next.js caching support
+* explicit, typed Next.js caching support (`next.revalidate` / `next.tags`, `cache`)
 * typed responses
 * controlled retries
+
+---
+
+# Using SafeFetch in Edge Middleware
+
+Because SafeFetch avoids Node-only APIs, it runs as-is in Edge Middleware and edge Route Handlers — no separate "edge build" needed.
+
+```ts
+// middleware.ts
+import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+import { api } from "@/lib/safe-fetch";
+
+interface FeatureFlags {
+  maintenanceMode: boolean;
+}
+
+export async function middleware(req: NextRequest) {
+  const res = await api.get<FeatureFlags>("/feature-flags", {
+    // Middleware runs on every request — keep it fast and non-blocking.
+    timeout: 2000,
+    retries: 0
+  });
+
+  if (res.success && res.data.maintenanceMode) {
+    return NextResponse.redirect(new URL("/maintenance", req.url));
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: "/((?!maintenance|_next/static|_next/image|favicon.ico).*)"
+};
+```
+
+```ts
+// app/api/edge-example/route.ts
+import { api } from "@/lib/safe-fetch";
+
+export const runtime = "edge";
+
+export async function GET() {
+  const res = await api.get("/ping");
+  return Response.json(res);
+}
+```
 
 ---
 
@@ -109,7 +160,7 @@ export async function getUser(id: string) {
 }
 
 export async function updateUser(id: string, data: Partial<User>) {
-  return api.put(`/users/${id}`, {
+  return api.put<User>(`/users/${id}`, {
     data
   });
 }
@@ -142,8 +193,13 @@ SafeFetch can also be used inside backend services.
 
 import { api } from "@/lib/safe-fetch";
 
+interface Payment {
+  id: string;
+  status: "pending" | "paid" | "failed";
+}
+
 export async function verifyPayment(sessionId: string) {
-  const res = await api.get(`/payments/${sessionId}`);
+  const res = await api.get<Payment>(`/payments/${sessionId}`);
 
   if (!res.success) {
     throw new Error(res.error.message);
@@ -201,6 +257,8 @@ const analytics = await analyticsApi.api.post("/events", {
 });
 ```
 
+Each instance gets its own connection pool, rate limiter, URL cache, and auth-header cache — they never share state, so `analyticsApi`'s stricter `retries`/`timeout` can't affect `coreApi` calls.
+
 ---
 
 # Using SafeFetch in Redux Toolkit
@@ -212,11 +270,12 @@ SafeFetch integrates well with Redux async logic.
 
 import { createAsyncThunk } from "@reduxjs/toolkit";
 import { api } from "@/lib/safe-fetch";
+import type { User } from "@/services/user-service";
 
 export const fetchUser = createAsyncThunk(
   "user/fetch",
   async (id: string) => {
-    const res = await api.get(`/users/${id}`);
+    const res = await api.get<User>(`/users/${id}`);
 
     if (!res.success) {
       throw new Error(res.error.message);
@@ -231,10 +290,12 @@ export const fetchUser = createAsyncThunk(
 
 # Handling Global API Errors
 
-You can standardize error handling.
+You can standardize error handling with a small typed helper.
 
 ```ts
-export async function safeCall<T>(promise: Promise<any>) {
+import type { ApiResponse } from "@/lib/safe-fetch";
+
+export async function safeCall<T>(promise: Promise<ApiResponse<T>>): Promise<T> {
   const res = await promise;
 
   if (!res.success) {
@@ -242,31 +303,33 @@ export async function safeCall<T>(promise: Promise<any>) {
     throw new Error(res.error.message);
   }
 
-  return res.data as T;
+  return res.data;
 }
 ```
 
 Usage:
 
 ```ts
-const user = await safeCall(api.get("/users/me"));
+const user = await safeCall(api.get<User>("/users/me"));
 ```
+
+Typing the promise as `ApiResponse<T>` (instead of `any`) keeps `res.data` — and the returned value — fully typed end to end.
 
 ---
 
 # Optimizing Concurrent Requests
 
-SafeFetch handles concurrent requests efficiently using its internal pool.
+SafeFetch handles concurrent requests efficiently using its internal priority pool and rate limiter.
 
 ```ts
 const [users, posts, stats] = await Promise.all([
   api.get("/users"),
   api.get("/posts"),
-  api.get("/stats")
+  api.get("/stats", { priority: "high" })
 ]);
 ```
 
-The internal connection pool ensures requests are executed within safe limits.
+`priority` only affects queueing once the pool's `maxConcurrent` limit is hit — a `"high"`-priority call jumps ahead of queued `"normal"`/`"low"` ones, it doesn't bypass the rate limiter itself.
 
 ---
 
@@ -274,12 +337,16 @@ The internal connection pool ensures requests are executed within safe limits.
 
 Next.js layouts can preload shared data.
 
-```ts
+```tsx
 // app/layout.tsx
 
 import { api } from "@/lib/safe-fetch";
 
-export default async function RootLayout({ children }) {
+export default async function RootLayout({
+  children
+}: {
+  children: React.ReactNode;
+}) {
   const res = await api.get("/app-config", {
     priority: "high"
   });
@@ -315,6 +382,8 @@ const res = await api.get("/product/1", {
 });
 ```
 
+`transform` runs **before** `schema` validation, so validate against the shape your `transform` returns, not the raw response shape.
+
 ---
 
 # Logging Types During Development
@@ -338,6 +407,4 @@ Type:
 }
 ```
 
-This helps generate TypeScript interfaces quickly during development.
-
----
+This helps generate TypeScript interfaces quickly during development. `logTypes` is a no-op in production builds (`NODE_ENV === "production"`), so it's safe to leave on `true` in shared service-layer code without a manual `if (dev)` guard.
