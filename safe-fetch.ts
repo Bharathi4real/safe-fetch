@@ -3,9 +3,15 @@
  * (c) 2025 Bharathi4real – BSD 3-Clause License
  * Memory-optimized with unified retry, timeout & adaptive pooling
  * https://github.com/Bharathi4real/safe-fetch/
+ *
+ * Runtime notes: this module has zero Node-only static imports (no
+ * `node:crypto`, no `node:buffer`), so it works unmodified in the Node.js
+ * runtime, the Edge Runtime (Middleware, Edge Route Handlers) and in App
+ * Router Server Actions / Route Handlers / Server Components. `Buffer` is
+ * only ever referenced behind a `typeof Buffer !== "undefined"` guard, so
+ * it degrades gracefully where `Buffer` doesn't exist.
  */
 
-import { createHash } from "node:crypto";
 import type { ZodSchema } from "zod";
 
 /* ─── Public Types ─────────────────────────────────────────────────────────── */
@@ -87,23 +93,25 @@ const DEFAULT_CFG = {
   AUTH_CACHE_TTL: 300_000,
 } as const;
 
+/** `AbortSignal.any` with a manual fallback for runtimes that predate it. */
 const composeSignals = (a: AbortSignal, b: AbortSignal): AbortSignal => {
   if (typeof AbortSignal.any === "function") return AbortSignal.any([a, b]);
+
   const ctrl = new AbortController();
   if (a.aborted || b.aborted) {
     ctrl.abort();
     return ctrl.signal;
   }
-  const abortA = () => {
-    b.removeEventListener("abort", abortB);
+
+  // Single shared handler (instead of one per signal) so cleanup after
+  // either signal fires is a one-liner rather than two mirrored closures.
+  const onAbort = () => {
+    a.removeEventListener("abort", onAbort);
+    b.removeEventListener("abort", onAbort);
     ctrl.abort();
   };
-  const abortB = () => {
-    a.removeEventListener("abort", abortA);
-    ctrl.abort();
-  };
-  a.addEventListener("abort", abortA, { once: true });
-  b.addEventListener("abort", abortB, { once: true });
+  a.addEventListener("abort", onAbort, { once: true });
+  b.addEventListener("abort", onAbort, { once: true });
   return ctrl.signal;
 };
 
@@ -119,7 +127,7 @@ class RateLimiter {
   }
 
   async check(max: number, win: number): Promise<void> {
-    while (true) {
+    for (;;) {
       const now = Date.now();
       const cutoff = now - win;
       while (this.size > 0 && this.timestamps[this.head] < cutoff) {
@@ -152,10 +160,8 @@ class Pool {
     pri: "high" | "normal" | "low" = "normal",
     key?: string | null,
   ): Promise<T> {
-    if (key) {
-      const existing = this.pending.get(key);
-      if (existing) return existing as Promise<T>;
-    }
+    const existing = key && this.pending.get(key);
+    if (existing) return existing as Promise<T>;
 
     const task = new Promise<T>((resolve, reject) => {
       const run = async () => {
@@ -182,17 +188,15 @@ class Pool {
       this.queue.shift()?.fn();
   }
 
+  /** Insertion-sorted (highest priority first) via binary search. */
   private enqueue(fn: () => void, pri: "high" | "normal" | "low"): void {
     const priVal = PRIORITY_VALUES[pri];
-    let l = 0,
-      r = this.queue.length;
+    let l = 0;
+    let r = this.queue.length;
     while (l < r) {
       const m = (l + r) >>> 1;
-      if (this.queue[m].pri >= priVal) {
-        l = m + 1;
-      } else {
-        r = m;
-      }
+      if (this.queue[m].pri >= priVal) l = m + 1;
+      else r = m;
     }
     this.queue.splice(l, 0, { fn, pri: priVal });
   }
@@ -301,6 +305,7 @@ const buildUrlFactory = (maxCache = 100) => {
     const cacheKey = p ? `${ep}:${JSON.stringify(p)}` : ep;
     const cached = cache.get(cacheKey);
     if (cached) {
+      // Refresh LRU position.
       cache.delete(cacheKey);
       cache.set(cacheKey, cached);
       return cached;
@@ -310,19 +315,19 @@ const buildUrlFactory = (maxCache = 100) => {
       ? ep
       : `${(base || (typeof window !== "undefined" ? window.location.origin : "")).replace(/\/+$/, "")}/${ep.replace(/^\/+/, "")}`;
 
-    // SSRF guard
+    // SSRF guard.
     if (allowedHosts?.length) {
+      let hostname: string;
       try {
-        const { hostname } = new URL(url);
-        if (!allowedHosts.includes(hostname)) {
-          throw new Error(
-            `[SafeFetch] Blocked request to disallowed host: ${hostname}`,
-          );
-        }
-      } catch (err) {
-        if ((err as Error).message.startsWith("[SafeFetch]")) throw err;
+        hostname = new URL(url).hostname;
+      } catch {
         throw new Error(
           `[SafeFetch] Could not parse URL for SSRF check: ${url}`,
+        );
+      }
+      if (!allowedHosts.includes(hostname)) {
+        throw new Error(
+          `[SafeFetch] Blocked request to disallowed host: ${hostname}`,
         );
       }
     }
@@ -358,6 +363,33 @@ const sortedStringify = (v: unknown): string => {
     .join(",")}}`;
 };
 
+/**
+ * cyrb53 — fast, deterministic, dependency-free string hash. Used only to
+ * shorten request-dedupe cache keys, not for security, so a non-crypto hash
+ * is intentional: it keeps this module free of `node:crypto`, which the
+ * Edge Runtime and Next.js Middleware cannot bundle.
+ */
+const hashString = (str: string, seed = 0): string => {
+  let h1 = 0xdeadbeef ^ seed;
+  let h2 = 0x41c6ce57 ^ seed;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 =
+    Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^
+    Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 =
+    Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^
+    Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16);
+};
+
+/** `Buffer` may not exist (Edge Runtime, browser) — guard every reference. */
+const isRawBinary = (v: unknown): v is ArrayBuffer | Buffer =>
+  v instanceof ArrayBuffer || (typeof Buffer !== "undefined" && v instanceof Buffer);
+
 const buildDedupeKey = (
   method: HttpMethod,
   url: string,
@@ -365,15 +397,10 @@ const buildDedupeKey = (
 ): string => {
   if (!data) return `${method}:${url}`;
   if (data instanceof FormData) return `${method}:${url}:formdata`;
-  if (
-    data instanceof ArrayBuffer ||
-    (typeof Buffer !== "undefined" && data instanceof Buffer)
-  )
-    return `${method}:${url}:binary`;
+  if (isRawBinary(data)) return `${method}:${url}:binary`;
 
   const raw = typeof data === "string" ? data : sortedStringify(data);
-  const hash = createHash("sha256").update(raw).digest("hex").slice(0, 16);
-  return `${method}:${url}:${hash}`;
+  return `${method}:${url}:${hashString(raw)}`;
 };
 
 const calculateBackoff = (attempt: number): number =>
@@ -421,6 +448,21 @@ const createErrorResponse = (
   };
 };
 
+/** Shorthand for the `success: false` shape returned by the non-retryable
+ * failure paths (parse, transform, schema validation) inside `apiRequest`. */
+const failResult = <T>(
+  status: number,
+  name: string,
+  message: string,
+  url: string,
+  method: string,
+): ApiResponse<T> => ({
+  success: false,
+  status,
+  error: { name, message, status, retryable: false, url, method },
+  data: null,
+});
+
 type ParseResult =
   | { ok: true; data: unknown }
   | { ok: false; reason: "parse_error" | "empty" };
@@ -464,8 +506,7 @@ const parseRetryAfter = (retryAfter: string | undefined): number | null => {
   const seconds = Number(retryAfter);
   if (!Number.isNaN(seconds)) return seconds * 1_000;
   const date = new Date(retryAfter).getTime();
-  if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
-  return null;
+  return Number.isNaN(date) ? null : Math.max(0, date - Date.now());
 };
 
 /* ─── Dev Logger ─────────────────────────────────────────────────────────────── */
@@ -537,16 +578,13 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
     opts: RequestOptions<RequestBody, T> = {},
   ): Promise<ApiResponse<T>> {
     if (!HTTP_METHODS.includes(method)) {
-      return {
-        success: false,
-        status: 400,
-        error: {
-          name: "ValidationError",
-          message: "Invalid HTTP method",
-          status: 400,
-        },
-        data: null,
-      };
+      return failResult<T>(
+        400,
+        "ValidationError",
+        "Invalid HTTP method",
+        endpoint,
+        method,
+      );
     }
 
     const { retries = cfg.retries, priority = "normal" } = opts;
@@ -571,8 +609,7 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
       async () => {
         let attempt = 0;
 
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
+        for (;;) {
           attempt++;
           await limiter.check(cfg.rateMax, cfg.rateWindow);
 
@@ -602,9 +639,7 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
             }
 
             const body = opts.data
-              ? opts.data instanceof FormData ||
-                opts.data instanceof ArrayBuffer ||
-                (typeof Buffer !== "undefined" && opts.data instanceof Buffer)
+              ? opts.data instanceof FormData || isRawBinary(opts.data)
                 ? (opts.data as BodyInit)
                 : JSON.stringify(opts.data)
               : undefined;
@@ -620,43 +655,33 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
 
             clearTimeout(timeoutId);
 
-            // FIX #15 (auth cache) — automatically invalidate the auth cache on
-            // 401 so the next retry picks up fresh credentials rather than
-            // replaying a stale token for the full cacheTtl window.
-            if (res.status === 401) {
-              authCache.invalidateAuthCache();
-            }
+            // On 401, drop the cached auth header immediately so the next
+            // retry sends fresh credentials instead of replaying a stale
+            // token for the rest of the cache TTL window.
+            if (res.status === 401) authCache.invalidateAuthCache();
 
             const parsed = await parseResponse(res);
-            const rawData: unknown = parsed.ok ? parsed.data : null;
 
             if (!res.ok) {
               const message = parsed.ok
-                ? extractErrorMessage(rawData, res.statusText)
+                ? extractErrorMessage(parsed.data, res.statusText)
                 : res.statusText;
-
               const retryAfter = res.headers.get("Retry-After") ?? undefined;
               throw { status: res.status, msg: message, retryAfter };
             }
 
             if (!parsed.ok) {
-              return {
-                success: false as const,
-                status: res.status,
-                error: {
-                  name: "ParseError",
-                  message: `Response body could not be parsed (${parsed.reason})`,
-                  status: res.status,
-                  retryable: false,
-                  url,
-                  method,
-                },
-                data: null,
-              };
+              return failResult<T>(
+                res.status,
+                "ParseError",
+                `Response body could not be parsed (${parsed.reason})`,
+                url,
+                method,
+              );
             }
 
             if (opts.logTypes && IS_DEV) {
-              logTypes(endpoint, method, rawData, {
+              logTypes(endpoint, method, parsed.data, {
                 time: Math.round(performance.now() - start),
                 att: attempt > 1 ? attempt : undefined,
               });
@@ -670,57 +695,37 @@ export function createSafeFetch(instanceConfig: SafeFetchConfig = {}) {
             let transformed: T;
             try {
               transformed = opts.transform
-                ? opts.transform(rawData as T)
-                : (rawData as T);
+                ? opts.transform(parsed.data as T)
+                : (parsed.data as T);
             } catch (transformErr) {
-              return {
-                success: false as const,
-                status: res.status,
-                error: {
-                  name: "TransformError",
-                  message:
-                    transformErr instanceof Error
-                      ? transformErr.message
-                      : "transform() threw an unexpected error",
-                  status: res.status,
-                  retryable: false,
-                  url,
-                  method,
-                },
-                data: null,
-              };
+              return failResult<T>(
+                res.status,
+                "TransformError",
+                transformErr instanceof Error
+                  ? transformErr.message
+                  : "transform() threw an unexpected error",
+                url,
+                method,
+              );
             }
 
-            if (opts.schema) {
-              const result = opts.schema.safeParse(transformed);
-              if (!result.success) {
-                return {
-                  success: false as const,
-                  status: res.status,
-                  error: {
-                    name: "ValidationError",
-                    message: result.error.message,
-                    status: res.status,
-                    retryable: false,
-                    url,
-                    method,
-                  },
-                  data: null,
-                };
-              }
-              return {
-                success: true as const,
-                status: res.status,
-                data: result.data,
-                headers: responseHeaders,
-                requestId,
-              };
+            const validated = opts.schema
+              ? opts.schema.safeParse(transformed)
+              : null;
+            if (validated && !validated.success) {
+              return failResult<T>(
+                res.status,
+                "ValidationError",
+                validated.error.message,
+                url,
+                method,
+              );
             }
 
             return {
               success: true as const,
               status: res.status,
-              data: transformed,
+              data: validated ? validated.data : transformed,
               headers: responseHeaders,
               requestId,
             };
